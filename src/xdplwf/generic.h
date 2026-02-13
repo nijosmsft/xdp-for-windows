@@ -17,6 +17,11 @@
 //       Or just make this opaque context?
 typedef struct _XDP_LWF_FILTER XDP_LWF_FILTER;
 
+//
+// Forward declaration for CPUMAP (opaque pointer).
+//
+typedef struct _XDP_CPUMAP XDP_CPUMAP;
+
 typedef struct _XDP_LWF_DATAPATH_BYPASS {
     BOOLEAN Inserted;           // LWF handlers are inserted on the NDIS data path.
     INT64 ReferenceCount;       // Number of data path clients.
@@ -43,6 +48,12 @@ typedef struct _XDP_LWF_GENERIC {
     } Flags;
 
     XDP_LWF_GENERIC_RSS Rss;
+
+    //
+    // CPU redirect support.
+    //
+    XDP_CPUMAP *CpuMap;
+    XDP_EXTENSION CpuRedirectExtension;
 
     struct {
         XDP_LWF_DATAPATH_BYPASS Datapath;

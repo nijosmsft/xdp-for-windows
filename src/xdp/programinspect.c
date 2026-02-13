@@ -1394,12 +1394,72 @@ XdpInspect(
             switch (Rule->Action) {
 
             case XDP_PROGRAM_ACTION_REDIRECT:
-                XdpRedirect(
-                    &InspectionContext->RedirectContext, FrameIndex, FragmentIndex,
-                    Rule->Redirect.TargetType, Rule->Redirect.Target);
+                if (Rule->Redirect.TargetType == XDP_REDIRECT_TARGET_TYPE_CPU) {
+                    //
+                    // CPU redirect: Compute hash from frame and redirect to target CPU.
+                    //
+                    UINT32 Hash = 0;
 
-                Action = XDP_RX_ACTION_DROP;
-                STAT_INC(RxQueueStats, InspectFramesRedirected);
+                    //
+                    // Ensure frame is parsed for hash computation.
+                    //
+                    if (!FrameCache.UdpCached) {
+                        XdpParseFrame(
+                            Frame, FragmentRing, FragmentExtension, FragmentIndex,
+                            VirtualAddressExtension, &FrameCache, &Program->FrameStorage);
+                    }
+
+                    //
+                    // Compute simple hash from IP addresses and ports.
+                    //
+                    if (FrameCache.Ip4Valid) {
+                        Hash = (*(UINT32 *)&FrameCache.Ip4Hdr->SourceAddress) ^
+                               (*(UINT32 *)&FrameCache.Ip4Hdr->DestinationAddress);
+                    } else if (FrameCache.Ip6Valid) {
+                        //
+                        // Hash IPv6 by XORing address dwords.
+                        //
+                        for (ULONG i = 0; i < 4; i++) {
+                            Hash ^= ((UINT32 *)&FrameCache.Ip6Hdr->SourceAddress)[i];
+                            Hash ^= ((UINT32 *)&FrameCache.Ip6Hdr->DestinationAddress)[i];
+                        }
+                    }
+
+                    if (FrameCache.UdpValid) {
+                        Hash ^= (UINT32)FrameCache.UdpHdr->uh_sport;
+                        Hash ^= (UINT32)FrameCache.UdpHdr->uh_dport;
+                    } else if (FrameCache.TcpValid) {
+                        Hash ^= (UINT32)FrameCache.TcpHdr->th_sport;
+                        Hash ^= (UINT32)FrameCache.TcpHdr->th_dport;
+                    }
+
+                    //
+                    // Map to target CPU.
+                    //
+                    UINT32 CpuBase = Rule->Redirect.CpuRedirect.TargetCpuBase;
+                    UINT32 CpuCount = Rule->Redirect.CpuRedirect.TargetCpuCount;
+                    UINT32 TargetCpu = (Hash % CpuCount) + CpuBase;
+
+                    //
+                    // Store target CPU in frame extension.
+                    //
+                    XDP_FRAME_CPU_REDIRECT *CpuRedirect =
+                        XdpGetCpuRedirectExtension(Frame, &InspectionContext->CpuRedirectExtension);
+                    CpuRedirect->TargetCpu = TargetCpu;
+
+                    Action = XDP_RX_ACTION_CPU_REDIRECT;
+                    STAT_INC(RxQueueStats, InspectFramesRedirected);
+                } else {
+                    //
+                    // XSK redirect.
+                    //
+                    XdpRedirect(
+                        &InspectionContext->RedirectContext, FrameIndex, FragmentIndex,
+                        Rule->Redirect.TargetType, Rule->Redirect.Target);
+
+                    Action = XDP_RX_ACTION_DROP;
+                    STAT_INC(RxQueueStats, InspectFramesRedirected);
+                }
                 break;
 
             case XDP_PROGRAM_ACTION_EBPF:
@@ -1477,6 +1537,12 @@ XdpProgramDeleteRule(
                 XskDereferenceDatapathHandle(Rule->Redirect.Target);
                 Rule->Redirect.Target = NULL;
             }
+            break;
+
+        case XDP_REDIRECT_TARGET_TYPE_CPU:
+            //
+            // CPU redirect has no handle to dereference.
+            //
             break;
 
         default:
@@ -1598,10 +1664,40 @@ XdpProgramValidateRule(
         switch (UserRule->Redirect.TargetType) {
 
         case XDP_REDIRECT_TARGET_TYPE_XSK:
+            ValidatedRule->Redirect.TargetType = XDP_REDIRECT_TARGET_TYPE_XSK;
             Status =
                 XskReferenceDatapathHandle(
                     RequestorMode, &UserRule->Redirect.Target, TRUE,
                     &ValidatedRule->Redirect.Target);
+            break;
+
+        case XDP_REDIRECT_TARGET_TYPE_CPU:
+            {
+                UINT32 ActiveCpuCount;
+                UINT32 CpuBase;
+                UINT32 CpuCount;
+
+                //
+                // Validate CPU redirect parameters.
+                //
+                ActiveCpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                CpuBase = UserRule->Redirect.CpuRedirect.TargetCpuBase;
+                CpuCount = UserRule->Redirect.CpuRedirect.TargetCpuCount;
+
+                if (CpuBase >= ActiveCpuCount ||
+                    CpuCount == 0 ||
+                    CpuBase + CpuCount > ActiveCpuCount) {
+                    Status = STATUS_INVALID_PARAMETER;
+                    goto Exit;
+                }
+
+                //
+                // Copy CPU redirect target type and parameters.
+                //
+                ValidatedRule->Redirect.TargetType = XDP_REDIRECT_TARGET_TYPE_CPU;
+                ValidatedRule->Redirect.CpuRedirect = UserRule->Redirect.CpuRedirect;
+                Status = STATUS_SUCCESS;
+            }
             break;
 
         default:

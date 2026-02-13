@@ -413,6 +413,14 @@ static const XDP_EXTENSION_REGISTRATION XdpRxFrameExtensions[] = {
         .Size                   = sizeof(XDP_FRAME_TIMESTAMP),
         .Alignment              = __alignof(XDP_FRAME_TIMESTAMP),
     },
+    {
+        .Info.ExtensionName     = XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME,
+        .Info.ExtensionVersion  = XDP_FRAME_EXTENSION_CPU_REDIRECT_VERSION_1,
+        .Info.ExtensionType     = XDP_EXTENSION_TYPE_FRAME,
+        .Size                   = sizeof(XDP_FRAME_CPU_REDIRECT),
+        .Alignment              = __alignof(XDP_FRAME_CPU_REDIRECT),
+        .InternalExtension      = TRUE,
+    },
 };
 
 static const XDP_EXTENSION_REGISTRATION XdpRxBufferExtensions[] = {
@@ -504,6 +512,7 @@ XdpRxQueueSetCapabilities(
     XdpExtensionSetEnableEntry(RxQueue->BufferExtensionSet, XDP_BUFFER_EXTENSION_VIRTUAL_ADDRESS_NAME);
 
     XdpExtensionSetEnableEntry(RxQueue->FrameExtensionSet, XDP_FRAME_EXTENSION_RX_ACTION_NAME);
+    XdpExtensionSetEnableEntry(RxQueue->FrameExtensionSet, XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME);
 
     if (Capabilities->MaximumFragments > 0) {
         XdpExtensionSetEnableEntry(RxQueue->FrameExtensionSet, XDP_FRAME_EXTENSION_FRAGMENT_NAME);
@@ -1043,6 +1052,11 @@ XdpRxQueueAttachInterface(
         &ExtensionInfo, XDP_FRAME_EXTENSION_RX_ACTION_NAME,
         XDP_FRAME_EXTENSION_RX_ACTION_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
     XdpRxQueueGetExtension(ConfigActivate, &ExtensionInfo, &RxQueue->RxActionExtension);
+
+    XdpInitializeExtensionInfo(
+        &ExtensionInfo, XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME,
+        XDP_FRAME_EXTENSION_CPU_REDIRECT_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
+    XdpRxQueueGetExtension(ConfigActivate, &ExtensionInfo, &RxQueue->InspectionContext.CpuRedirectExtension);
 
     if (XdpRxQueueIsVirtualAddressEnabled(ConfigActivate)) {
         XdpInitializeExtensionInfo(

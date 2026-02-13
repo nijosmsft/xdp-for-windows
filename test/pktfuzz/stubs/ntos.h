@@ -93,3 +93,21 @@ RtlSizeTMult(
         return STATUS_INTEGER_OVERFLOW;
     }
 }
+
+#ifndef ALL_PROCESSOR_GROUPS
+#define ALL_PROCESSOR_GROUPS 0xffff
+#endif
+
+inline
+ULONG
+KeQueryActiveProcessorCountEx(
+    _In_ USHORT GroupNumber
+    )
+{
+    UNREFERENCED_PARAMETER(GroupNumber);
+
+    //
+    // Return a reasonable CPU count for fuzzing.
+    //
+    return 64;
+}

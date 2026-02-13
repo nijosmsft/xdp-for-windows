@@ -1722,6 +1722,67 @@ XdpGenericReceivePostInspectNbs(
                 NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
                 break;
 
+            case XDP_RX_ACTION_CPU_REDIRECT:
+                {
+                    //
+                    // Get target CPU from frame extension.
+                    //
+                    XDP_FRAME_CPU_REDIRECT *CpuRedirect =
+                        XdpGetCpuRedirectExtension(Frame, &RxQueue->CpuRedirectExtension);
+                    UINT32 TargetCpu = CpuRedirect->TargetCpu;
+
+                    //
+                    // Ensure CPUMAP is created (lazy initialization).
+                    //
+                    if (RxQueue->Generic->CpuMap == NULL) {
+                        //
+                        // Create CPUMAP on first use.
+                        //
+                        UINT32 CpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                        NTSTATUS Status = XdpCpuMapCreate(
+                            CpuCount,
+                            XDP_CPUMAP_RING_DEFAULT_CAPACITY,
+                            RxQueue->Generic->NdisFilterHandle,
+                            &RxQueue->Generic->CpuMap);
+
+                        if (!NT_SUCCESS(Status)) {
+                            //
+                            // Failed to create CPUMAP, drop packet.
+                            //
+                            NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
+                            STAT_INC(&RxQueue->PcwStats, ForwardingFailuresAllocation);
+                            break;
+                        }
+                    }
+
+                    //
+                    // Enqueue to target CPU ring (XdpCpuMapEnqueue handles cloning).
+                    //
+                    NTSTATUS Status = XdpCpuMapEnqueue(
+                        RxQueue->Generic->CpuMap,
+                        TargetCpu,
+                        ActionNbl,
+                        RxQueue->Generic->NdisFilterHandle,
+                        PortNumber);
+
+                    if (!NT_SUCCESS(Status)) {
+                        //
+                        // Enqueue failed (ring full or clone failed).
+                        //
+                        if (Status == STATUS_INSUFFICIENT_RESOURCES) {
+                            STAT_INC(&RxQueue->PcwStats, ForwardingFailuresAllocation);
+                        } else {
+                            STAT_INC(&RxQueue->PcwStats, ForwardingFailuresAllocationLimit);
+                        }
+                    }
+
+                    //
+                    // Return original NBL (like DROP).
+                    //
+                    NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
+                }
+                break;
+
             default:
                 ASSERT(FALSE);
             }
@@ -2410,6 +2471,11 @@ XdpGenericRxActivateQueue(
         &ExtensionInfo, XDP_FRAME_EXTENSION_RX_ACTION_NAME,
         XDP_FRAME_EXTENSION_RX_ACTION_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
     XdpRxQueueGetExtension(Config, &ExtensionInfo, &RxQueue->RxActionExtension);
+
+    XdpInitializeExtensionInfo(
+        &ExtensionInfo, XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME,
+        XDP_FRAME_EXTENSION_CPU_REDIRECT_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
+    XdpRxQueueGetExtension(Config, &ExtensionInfo, &RxQueue->CpuRedirectExtension);
 
     XdpInitializeExtensionInfo(
         &ExtensionInfo, XDP_FRAME_EXTENSION_FRAGMENT_NAME,

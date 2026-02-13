@@ -16,6 +16,7 @@ typedef struct _XDP_INSPECTION_CONTEXT {
     XDP_INSPECTION_EBPF_CONTEXT EbpfContext;
     XDP_REDIRECT_CONTEXT RedirectContext;
     ULONG IfIndex;
+    XDP_EXTENSION CpuRedirectExtension;
 } XDP_INSPECTION_CONTEXT;
 
 //

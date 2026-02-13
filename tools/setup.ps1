@@ -204,8 +204,18 @@ function Install-DriverCertificate($CertFileName) {
     $Chain.Build($CertFileName) | Write-Verbose
     $Chain.ChainElements.Certificate | Select-Object -Last 1 | Export-Certificate -Type CERT -FilePath $CertRootFileName | Write-Verbose
 
-    Import-Certificate -FilePath $CertRootFileName -CertStoreLocation 'cert:\localmachine\root' | Write-Verbose
-    Import-Certificate -FilePath $CertFileName -CertStoreLocation 'cert:\localmachine\trustedpublisher' | Write-Verbose
+    # Use certutil instead of Import-Certificate for better compatibility
+    Write-Verbose "Importing root certificate using certutil"
+    & certutil -f -addstore Root $CertRootFileName 2>&1 | Write-Verbose
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to import root certificate with certutil (exit code: $LASTEXITCODE)"
+    }
+
+    Write-Verbose "Importing publisher certificate using certutil"
+    & certutil -f -addstore TrustedPublisher $CertFileName 2>&1 | Write-Verbose
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to import publisher certificate with certutil (exit code: $LASTEXITCODE)"
+    }
 }
 
 function Install-SignedDriverCertificate($SignedFileName) {

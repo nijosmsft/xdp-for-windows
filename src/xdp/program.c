@@ -1270,11 +1270,18 @@ XdpProgramBindingAttach(
                 if (!NT_SUCCESS(Status)) {
                     goto Exit;
                 }
+                break;
 
+            case XDP_REDIRECT_TARGET_TYPE_CPU:
+                //
+                // CPU redirect parameters already validated in XdpProgramValidateRule
+                // No additional validation needed here
+                //
                 break;
 
             default:
-                break;
+                Status = STATUS_NOT_SUPPORTED;
+                goto Exit;
             }
         }
     }

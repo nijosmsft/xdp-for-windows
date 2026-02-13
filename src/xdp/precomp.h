@@ -85,6 +85,7 @@
 
 #include "xdpp.h"
 #include "bind.h"
+#include "cpumap.h"
 #include "dispatch.h"
 #include "ebpfextension.h"
 #include "extensionset.h"

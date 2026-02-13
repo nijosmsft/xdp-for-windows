@@ -2,6 +2,7 @@
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="bind.c" />
+    <ClCompile Include="cpumap.c" />
     <ClCompile Include="dispatch.c" />
     <ClCompile Include="ebpfextension.c" />
     <ClCompile Include="extensionset.c" />
