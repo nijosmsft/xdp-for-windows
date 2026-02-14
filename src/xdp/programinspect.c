@@ -1410,27 +1410,75 @@ XdpInspect(
                     }
 
                     //
-                    // Compute simple hash from IP addresses and ports.
+                    // Compute improved hash from IP addresses and ports.
+                    // Uses symmetric hash to ensure bidirectional flows
+                    // map to the same CPU for better cache locality and
+                    // more uniform distribution across CPUs.
                     //
                     if (FrameCache.Ip4Valid) {
-                        Hash = (*(UINT32 *)&FrameCache.Ip4Hdr->SourceAddress) ^
-                               (*(UINT32 *)&FrameCache.Ip4Hdr->DestinationAddress);
+                        UINT32 SrcIp = *(UINT32 *)&FrameCache.Ip4Hdr->SourceAddress;
+                        UINT32 DstIp = *(UINT32 *)&FrameCache.Ip4Hdr->DestinationAddress;
+
+                        //
+                        // Symmetric combination: ensures hash(A→B) == hash(B→A).
+                        // Using min + rotl(max, 16) provides better distribution
+                        // than simple XOR while maintaining symmetry.
+                        //
+                        UINT32 MinIp = (SrcIp < DstIp) ? SrcIp : DstIp;
+                        UINT32 MaxIp = (SrcIp > DstIp) ? SrcIp : DstIp;
+                        Hash = MinIp + ((MaxIp << 16) | (MaxIp >> 16));  // Rotate left 16
                     } else if (FrameCache.Ip6Valid) {
                         //
-                        // Hash IPv6 by XORing address dwords.
+                        // Hash IPv6 symmetrically by combining all address dwords.
                         //
+                        UINT32 SrcHash = 0;
+                        UINT32 DstHash = 0;
+
                         for (ULONG i = 0; i < 4; i++) {
-                            Hash ^= ((UINT32 *)&FrameCache.Ip6Hdr->SourceAddress)[i];
-                            Hash ^= ((UINT32 *)&FrameCache.Ip6Hdr->DestinationAddress)[i];
+                            SrcHash ^= ((UINT32 *)&FrameCache.Ip6Hdr->SourceAddress)[i];
+                            DstHash ^= ((UINT32 *)&FrameCache.Ip6Hdr->DestinationAddress)[i];
                         }
+
+                        //
+                        // Symmetric combination for IPv6 hash values.
+                        //
+                        UINT32 MinHash = (SrcHash < DstHash) ? SrcHash : DstHash;
+                        UINT32 MaxHash = (SrcHash > DstHash) ? SrcHash : DstHash;
+                        Hash = MinHash + ((MaxHash << 16) | (MaxHash >> 16));  // Rotate left 16
                     }
 
                     if (FrameCache.UdpValid) {
-                        Hash ^= (UINT32)FrameCache.UdpHdr->uh_sport;
-                        Hash ^= (UINT32)FrameCache.UdpHdr->uh_dport;
+                        UINT16 SrcPort = FrameCache.UdpHdr->uh_sport;
+                        UINT16 DstPort = FrameCache.UdpHdr->uh_dport;
+
+                        //
+                        // Symmetric port combination: min in low word, max in high word.
+                        //
+                        UINT16 MinPort = (SrcPort < DstPort) ? SrcPort : DstPort;
+                        UINT16 MaxPort = (SrcPort > DstPort) ? SrcPort : DstPort;
+                        UINT32 PortHash = (UINT32)MinPort + ((UINT32)MaxPort << 16);
+
+                        //
+                        // Mix IP and port hashes using multiplicative constant.
+                        // 0x9E3779B9 is the golden ratio, provides good avalanche.
+                        //
+                        Hash = Hash * 0x9E3779B9 + PortHash;
                     } else if (FrameCache.TcpValid) {
-                        Hash ^= (UINT32)FrameCache.TcpHdr->th_sport;
-                        Hash ^= (UINT32)FrameCache.TcpHdr->th_dport;
+                        UINT16 SrcPort = FrameCache.TcpHdr->th_sport;
+                        UINT16 DstPort = FrameCache.TcpHdr->th_dport;
+
+                        //
+                        // Symmetric port combination: min in low word, max in high word.
+                        //
+                        UINT16 MinPort = (SrcPort < DstPort) ? SrcPort : DstPort;
+                        UINT16 MaxPort = (SrcPort > DstPort) ? SrcPort : DstPort;
+                        UINT32 PortHash = (UINT32)MinPort + ((UINT32)MaxPort << 16);
+
+                        //
+                        // Mix IP and port hashes using multiplicative constant.
+                        // 0x9E3779B9 is the golden ratio, provides good avalanche.
+                        //
+                        Hash = Hash * 0x9E3779B9 + PortHash;
                     }
 
                     //
