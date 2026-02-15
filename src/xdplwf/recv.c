@@ -1732,18 +1732,19 @@ XdpGenericReceivePostInspectNbs(
                     UINT32 TargetCpu = CpuRedirect->TargetCpu;
 
                     //
-                    // Ensure CPUMAP is created (lazy initialization).
+                    // Ensure CPUMAP is created (race-safe lazy initialization).
+                    // Multiple RX queues share Generic->CpuMap, so use
+                    // InterlockedCompareExchangePointer to avoid leaking a
+                    // duplicate allocation.
                     //
                     if (RxQueue->Generic->CpuMap == NULL) {
-                        //
-                        // Create CPUMAP on first use.
-                        //
                         UINT32 CpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                        XDP_CPUMAP *NewMap = NULL;
                         NTSTATUS Status = XdpCpuMapCreate(
                             CpuCount,
                             XDP_CPUMAP_RING_DEFAULT_CAPACITY,
                             RxQueue->Generic->NdisFilterHandle,
-                            &RxQueue->Generic->CpuMap);
+                            &NewMap);
 
                         if (!NT_SUCCESS(Status)) {
                             //
@@ -1752,6 +1753,17 @@ XdpGenericReceivePostInspectNbs(
                             NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
                             STAT_INC(&RxQueue->PcwStats, ForwardingFailuresAllocation);
                             break;
+                        }
+
+                        //
+                        // Atomically install the new map. If another thread
+                        // already installed one, destroy ours and use theirs.
+                        //
+                        if (InterlockedCompareExchangePointer(
+                                (PVOID *)&RxQueue->Generic->CpuMap,
+                                NewMap,
+                                NULL) != NULL) {
+                            XdpCpuMapDestroy(NewMap);
                         }
                     }
 

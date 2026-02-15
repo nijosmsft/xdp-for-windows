@@ -1482,6 +1482,18 @@ XdpInspect(
                     }
 
                     //
+                    // Finalize hash: spread entropy across all bits so that
+                    // the subsequent modulo distributes evenly, especially
+                    // for non-power-of-2 CPU counts.  Uses murmur3 32-bit
+                    // finalizer constants.
+                    //
+                    Hash ^= Hash >> 16;
+                    Hash *= 0x85ebca6b;
+                    Hash ^= Hash >> 13;
+                    Hash *= 0xc2b2ae35;
+                    Hash ^= Hash >> 16;
+
+                    //
                     // Map to target CPU.
                     //
                     UINT32 CpuBase = Rule->Redirect.CpuRedirect.TargetCpuBase;
