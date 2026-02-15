@@ -1627,6 +1627,8 @@ XdpGenericReceivePostInspectNbs(
         FrameRing->InterfaceReserved == FrameRing->ProducerIndex - 1);
 
     NET_BUFFER_LIST *CachedNextNbl = NULL;
+    XDP_CPUMAP_BATCH CpuRedirectBatch;
+    XdpCpuMapBatchInit(&CpuRedirectBatch);
 
     while (NbHead != NbTail) {
         XDP_FRAME *Frame;
@@ -1768,24 +1770,27 @@ XdpGenericReceivePostInspectNbs(
                     }
 
                     //
-                    // Enqueue to target CPU ring (XdpCpuMapEnqueue handles cloning).
+                    // Collect redirect decision in the batch. The batch
+                    // is flushed after the while loop to minimize lock
+                    // acquisitions and DPC inserts.
                     //
-                    NTSTATUS Status = XdpCpuMapEnqueue(
-                        RxQueue->Generic->CpuMap,
-                        TargetCpu,
-                        ActionNbl,
-                        RxQueue->Generic->NdisFilterHandle,
-                        PortNumber);
-
-                    if (!NT_SUCCESS(Status)) {
+                    if (!XdpCpuMapBatchAdd(
+                            &CpuRedirectBatch,
+                            ActionNbl,
+                            TargetCpu,
+                            RxQueue->Generic->NdisFilterHandle,
+                            PortNumber)) {
                         //
-                        // Enqueue failed (ring full or clone failed).
+                        // Batch full — flush current batch and retry.
                         //
-                        if (Status == STATUS_INSUFFICIENT_RESOURCES) {
-                            STAT_INC(&RxQueue->PcwStats, ForwardingFailuresAllocation);
-                        } else {
-                            STAT_INC(&RxQueue->PcwStats, ForwardingFailuresAllocationLimit);
-                        }
+                        XdpCpuMapFlushBatch(
+                            RxQueue->Generic->CpuMap, &CpuRedirectBatch);
+                        XdpCpuMapBatchAdd(
+                            &CpuRedirectBatch,
+                            ActionNbl,
+                            TargetCpu,
+                            RxQueue->Generic->NdisFilterHandle,
+                            PortNumber);
                     }
 
                     //
@@ -1819,6 +1824,13 @@ XdpGenericReceivePostInspectNbs(
                 RxQueue->Generic->NdisFilterHandle, &RxQueue->EcLock, PassList, DropList,
                 LowResourcesList, PortNumber, (NbHead == NULL));
         }
+    }
+
+    //
+    // Flush any remaining batched CPU redirect entries.
+    //
+    if (CpuRedirectBatch.Count > 0 && RxQueue->Generic->CpuMap != NULL) {
+        XdpCpuMapFlushBatch(RxQueue->Generic->CpuMap, &CpuRedirectBatch);
     }
 
     ASSERT(FrameRing->InterfaceReserved == FrameRing->ProducerIndex);

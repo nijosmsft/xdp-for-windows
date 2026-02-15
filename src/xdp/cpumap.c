@@ -322,6 +322,195 @@ XdpCpuMapEnqueue(
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapBatchInit(
+    _Out_ XDP_CPUMAP_BATCH *Batch
+    )
+{
+    Batch->Count = 0;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+XdpCpuMapBatchAdd(
+    _Inout_ XDP_CPUMAP_BATCH *Batch,
+    _In_ NET_BUFFER_LIST *Nbl,
+    _In_ UINT32 TargetCpu,
+    _In_ NDIS_HANDLE FilterHandle,
+    _In_ NDIS_PORT_NUMBER PortNumber
+    )
+{
+    if (Batch->Count >= XDP_CPUMAP_MAX_BATCH_ENTRIES) {
+        return FALSE;
+    }
+
+    XDP_CPUMAP_BATCH_ENTRY *Entry = &Batch->Entries[Batch->Count];
+    Entry->OriginalNbl = Nbl;
+    Entry->TargetCpu = TargetCpu;
+    Entry->FilterHandle = FilterHandle;
+    Entry->PortNumber = PortNumber;
+    Batch->Count++;
+
+    return TRUE;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapFlushBatch(
+    _In_ XDP_CPUMAP *CpuMap,
+    _Inout_ XDP_CPUMAP_BATCH *Batch
+    )
+/*++
+
+Routine Description:
+
+    Flush all collected CPU redirect decisions in a single pass.
+
+    Phase 1: Clone all NBLs in a tight loop (no locks held) using the
+             source CPU's per-CPU clone pool for cache-hot L1 lookaside.
+
+    Phase 2: For each unique target CPU, acquire the ring lock once,
+             enqueue all clones destined for that target, release the lock,
+             and schedule one DPC.
+
+    This reduces lock acquisitions from N (one per packet) to T (one per
+    unique target CPU in the batch) and DPC inserts from N to T.
+
+--*/
+{
+    UINT32 i, j;
+    NET_BUFFER_LIST *Clones[XDP_CPUMAP_MAX_BATCH_ENTRIES];
+    BOOLEAN Processed[XDP_CPUMAP_MAX_BATCH_ENTRIES];
+
+    if (Batch->Count == 0 || !CpuMap->Active) {
+        return;
+    }
+
+    //
+    // Resolve the source CPU's clone pool (once per flush, outside any lock).
+    //
+    UINT32 SourceCpu = KeGetCurrentProcessorIndex();
+    NDIS_HANDLE ClonePool;
+
+    if (SourceCpu < CpuMap->ClonePoolCount) {
+        ClonePool = CpuMap->PerCpuClonePools[SourceCpu];
+    } else {
+        ClonePool = CpuMap->PerCpuClonePools[0];
+    }
+
+    //
+    // Phase 1: Clone all NBLs. No locks held — this is the hot allocation
+    // loop and benefits from cache-hot per-CPU pool L1 lookaside.
+    //
+    for (i = 0; i < Batch->Count; i++) {
+        XDP_CPUMAP_BATCH_ENTRY *BatchEntry = &Batch->Entries[i];
+        NET_BUFFER_LIST *Original = BatchEntry->OriginalNbl;
+
+        Clones[i] = NdisAllocateCloneNetBufferList(Original, ClonePool, NULL, 0);
+
+        if (Clones[i] != NULL) {
+            //
+            // Preserve RSS hash and metadata on the clone.
+            //
+            NET_BUFFER_LIST_SET_HASH_VALUE(Clones[i],
+                NET_BUFFER_LIST_GET_HASH_VALUE(Original));
+            NET_BUFFER_LIST_SET_HASH_TYPE(Clones[i],
+                NET_BUFFER_LIST_GET_HASH_TYPE(Original));
+            Processed[i] = FALSE;
+        } else {
+            //
+            // Clone failed — mark as already processed (will be skipped).
+            //
+            Processed[i] = TRUE;
+        }
+    }
+
+    //
+    // Phase 2: Group by target CPU and enqueue with one lock acquisition
+    // per target. With N <= 32, the O(N*T) scan is trivial at DISPATCH_LEVEL.
+    //
+    for (i = 0; i < Batch->Count; i++) {
+        KLOCK_QUEUE_HANDLE LockHandle;
+        XDP_CPUMAP_RING *Ring;
+        UINT32 TargetCpu;
+        UINT32 Enqueued = 0;
+        UINT32 Dropped = 0;
+
+        if (Processed[i]) {
+            continue;
+        }
+
+        TargetCpu = Batch->Entries[i].TargetCpu;
+
+        if (TargetCpu >= CpuMap->CpuCount) {
+            //
+            // Invalid target — free the clone and skip.
+            //
+            NdisFreeCloneNetBufferList(Clones[i], 0);
+            Processed[i] = TRUE;
+            continue;
+        }
+
+        Ring = CpuMap->PerCpuRings[TargetCpu];
+
+        //
+        // Acquire the target ring lock ONCE for all entries going to this CPU.
+        //
+        KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+
+        //
+        // Enqueue this entry and all subsequent entries with the same target.
+        //
+        for (j = i; j < Batch->Count; j++) {
+            XDP_CPUMAP_ENTRY *RingEntry;
+            UINT32 NextTail;
+
+            if (Processed[j] || Batch->Entries[j].TargetCpu != TargetCpu) {
+                continue;
+            }
+
+            NextTail = Ring->Tail + 1;
+            if ((NextTail - Ring->Head) > Ring->Capacity) {
+                //
+                // Ring full — free the clone and count the drop.
+                //
+                NdisFreeCloneNetBufferList(Clones[j], 0);
+                Dropped++;
+                Processed[j] = TRUE;
+                continue;
+            }
+
+            RingEntry = &Ring->Entries[Ring->Tail & Ring->Mask];
+            RingEntry->Nbl = Clones[j];
+            RingEntry->FilterHandle = Batch->Entries[j].FilterHandle;
+            RingEntry->PortNumber = Batch->Entries[j].PortNumber;
+
+            Ring->Tail = NextTail;
+            Enqueued++;
+            Processed[j] = TRUE;
+        }
+
+        if (Enqueued > 0) {
+            InterlockedAdd(&Ring->EnqueueCount, Enqueued);
+        }
+        if (Dropped > 0) {
+            InterlockedAdd(&Ring->DropCount, Dropped);
+        }
+
+        KeReleaseInStackQueuedSpinLock(&LockHandle);
+
+        //
+        // Schedule exactly one DPC per target CPU.
+        //
+        if (Enqueued > 0) {
+            KeInsertQueueDpc(&CpuMap->PerCpuDpcs[TargetCpu], NULL, NULL);
+        }
+    }
+
+    Batch->Count = 0;
+}
+
 _Function_class_(KDEFERRED_ROUTINE)
 _IRQL_requires_(DISPATCH_LEVEL)
 _IRQL_requires_same_

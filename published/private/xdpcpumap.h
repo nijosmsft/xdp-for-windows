@@ -66,4 +66,46 @@ XdpCpuMapEnqueue(
     _In_ NDIS_PORT_NUMBER PortNumber
     );
 
+//
+// Batch enqueue API: collect redirect decisions, then flush in one pass.
+// Reduces lock acquisitions from N (per-packet) to T (per-target-CPU).
+//
+
+#define XDP_CPUMAP_MAX_BATCH_ENTRIES 32
+
+typedef struct _XDP_CPUMAP_BATCH_ENTRY {
+    NET_BUFFER_LIST *OriginalNbl;
+    UINT32 TargetCpu;
+    NDIS_HANDLE FilterHandle;
+    NDIS_PORT_NUMBER PortNumber;
+} XDP_CPUMAP_BATCH_ENTRY;
+
+typedef struct _XDP_CPUMAP_BATCH {
+    UINT32 Count;
+    XDP_CPUMAP_BATCH_ENTRY Entries[XDP_CPUMAP_MAX_BATCH_ENTRIES];
+} XDP_CPUMAP_BATCH;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapBatchInit(
+    _Out_ XDP_CPUMAP_BATCH *Batch
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+XdpCpuMapBatchAdd(
+    _Inout_ XDP_CPUMAP_BATCH *Batch,
+    _In_ NET_BUFFER_LIST *Nbl,
+    _In_ UINT32 TargetCpu,
+    _In_ NDIS_HANDLE FilterHandle,
+    _In_ NDIS_PORT_NUMBER PortNumber
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapFlushBatch(
+    _In_ XDP_CPUMAP *CpuMap,
+    _Inout_ XDP_CPUMAP_BATCH *Batch
+    );
+
 #endif // _KERNEL_MODE
