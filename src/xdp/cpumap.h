@@ -50,7 +50,15 @@ struct _XDP_CPUMAP {
     UINT32 CpuCount;
     volatile BOOLEAN Active;
 
-    NDIS_HANDLE NblClonePool;
+    //
+    // Per-source-CPU NBL clone pools. Indexed by KeGetCurrentProcessorIndex().
+    // Each RSS CPU allocates clones from its own pool; NDIS auto-routes frees
+    // back to the originating pool regardless of which CPU calls
+    // NdisFreeCloneNetBufferList.
+    //
+    UINT32 ClonePoolCount;
+    NDIS_HANDLE *PerCpuClonePools;
+
     XDP_CPUMAP_RING **PerCpuRings;
     KDPC *PerCpuDpcs;
 

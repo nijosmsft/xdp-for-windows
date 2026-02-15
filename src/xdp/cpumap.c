@@ -68,8 +68,21 @@ XdpCpuMapCreate(
     }
 
     //
-    // Create NBL clone pool
+    // Allocate per-source-CPU NBL clone pools.
+    // Each source CPU allocates clones from its own pool, eliminating
+    // contention on the pool-global spinlock at high CPU counts.
+    // NdisFreeCloneNetBufferList auto-routes frees to the originating pool.
     //
+    Map->ClonePoolCount = 0;
+    Map->PerCpuClonePools = ExAllocatePoolZero(
+        NonPagedPoolNx,
+        sizeof(NDIS_HANDLE) * CpuCount,
+        POOLTAG_CPUMAP);
+    if (Map->PerCpuClonePools == NULL) {
+        Status = STATUS_NO_MEMORY;
+        goto Exit;
+    }
+
     RtlZeroMemory(&PoolParams, sizeof(PoolParams));
     PoolParams.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
     PoolParams.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
@@ -78,10 +91,13 @@ XdpCpuMapCreate(
     PoolParams.fAllocateNetBuffer = TRUE;
     PoolParams.ContextSize = 0;
 
-    Map->NblClonePool = NdisAllocateNetBufferListPool(NdisHandle, &PoolParams);
-    if (Map->NblClonePool == NULL) {
-        Status = STATUS_NO_MEMORY;
-        goto Exit;
+    for (UINT32 i = 0; i < CpuCount; i++) {
+        Map->PerCpuClonePools[i] = NdisAllocateNetBufferListPool(NdisHandle, &PoolParams);
+        if (Map->PerCpuClonePools[i] == NULL) {
+            Status = STATUS_NO_MEMORY;
+            goto Exit;
+        }
+        Map->ClonePoolCount++;
     }
 
     //
@@ -111,7 +127,7 @@ XdpCpuMapCreate(
         Ring->DrainCount = 0;
         Ring->DropCount = 0;
 
-#pragma warning(suppress: 6386) // Buffer overrun false positive - array size is correct
+#pragma prefast(suppress:6386, "Buffer size is sizeof(XDP_CPUMAP_RING *) * CpuCount, indexed by i < CpuCount.")
         Map->PerCpuRings[i] = Ring;
 
         //
@@ -174,7 +190,6 @@ XdpCpuMapDestroy(
                 while (Ring->Head != Ring->Tail) {
                     XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
                     if (Entry->Nbl != NULL) {
-#pragma warning(suppress: 6001) // Nbl is initialized by enqueue - false positive
                         NdisFreeCloneNetBufferList(Entry->Nbl, 0);
                     }
                     Ring->Head++;
@@ -194,10 +209,16 @@ XdpCpuMapDestroy(
     }
 
     //
-    // Free NBL clone pool
+    // Free per-CPU NBL clone pools
     //
-    if (CpuMap->NblClonePool != NULL) {
-        NdisFreeNetBufferListPool(CpuMap->NblClonePool);
+    if (CpuMap->PerCpuClonePools != NULL) {
+        for (UINT32 i = 0; i < CpuMap->ClonePoolCount; i++) {
+#pragma prefast(suppress:6001, "Pool handles are initialized in XdpCpuMapCreate.")
+            if (CpuMap->PerCpuClonePools[i] != NULL) {
+                NdisFreeNetBufferListPool(CpuMap->PerCpuClonePools[i]);
+            }
+        }
+        ExFreePoolWithTag(CpuMap->PerCpuClonePools, POOLTAG_CPUMAP);
     }
 
     //
@@ -230,11 +251,23 @@ XdpCpuMapEnqueue(
     }
 
     //
-    // Clone the NBL before enqueuing.
+    // Clone the NBL using the source CPU's dedicated pool.
     //
+    UINT32 SourceCpu = KeGetCurrentProcessorIndex();
+    NDIS_HANDLE ClonePool;
+
+    if (SourceCpu < CpuMap->ClonePoolCount) {
+        ClonePool = CpuMap->PerCpuClonePools[SourceCpu];
+    } else {
+        //
+        // Guard against CPU hot-add: fall back to pool 0.
+        //
+        ClonePool = CpuMap->PerCpuClonePools[0];
+    }
+
     Clone = NdisAllocateCloneNetBufferList(
         Nbl,
-        CpuMap->NblClonePool,
+        ClonePool,
         NULL,
         0);
 
