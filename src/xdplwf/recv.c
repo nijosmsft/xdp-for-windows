@@ -2604,6 +2604,25 @@ XdpGenericRxDeleteQueue(
     XdpLifetimeDelete(XdpGenericRxDeleteTxInspectEc, &RxQueue->DeleteEntry);
     KeWaitForSingleObject(&DeleteComplete, Executive, KernelMode, FALSE, NULL);
 
+    //
+    // If this was the last RX queue, destroy the CpuMap so stats are dumped
+    // and resources freed. The CpuMap is lazily created on first CPU redirect
+    // action and lives on Generic, so we clean it up here when no more queues
+    // can reference it.
+    //
+    {
+        XDP_CPUMAP *OldMap = NULL;
+        RtlAcquirePushLockExclusive(&Generic->Lock);
+        if (IsListEmpty(&Generic->Rx.Queues) && Generic->CpuMap != NULL) {
+            OldMap = Generic->CpuMap;
+            Generic->CpuMap = NULL;
+        }
+        RtlReleasePushLockExclusive(&Generic->Lock);
+        if (OldMap != NULL) {
+            XdpCpuMapDestroy(OldMap);
+        }
+    }
+
     TraceExitSuccess(TRACE_GENERIC);
 }
 

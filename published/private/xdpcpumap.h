@@ -20,7 +20,7 @@ typedef struct _XDP_FRAME_CPU_REDIRECT {
 //
 typedef struct _XDP_CPUMAP XDP_CPUMAP;
 
-#define XDP_CPUMAP_RING_DEFAULT_CAPACITY 256
+#define XDP_CPUMAP_RING_DEFAULT_CAPACITY 32768
 
 //
 // CPU redirect extension inline accessor.

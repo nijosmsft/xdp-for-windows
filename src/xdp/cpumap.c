@@ -100,6 +100,17 @@ XdpCpuMapCreate(
         Map->ClonePoolCount++;
     }
 
+#if XDP_CPUMAP_PREALLOC
+    //
+    // Create a single NBL pool for pre-allocated shells.
+    //
+    Map->PreallocNblPool = NdisAllocateNetBufferListPool(NdisHandle, &PoolParams);
+    if (Map->PreallocNblPool == NULL) {
+        Status = STATUS_NO_MEMORY;
+        goto Exit;
+    }
+#endif
+
     //
     // Allocate and initialize per-CPU rings and DPCs
     //
@@ -126,6 +137,62 @@ XdpCpuMapCreate(
         Ring->EnqueueCount = 0;
         Ring->DrainCount = 0;
         Ring->DropCount = 0;
+        Ring->RingFullCount = 0;
+        Ring->CloneFailCount = 0;
+        Ring->PreallocHitCount = 0;
+        Ring->PreallocMissCount = 0;
+        Ring->PreallocOversizeCount = 0;
+        Ring->DpcInvokeCount = 0;
+        Ring->DpcMaxBatchDrained = 0;
+        Ring->DpcRequeueCount = 0;
+        Ring->MaxRingDepth = 0;
+
+#if XDP_CPUMAP_PREALLOC
+        //
+        // Pre-allocate NBL+NB+MDL+Buffer shells for this ring.
+        // Allocate all shells in a single contiguous block to eliminate
+        // per-shell pool headers and reduce NonPagedPool fragmentation.
+        // Each shell is pushed onto a lock-free SLIST; enqueue pops,
+        // drain pushes back — no NDIS pool alloc/free on the hot path.
+        //
+        InitializeSListHead(&Ring->PreallocFreeList);
+
+        {
+            SIZE_T BlockSize = (SIZE_T)RingCapacity * sizeof(XDP_CPUMAP_PREALLOC_SHELL);
+            Ring->PreallocShellBlock = ExAllocatePoolZero(
+                NonPagedPoolNx, BlockSize, POOLTAG_CPUMAP);
+            if (Ring->PreallocShellBlock == NULL) {
+                Status = STATUS_NO_MEMORY;
+                goto Exit;
+            }
+        }
+
+        for (UINT32 k = 0; k < RingCapacity; k++) {
+            XDP_CPUMAP_PREALLOC_SHELL *Shell = &Ring->PreallocShellBlock[k];
+
+            Shell->Mdl = IoAllocateMdl(
+                Shell->DataBuffer,
+                XDP_CPUMAP_PREALLOC_BUFFER_SIZE,
+                FALSE, FALSE, NULL);
+            if (Shell->Mdl == NULL) {
+                Status = STATUS_NO_MEMORY;
+                goto Exit;
+            }
+            MmBuildMdlForNonPagedPool(Shell->Mdl);
+
+            Shell->Nbl = NdisAllocateNetBufferAndNetBufferList(
+                Map->PreallocNblPool, 0, 0, Shell->Mdl, 0, 0);
+            if (Shell->Nbl == NULL) {
+                IoFreeMdl(Shell->Mdl);
+                Shell->Mdl = NULL;
+                Status = STATUS_NO_MEMORY;
+                goto Exit;
+            }
+
+            InterlockedPushEntrySList(
+                &Ring->PreallocFreeList, &Shell->SListEntry);
+        }
+#endif
 
 #pragma prefast(suppress:6386, "Buffer size is sizeof(XDP_CPUMAP_RING *) * CpuCount, indexed by i < CpuCount.")
         Map->PerCpuRings[i] = Ring;
@@ -178,6 +245,80 @@ XdpCpuMapDestroy(
     KeFlushQueuedDpcs();
 
     //
+    // Dump per-ring statistics via DbgPrintEx (works at any IRQL).
+    // View with WinDbg or DbgView (enable kernel capture).
+    //
+    if (CpuMap->PerCpuRings != NULL) {
+        LONG TotalEnqueue = 0, TotalDrain = 0, TotalDrop = 0;
+        LONG TotalRingFull = 0, TotalCloneFail = 0;
+        LONG TotalPreallocHit = 0, TotalPreallocMiss = 0, TotalOversize = 0;
+        LONG TotalDpcInvoke = 0, TotalDpcRequeue = 0;
+        LONG TotalEnqBatch = 0, TotalDpcLoop = 0, TotalDpcEmpty = 0;
+
+        DbgPrintEx(
+            DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+            "CPUMAP: Destroying map (%u CPUs, ring capacity %u)\n",
+            CpuMap->CpuCount,
+            CpuMap->PerCpuRings[0] ? CpuMap->PerCpuRings[0]->Capacity : 0);
+
+        for (UINT32 s = 0; s < CpuMap->CpuCount; s++) {
+            XDP_CPUMAP_RING *R = CpuMap->PerCpuRings[s];
+            if (R != NULL && (R->EnqueueCount || R->DrainCount || R->DropCount)) {
+                TotalEnqueue += R->EnqueueCount;
+                TotalDrain += R->DrainCount;
+                TotalDrop += R->DropCount;
+                TotalRingFull += R->RingFullCount;
+                TotalCloneFail += R->CloneFailCount;
+                TotalPreallocHit += R->PreallocHitCount;
+                TotalPreallocMiss += R->PreallocMissCount;
+                TotalOversize += R->PreallocOversizeCount;
+                TotalDpcInvoke += R->DpcInvokeCount;
+                TotalDpcRequeue += R->DpcRequeueCount;
+                TotalEnqBatch += R->EnqueueBatchCount;
+                TotalDpcLoop += R->DpcLoopIterations;
+                TotalDpcEmpty += R->DpcEmptyCount;
+
+                DbgPrintEx(
+                    DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+                    "Ring[%2u]: Enq=%d Drain=%d Drop=%d "
+                    "Full=%d CFail=%d "
+                    "PHit=%d PMiss=%d Over=%d "
+                    "DPC=%d MaxB=%d Req=%d MaxD=%d "
+                    "EBat=%d Loop=%d MxL=%d Emp=%d\n",
+                    s, R->EnqueueCount, R->DrainCount, R->DropCount,
+                    R->RingFullCount, R->CloneFailCount,
+                    R->PreallocHitCount, R->PreallocMissCount,
+                    R->PreallocOversizeCount,
+                    R->DpcInvokeCount, R->DpcMaxBatchDrained,
+                    R->DpcRequeueCount, R->MaxRingDepth,
+                    R->EnqueueBatchCount, R->DpcLoopIterations,
+                    R->DpcMaxLoopIterations, R->DpcEmptyCount);
+            }
+        }
+
+        {
+            LONG LossWhole = 0, LossFrac = 0;
+            if (TotalEnqueue > 0) {
+                LONG Bp = (LONG)((LONGLONG)TotalDrop * 10000 / TotalEnqueue);
+                LossWhole = Bp / 100;
+                LossFrac = Bp % 100;
+            }
+            DbgPrintEx(
+                DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+                "Totals: Enq=%d Drain=%d Drop=%d (%d.%02d%%) "
+                "Full=%d CFail=%d "
+                "PHit=%d PMiss=%d Over=%d "
+                "DPC=%d Req=%d "
+                "EBat=%d Loop=%d Emp=%d\n",
+                TotalEnqueue, TotalDrain, TotalDrop, LossWhole, LossFrac,
+                TotalRingFull, TotalCloneFail,
+                TotalPreallocHit, TotalPreallocMiss, TotalOversize,
+                TotalDpcInvoke, TotalDpcRequeue,
+                TotalEnqBatch, TotalDpcLoop, TotalDpcEmpty);
+        }
+    }
+
+    //
     // Free per-CPU rings
     //
     if (CpuMap->PerCpuRings != NULL) {
@@ -190,10 +331,38 @@ XdpCpuMapDestroy(
                 while (Ring->Head != Ring->Tail) {
                     XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
                     if (Entry->Nbl != NULL) {
-                        NdisFreeCloneNetBufferList(Entry->Nbl, 0);
+#if XDP_CPUMAP_PREALLOC
+                        if (Entry->Shell != NULL) {
+                            InterlockedPushEntrySList(
+                                &Ring->PreallocFreeList, &Entry->Shell->SListEntry);
+                        } else
+#endif
+                        {
+                            NdisFreeCloneNetBufferList(Entry->Nbl, 0);
+                        }
                     }
                     Ring->Head++;
                 }
+
+#if XDP_CPUMAP_PREALLOC
+                //
+                // Free all pre-allocated shells.
+                // Shells live in a contiguous block; free NBL/MDL per-shell,
+                // then free the single block.
+                //
+                if (Ring->PreallocShellBlock != NULL) {
+                    for (UINT32 k = 0; k < Ring->Capacity; k++) {
+                        XDP_CPUMAP_PREALLOC_SHELL *Shell = &Ring->PreallocShellBlock[k];
+                        if (Shell->Nbl != NULL) {
+                            NdisFreeNetBufferList(Shell->Nbl);
+                        }
+                        if (Shell->Mdl != NULL) {
+                            IoFreeMdl(Shell->Mdl);
+                        }
+                    }
+                    ExFreePoolWithTag(Ring->PreallocShellBlock, POOLTAG_CPUMAP);
+                }
+#endif
 
                 ExFreePoolWithTag(Ring, POOLTAG_CPUMAP);
             }
@@ -220,6 +389,12 @@ XdpCpuMapDestroy(
         }
         ExFreePoolWithTag(CpuMap->PerCpuClonePools, POOLTAG_CPUMAP);
     }
+
+#if XDP_CPUMAP_PREALLOC
+    if (CpuMap->PreallocNblPool != NULL) {
+        NdisFreeNetBufferListPool(CpuMap->PreallocNblPool);
+    }
+#endif
 
     //
     // Free CPUMAP structure
@@ -382,6 +557,9 @@ Routine Description:
     UINT32 i, j;
     NET_BUFFER_LIST *Clones[XDP_CPUMAP_MAX_BATCH_ENTRIES];
     BOOLEAN Processed[XDP_CPUMAP_MAX_BATCH_ENTRIES];
+#if XDP_CPUMAP_PREALLOC
+    XDP_CPUMAP_PREALLOC_SHELL *Shells[XDP_CPUMAP_MAX_BATCH_ENTRIES];
+#endif
 
     if (Batch->Count == 0 || !CpuMap->Active) {
         return;
@@ -400,13 +578,99 @@ Routine Description:
     }
 
     //
-    // Phase 1: Clone all NBLs. No locks held — this is the hot allocation
-    // loop and benefits from cache-hot per-CPU pool L1 lookaside.
+    // Phase 1: Prepare NBLs for each batch entry. No locks held.
     //
     for (i = 0; i < Batch->Count; i++) {
         XDP_CPUMAP_BATCH_ENTRY *BatchEntry = &Batch->Entries[i];
         NET_BUFFER_LIST *Original = BatchEntry->OriginalNbl;
 
+#if XDP_CPUMAP_PREALLOC
+        Shells[i] = NULL;
+#endif
+        Clones[i] = NULL;
+        Processed[i] = TRUE;
+
+#if XDP_CPUMAP_PREALLOC
+        //
+        // Try pre-allocated shell path: pop a shell from the target ring's
+        // lock-free free list, memcpy the packet data, and use the shell's
+        // pre-allocated NBL.  This eliminates NdisAllocateCloneNetBufferList
+        // and NdisFreeCloneNetBufferList from the hot path.
+        //
+        {
+            UINT32 TargetCpu = BatchEntry->TargetCpu;
+
+            if (TargetCpu < CpuMap->CpuCount) {
+                XDP_CPUMAP_RING *TargetRing = CpuMap->PerCpuRings[TargetCpu];
+                PSLIST_ENTRY Sle =
+                    InterlockedPopEntrySList(&TargetRing->PreallocFreeList);
+
+                if (Sle != NULL) {
+                    XDP_CPUMAP_PREALLOC_SHELL *Shell =
+                        CONTAINING_RECORD(Sle, XDP_CPUMAP_PREALLOC_SHELL, SListEntry);
+                    NET_BUFFER *SrcNb = NET_BUFFER_LIST_FIRST_NB(Original);
+                    ULONG DataLen = NET_BUFFER_DATA_LENGTH(SrcNb);
+
+                    if (DataLen <= XDP_CPUMAP_PREALLOC_BUFFER_SIZE) {
+                        PVOID SrcData = NdisGetDataBuffer(
+                            SrcNb, DataLen, Shell->DataBuffer, 1, 0);
+
+                        if (SrcData != NULL) {
+                            NET_BUFFER *DstNb;
+
+                            if (SrcData != Shell->DataBuffer) {
+                                RtlCopyMemory(
+                                    Shell->DataBuffer, SrcData, DataLen);
+                            }
+
+                            //
+                            // Wire up the pre-allocated NB to describe the
+                            // copied data.
+                            //
+                            DstNb = NET_BUFFER_LIST_FIRST_NB(Shell->Nbl);
+                            NET_BUFFER_DATA_LENGTH(DstNb) = DataLen;
+                            NET_BUFFER_DATA_OFFSET(DstNb) = 0;
+                            NET_BUFFER_CURRENT_MDL(DstNb) = Shell->Mdl;
+                            NET_BUFFER_CURRENT_MDL_OFFSET(DstNb) = 0;
+
+                            //
+                            // Preserve RSS hash metadata.
+                            //
+                            NET_BUFFER_LIST_SET_HASH_VALUE(Shell->Nbl,
+                                NET_BUFFER_LIST_GET_HASH_VALUE(Original));
+                            NET_BUFFER_LIST_SET_HASH_TYPE(Shell->Nbl,
+                                NET_BUFFER_LIST_GET_HASH_TYPE(Original));
+
+                            Clones[i] = Shell->Nbl;
+                            Shells[i] = Shell;
+                            Processed[i] = FALSE;
+                            InterlockedIncrement(&TargetRing->PreallocHitCount);
+                            continue;
+                        }
+                    }
+
+                    //
+                    // Packet too large or data retrieval failed;
+                    // return the shell and fall through to clone path.
+                    //
+                    if (DataLen > XDP_CPUMAP_PREALLOC_BUFFER_SIZE) {
+                        InterlockedIncrement(&TargetRing->PreallocOversizeCount);
+                    }
+                    InterlockedPushEntrySList(
+                        &TargetRing->PreallocFreeList, &Shell->SListEntry);
+                } else {
+                    //
+                    // SLIST was empty — all shells in-flight.
+                    //
+                    InterlockedIncrement(&TargetRing->PreallocMissCount);
+                }
+            }
+        }
+#endif // XDP_CPUMAP_PREALLOC
+
+        //
+        // Fallback: clone the NBL via the NDIS pool allocator.
+        //
         Clones[i] = NdisAllocateCloneNetBufferList(Original, ClonePool, NULL, 0);
 
         if (Clones[i] != NULL) {
@@ -420,9 +684,12 @@ Routine Description:
             Processed[i] = FALSE;
         } else {
             //
-            // Clone failed — mark as already processed (will be skipped).
+            // Clone allocation failed.
             //
-            Processed[i] = TRUE;
+            UINT32 Tc = BatchEntry->TargetCpu;
+            if (Tc < CpuMap->CpuCount) {
+                InterlockedIncrement(&CpuMap->PerCpuRings[Tc]->CloneFailCount);
+            }
         }
     }
 
@@ -473,10 +740,19 @@ Routine Description:
             NextTail = Ring->Tail + 1;
             if ((NextTail - Ring->Head) > Ring->Capacity) {
                 //
-                // Ring full — free the clone and count the drop.
+                // Ring full — recycle shell or free clone, count the drop.
                 //
-                NdisFreeCloneNetBufferList(Clones[j], 0);
+#if XDP_CPUMAP_PREALLOC
+                if (Shells[j] != NULL) {
+                    InterlockedPushEntrySList(
+                        &Ring->PreallocFreeList, &Shells[j]->SListEntry);
+                } else
+#endif
+                {
+                    NdisFreeCloneNetBufferList(Clones[j], 0);
+                }
                 Dropped++;
+                InterlockedIncrement(&Ring->RingFullCount);
                 Processed[j] = TRUE;
                 continue;
             }
@@ -485,14 +761,28 @@ Routine Description:
             RingEntry->Nbl = Clones[j];
             RingEntry->FilterHandle = Batch->Entries[j].FilterHandle;
             RingEntry->PortNumber = Batch->Entries[j].PortNumber;
+#if XDP_CPUMAP_PREALLOC
+            RingEntry->Shell = Shells[j];
+#endif
 
             Ring->Tail = NextTail;
             Enqueued++;
             Processed[j] = TRUE;
+
+            //
+            // Track high-water mark of ring occupancy.
+            //
+            {
+                LONG Depth = (LONG)(Ring->Tail - Ring->Head);
+                if (Depth > Ring->MaxRingDepth) {
+                    Ring->MaxRingDepth = Depth;
+                }
+            }
         }
 
         if (Enqueued > 0) {
             InterlockedAdd(&Ring->EnqueueCount, Enqueued);
+            InterlockedIncrement(&Ring->EnqueueBatchCount);
         }
         if (Dropped > 0) {
             InterlockedAdd(&Ring->DropCount, Dropped);
@@ -534,17 +824,50 @@ XdpCpuMapDrainDpc(
     NDIS_PORT_NUMBER PortNumber = 0;
     KLOCK_QUEUE_HANDLE LockHandle;
     BOOLEAN MoreWork;
+#if !XDP_CPUMAP_DRAIN_ALL && XDP_CPUMAP_PREALLOC
+    XDP_CPUMAP_PREALLOC_SHELL *ShellBatch[XDP_CPUMAP_MAX_BATCH_SIZE];
+#endif
 
     if (Ring == NULL) {
         return;
     }
+
+    InterlockedIncrement(&Ring->DpcInvokeCount);
+
+#if !XDP_CPUMAP_DRAIN_ALL
+    //
+    // Batched drain-until-empty: loop inside the DPC, draining up to
+    // XDP_CPUMAP_MAX_BATCH_SIZE per iteration. This keeps per-indication
+    // batch sizes small (low latency) while eliminating the DPC re-queue
+    // gap that causes ring drops under load.
+    //
+    {
+    UINT32 LoopIter = 0;
+    do {
+    LoopIter++;
+#endif
+
+    BatchHead = NULL;
+    BatchTail = NULL;
+    Count = 0;
+    FilterHandle = NULL;
+    PortNumber = 0;
 
     //
     // Dequeue batch
     //
     KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
 
+#if XDP_CPUMAP_DRAIN_ALL
+    //
+    // Drain-all mode: dequeue the entire ring in one pass. No batch cap.
+    // Shell pointers are stored inline in the NBL scratch field and
+    // recycled after NDIS indication, avoiding a fixed-size stack array.
+    //
+    while (Ring->Head != Ring->Tail) {
+#else
     while (Ring->Head != Ring->Tail && Count < XDP_CPUMAP_MAX_BATCH_SIZE) {
+#endif
         XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
 
         FilterHandle = Entry->FilterHandle;
@@ -561,6 +884,16 @@ XdpCpuMapDrainDpc(
         }
         BatchTail = Entry->Nbl;
 
+#if XDP_CPUMAP_DRAIN_ALL && XDP_CPUMAP_PREALLOC
+        //
+        // Stash shell pointer in NBL->MiniportReserved[0] so we can
+        // recycle it after indication without a separate array.
+        //
+        Entry->Nbl->MiniportReserved[0] = Entry->Shell;
+#elif XDP_CPUMAP_PREALLOC
+        ShellBatch[Count] = Entry->Shell;
+#endif
+
         Ring->Head++;
         Count++;
     }
@@ -568,6 +901,17 @@ XdpCpuMapDrainDpc(
     MoreWork = (Ring->Head != Ring->Tail);
     if (Count > 0) {
         InterlockedAdd(&Ring->DrainCount, Count);
+        //
+        // Track largest batch drained in a single DPC.
+        //
+        if ((LONG)Count > Ring->DpcMaxBatchDrained) {
+            Ring->DpcMaxBatchDrained = (LONG)Count;
+        }
+    } else if (!MoreWork) {
+        //
+        // DPC fired but ring was already empty.
+        //
+        InterlockedIncrement(&Ring->DpcEmptyCount);
     }
 
     KeReleaseInStackQueuedSpinLock(&LockHandle);
@@ -584,20 +928,76 @@ XdpCpuMapDrainDpc(
             NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL | NDIS_RECEIVE_FLAGS_RESOURCES);
 
         //
-        // RESOURCES flag means synchronous return, free clones immediately
+        // RESOURCES flag means synchronous return — recycle shells or free
+        // clones immediately.
         //
-        NET_BUFFER_LIST *Current = BatchHead;
-        while (Current != NULL) {
-            NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Current);
-            NdisFreeCloneNetBufferList(Current, 0);
-            Current = Next;
+        {
+            NET_BUFFER_LIST *Current = BatchHead;
+#if !XDP_CPUMAP_DRAIN_ALL && XDP_CPUMAP_PREALLOC
+            UINT32 Idx = 0;
+#endif
+            while (Current != NULL) {
+                NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Current);
+#if XDP_CPUMAP_DRAIN_ALL && XDP_CPUMAP_PREALLOC
+                {
+                    XDP_CPUMAP_PREALLOC_SHELL *Shell =
+                        (XDP_CPUMAP_PREALLOC_SHELL *)Current->MiniportReserved[0];
+                    if (Shell != NULL) {
+                        InterlockedPushEntrySList(
+                            &Ring->PreallocFreeList,
+                            &Shell->SListEntry);
+                    } else {
+                        NdisFreeCloneNetBufferList(Current, 0);
+                    }
+                }
+#elif XDP_CPUMAP_PREALLOC
+                if (ShellBatch[Idx] != NULL) {
+                    //
+                    // Pre-allocated shell — push back to the ring's lock-free
+                    // free list.  No NDIS pool free required.
+                    //
+                    InterlockedPushEntrySList(
+                        &Ring->PreallocFreeList,
+                        &ShellBatch[Idx]->SListEntry);
+                } else
+                {
+                    NdisFreeCloneNetBufferList(Current, 0);
+                }
+#else
+                {
+                    NdisFreeCloneNetBufferList(Current, 0);
+                }
+#endif
+#if !XDP_CPUMAP_DRAIN_ALL && XDP_CPUMAP_PREALLOC
+                Idx++;
+#endif
+                Current = Next;
+            }
         }
     }
 
+#if XDP_CPUMAP_DRAIN_ALL
     //
-    // Re-queue DPC if more work remains
+    // Drain-all mode: re-queue DPC if more work remains (shouldn't happen).
     //
     if (MoreWork) {
+        InterlockedIncrement(&Ring->DpcRequeueCount);
         KeInsertQueueDpc(Dpc, NULL, NULL);
     }
+#else
+    //
+    // Batched mode: loop back if more work remains. Track re-queue count
+    // for stats parity (counts loop iterations beyond the first).
+    //
+    if (MoreWork) {
+        InterlockedIncrement(&Ring->DpcRequeueCount);
+    }
+    } while (MoreWork);
+
+    InterlockedAdd(&Ring->DpcLoopIterations, (LONG)LoopIter);
+    if ((LONG)LoopIter > Ring->DpcMaxLoopIterations) {
+        Ring->DpcMaxLoopIterations = (LONG)LoopIter;
+    }
+    } // end LoopIter scope
+#endif
 }

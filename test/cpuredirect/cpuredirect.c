@@ -51,6 +51,11 @@ CONST CHAR *UsageText =
 #define LOGINFO(...) \
     printf(__VA_ARGS__); printf("\n")
 
+//
+// Event signaled by Ctrl+C handler to wake the main thread for clean shutdown.
+//
+HANDLE StopEvent = NULL;
+
 BOOL
 ParseArgs(
     INT ArgC,
@@ -96,7 +101,8 @@ CtrlHandler(
     case CTRL_BREAK_EVENT:
     case CTRL_CLOSE_EVENT:
         LOGINFO("\nDetaching XDP program...");
-        return FALSE;  // Let default handler terminate the process
+        SetEvent(StopEvent);
+        return TRUE;  // Signal main thread; don't let default handler call ExitProcess
     default:
         return FALSE;
     }
@@ -201,20 +207,30 @@ main(
     //
     // Set up Ctrl+C handler.
     //
+    StopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (StopEvent == NULL) {
+        LOGERR("CreateEvent failed: %u", GetLastError());
+        CloseHandle(Program);
+        return 1;
+    }
+
     SetConsoleCtrlHandler((PHANDLER_ROUTINE)CtrlHandler, TRUE);
 
     //
-    // Keep the program running until interrupted.
+    // Keep the program running until Ctrl+C signals the stop event.
     //
-    Sleep(INFINITE);
+    WaitForSingleObject(StopEvent, INFINITE);
 
     //
-    // Clean up (reached via Ctrl+C).
+    // Clean up: close the XDP program handle to trigger kernel-side detach
+    // and resource cleanup (including CpuMap destroy + stats dump).
     //
     if (Program != NULL) {
         CloseHandle(Program);
         LOGINFO("XDP program detached.");
     }
+
+    CloseHandle(StopEvent);
 
     return 0;
 }
