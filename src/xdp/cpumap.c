@@ -9,8 +9,10 @@
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 XdpCpuMapCreate(
+    _In_ UINT32 CpuBase,
     _In_ UINT32 CpuCount,
     _In_ UINT32 RingCapacity,
+    _In_ UINT32 DrainBatchSize,
     _In_ NDIS_HANDLE NdisHandle,
     _Out_ XDP_CPUMAP **CpuMap
     )
@@ -39,12 +41,20 @@ XdpCpuMapCreate(
         goto Exit;
     }
 
+    Map->CpuBase = CpuBase;
     Map->CpuCount = CpuCount;
     Map->Active = TRUE;
     Map->RefCount = 1;
 
     //
-    // Allocate per-CPU ring array
+    // Clamp DrainBatchSize to [1, XDP_CPUMAP_MAX_BATCH_SIZE].
+    //
+    if (DrainBatchSize == 0 || DrainBatchSize > XDP_CPUMAP_MAX_BATCH_SIZE) {
+        DrainBatchSize = XDP_CPUMAP_MAX_BATCH_SIZE;
+    }
+
+    //
+    // Allocate per-CPU ring array — one ring per TARGET CPU only.
     //
     Map->PerCpuRings = ExAllocatePoolZero(
         NonPagedPoolNx,
@@ -56,7 +66,7 @@ XdpCpuMapCreate(
     }
 
     //
-    // Allocate per-CPU DPC array
+    // Allocate per-CPU DPC array — one DPC per TARGET CPU only.
     //
     Map->PerCpuDpcs = ExAllocatePoolZero(
         NonPagedPoolNx,
@@ -68,36 +78,39 @@ XdpCpuMapCreate(
     }
 
     //
-    // Allocate per-source-CPU NBL clone pools.
-    // Each source CPU allocates clones from its own pool, eliminating
-    // contention on the pool-global spinlock at high CPU counts.
-    // NdisFreeCloneNetBufferList auto-routes frees to the originating pool.
+    // Allocate per-source-CPU NBL clone pools for ALL system CPUs.
+    // Any RSS CPU can be a packet source, so we need a pool per source CPU
+    // regardless of the target CPU range.  NdisFreeCloneNetBufferList
+    // auto-routes frees back to the originating pool.
     //
-    Map->ClonePoolCount = 0;
-    Map->PerCpuClonePools = ExAllocatePoolZero(
-        NonPagedPoolNx,
-        sizeof(NDIS_HANDLE) * CpuCount,
-        POOLTAG_CPUMAP);
-    if (Map->PerCpuClonePools == NULL) {
-        Status = STATUS_NO_MEMORY;
-        goto Exit;
-    }
-
-    RtlZeroMemory(&PoolParams, sizeof(PoolParams));
-    PoolParams.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
-    PoolParams.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
-    PoolParams.Header.Size = sizeof(PoolParams);
-    PoolParams.PoolTag = POOLTAG_CPUMAP;
-    PoolParams.fAllocateNetBuffer = TRUE;
-    PoolParams.ContextSize = 0;
-
-    for (UINT32 i = 0; i < CpuCount; i++) {
-        Map->PerCpuClonePools[i] = NdisAllocateNetBufferListPool(NdisHandle, &PoolParams);
-        if (Map->PerCpuClonePools[i] == NULL) {
+    {
+        UINT32 AllCpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        Map->ClonePoolCount = 0;
+        Map->PerCpuClonePools = ExAllocatePoolZero(
+            NonPagedPoolNx,
+            sizeof(NDIS_HANDLE) * AllCpuCount,
+            POOLTAG_CPUMAP);
+        if (Map->PerCpuClonePools == NULL) {
             Status = STATUS_NO_MEMORY;
             goto Exit;
         }
-        Map->ClonePoolCount++;
+
+        RtlZeroMemory(&PoolParams, sizeof(PoolParams));
+        PoolParams.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+        PoolParams.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        PoolParams.Header.Size = sizeof(PoolParams);
+        PoolParams.PoolTag = POOLTAG_CPUMAP;
+        PoolParams.fAllocateNetBuffer = TRUE;
+        PoolParams.ContextSize = 0;
+
+        for (UINT32 i = 0; i < AllCpuCount; i++) {
+            Map->PerCpuClonePools[i] = NdisAllocateNetBufferListPool(NdisHandle, &PoolParams);
+            if (Map->PerCpuClonePools[i] == NULL) {
+                Status = STATUS_NO_MEMORY;
+                goto Exit;
+            }
+            Map->ClonePoolCount++;
+        }
     }
 
 #if XDP_CPUMAP_PREALLOC
@@ -134,6 +147,7 @@ XdpCpuMapCreate(
         Ring->Tail = 0;
         Ring->Capacity = RingCapacity;
         Ring->Mask = RingCapacity - 1;
+        Ring->DrainBatchSize = DrainBatchSize;
         Ring->EnqueueCount = 0;
         Ring->DrainCount = 0;
         Ring->DropCount = 0;
@@ -202,7 +216,7 @@ XdpCpuMapCreate(
         //
         KeInitializeDpc(&Map->PerCpuDpcs[i], XdpCpuMapDrainDpc, Ring);
 
-        Status = KeGetProcessorNumberFromIndex(i, &ProcNumber);
+        Status = KeGetProcessorNumberFromIndex(CpuBase + i, &ProcNumber);
         if (!NT_SUCCESS(Status)) {
             goto Exit;
         }
@@ -421,7 +435,9 @@ XdpCpuMapEnqueue(
     //
     // Validate inputs
     //
-    if (!CpuMap->Active || TargetCpu >= CpuMap->CpuCount) {
+    if (!CpuMap->Active ||
+        TargetCpu < CpuMap->CpuBase ||
+        TargetCpu >= CpuMap->CpuBase + CpuMap->CpuCount) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -458,7 +474,7 @@ XdpCpuMapEnqueue(
     NET_BUFFER_LIST_SET_HASH_TYPE(Clone,
         NET_BUFFER_LIST_GET_HASH_TYPE(Nbl));
 
-    Ring = CpuMap->PerCpuRings[TargetCpu];
+    Ring = CpuMap->PerCpuRings[TargetCpu - CpuMap->CpuBase];
 
     //
     // Acquire spinlock and enqueue
@@ -492,7 +508,7 @@ XdpCpuMapEnqueue(
     //
     // Schedule DPC on target CPU
     //
-    KeInsertQueueDpc(&CpuMap->PerCpuDpcs[TargetCpu], NULL, NULL);
+    KeInsertQueueDpc(&CpuMap->PerCpuDpcs[TargetCpu - CpuMap->CpuBase], NULL, NULL);
 
     return STATUS_SUCCESS;
 }
@@ -599,9 +615,11 @@ Routine Description:
         //
         {
             UINT32 TargetCpu = BatchEntry->TargetCpu;
+            BOOLEAN InRange = (TargetCpu >= CpuMap->CpuBase &&
+                               TargetCpu < CpuMap->CpuBase + CpuMap->CpuCount);
 
-            if (TargetCpu < CpuMap->CpuCount) {
-                XDP_CPUMAP_RING *TargetRing = CpuMap->PerCpuRings[TargetCpu];
+            if (InRange) {
+                XDP_CPUMAP_RING *TargetRing = CpuMap->PerCpuRings[TargetCpu - CpuMap->CpuBase];
                 PSLIST_ENTRY Sle =
                     InterlockedPopEntrySList(&TargetRing->PreallocFreeList);
 
@@ -687,8 +705,8 @@ Routine Description:
             // Clone allocation failed.
             //
             UINT32 Tc = BatchEntry->TargetCpu;
-            if (Tc < CpuMap->CpuCount) {
-                InterlockedIncrement(&CpuMap->PerCpuRings[Tc]->CloneFailCount);
+            if (Tc >= CpuMap->CpuBase && Tc < CpuMap->CpuBase + CpuMap->CpuCount) {
+                InterlockedIncrement(&CpuMap->PerCpuRings[Tc - CpuMap->CpuBase]->CloneFailCount);
             }
         }
     }
@@ -710,7 +728,7 @@ Routine Description:
 
         TargetCpu = Batch->Entries[i].TargetCpu;
 
-        if (TargetCpu >= CpuMap->CpuCount) {
+        if (TargetCpu < CpuMap->CpuBase || TargetCpu >= CpuMap->CpuBase + CpuMap->CpuCount) {
             //
             // Invalid target — free the clone and skip.
             //
@@ -719,7 +737,7 @@ Routine Description:
             continue;
         }
 
-        Ring = CpuMap->PerCpuRings[TargetCpu];
+        Ring = CpuMap->PerCpuRings[TargetCpu - CpuMap->CpuBase];
 
         //
         // Acquire the target ring lock ONCE for all entries going to this CPU.
@@ -794,7 +812,7 @@ Routine Description:
         // Schedule exactly one DPC per target CPU.
         //
         if (Enqueued > 0) {
-            KeInsertQueueDpc(&CpuMap->PerCpuDpcs[TargetCpu], NULL, NULL);
+            KeInsertQueueDpc(&CpuMap->PerCpuDpcs[TargetCpu - CpuMap->CpuBase], NULL, NULL);
         }
     }
 
@@ -866,7 +884,7 @@ XdpCpuMapDrainDpc(
     //
     while (Ring->Head != Ring->Tail) {
 #else
-    while (Ring->Head != Ring->Tail && Count < XDP_CPUMAP_MAX_BATCH_SIZE) {
+    while (Ring->Head != Ring->Tail && Count < Ring->DrainBatchSize) {
 #endif
         XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
 

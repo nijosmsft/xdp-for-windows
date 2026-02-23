@@ -16,7 +16,7 @@
 #include <stdlib.h>
 
 CONST CHAR *UsageText =
-"cpuredirect.exe <IfIndex> <Port> <CpuBase> <CpuCount>\n"
+"cpuredirect.exe <IfIndex> <Port> <CpuBase> <CpuCount> [RingDepth] [DrainBatch]\n"
 "\n"
 "Creates an XDP program that redirects UDP traffic to CPUs for load distribution.\n"
 "\n"
@@ -29,15 +29,25 @@ CONST CHAR *UsageText =
 "       UDP destination port to match (0 = match all traffic)\n"
 "\n"
 "   CpuBase\n"
-"       First CPU index in the target range (typically 0)\n"
+"       First CPU index in the target range\n"
 "\n"
 "   CpuCount\n"
 "       Number of CPUs to distribute across\n"
 "\n"
+"   RingDepth (optional, default 32768)\n"
+"       Per-CPU ring capacity. Must be a power of 2.\n"
+"       Only rings for [CpuBase, CpuBase+CpuCount) are allocated.\n"
+"\n"
+"   DrainBatch (optional, default 256)\n"
+"       Max NBLs drained per DPC iteration. Range: 1-256.\n"
+"\n"
 "EXAMPLES:\n"
 "\n"
-"   cpuredirect.exe 6 9999 0 80\n"
-"       Redirect UDP port 9999 traffic across CPUs 0-79\n"
+"   cpuredirect.exe 6 9999 40 20\n"
+"       Redirect UDP port 9999 traffic across CPUs 40-59 (default ring/batch)\n"
+"\n"
+"   cpuredirect.exe 6 9999 56 24 16384 128\n"
+"       CPUs 56-79, 16K ring depth, 128 drain batch\n"
 "\n"
 "   cpuredirect.exe 6 0 0 16\n"
 "       Redirect ALL traffic across CPUs 0-15\n"
@@ -63,10 +73,12 @@ ParseArgs(
     UINT32 *IfIndex,
     UINT16 *Port,
     UINT32 *CpuBase,
-    UINT32 *CpuCount
+    UINT32 *CpuCount,
+    UINT32 *RingDepth,
+    UINT32 *DrainBatch
     )
 {
-    if (ArgC != 5) {
+    if (ArgC < 5 || ArgC > 7) {
         return FALSE;
     }
 
@@ -74,6 +86,8 @@ ParseArgs(
     *Port = (UINT16)atoi(ArgV[2]);
     *CpuBase = (UINT32)atoi(ArgV[3]);
     *CpuCount = (UINT32)atoi(ArgV[4]);
+    *RingDepth = (ArgC >= 6) ? (UINT32)atoi(ArgV[5]) : 0;
+    *DrainBatch = (ArgC >= 7) ? (UINT32)atoi(ArgV[6]) : 0;
 
     //
     // Basic validation.
@@ -85,6 +99,16 @@ ParseArgs(
 
     if (*CpuCount == 0) {
         LOGERR("CPU count must be greater than 0");
+        return FALSE;
+    }
+
+    if (*RingDepth != 0 && (*RingDepth < 2 || (*RingDepth & (*RingDepth - 1)) != 0)) {
+        LOGERR("RingDepth must be 0 (default) or a power of 2 >= 2");
+        return FALSE;
+    }
+
+    if (*DrainBatch > 256) {
+        LOGERR("DrainBatch must be 0 (default) or in range 1-256");
         return FALSE;
     }
 
@@ -119,6 +143,8 @@ main(
     UINT16 Port;
     UINT32 CpuBase;
     UINT32 CpuCount;
+    UINT32 RingDepth;
+    UINT32 DrainBatch;
     XDP_STATUS XdpStatus;
     HANDLE Program = NULL;
     XDP_RULE Rule;
@@ -133,7 +159,7 @@ main(
     //
     // Parse command line arguments.
     //
-    if (!ParseArgs(ArgC, ArgV, &IfIndex, &Port, &CpuBase, &CpuCount)) {
+    if (!ParseArgs(ArgC, ArgV, &IfIndex, &Port, &CpuBase, &CpuCount, &RingDepth, &DrainBatch)) {
         printf(UsageText);
         return 1;
     }
@@ -150,6 +176,8 @@ main(
     }
     LOGINFO("Target CPUs: %u-%u (%u cores)",
             CpuBase, CpuBase + CpuCount - 1, CpuCount);
+    LOGINFO("Ring Depth:  %u (0=default 32768)", RingDepth);
+    LOGINFO("Drain Batch: %u (0=default 256)", DrainBatch);
     LOGINFO("");
 
     //
@@ -168,6 +196,8 @@ main(
     Rule.Redirect.TargetType = XDP_REDIRECT_TARGET_TYPE_CPU;
     Rule.Redirect.CpuRedirect.TargetCpuBase = CpuBase;
     Rule.Redirect.CpuRedirect.TargetCpuCount = CpuCount;
+    Rule.Redirect.CpuRedirect.RingDepth = RingDepth;
+    Rule.Redirect.CpuRedirect.DrainBatchSize = DrainBatch;
 
     //
     // Use generic mode and apply to all queues.

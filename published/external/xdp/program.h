@@ -109,6 +109,8 @@ typedef enum _XDP_REDIRECT_TARGET_TYPE {
 typedef struct _XDP_CPU_REDIRECT_PARAMS {
     UINT32 TargetCpuBase;
     UINT32 TargetCpuCount;
+    UINT32 RingDepth;       // 0 = use default (XDP_CPUMAP_RING_DEFAULT_CAPACITY)
+    UINT32 DrainBatchSize;  // 0 = use default (256)
 } XDP_CPU_REDIRECT_PARAMS;
 
 typedef struct _XDP_REDIRECT_PARAMS {

@@ -10,6 +10,10 @@
 //
 typedef struct _XDP_FRAME_CPU_REDIRECT {
     UINT32 TargetCpu;
+    UINT32 CpuBase;        // First CPU in the redirect range
+    UINT32 CpuCount;       // Number of CPUs in the redirect range
+    UINT32 RingDepth;      // Per-CPU ring capacity (0 = default)
+    UINT32 DrainBatchSize; // DPC drain batch limit (0 = default)
 } XDP_FRAME_CPU_REDIRECT;
 
 #define XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME L"ms_frame_cpu_redirect"
@@ -44,8 +48,10 @@ XdpGetCpuRedirectExtension(
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 XdpCpuMapCreate(
+    _In_ UINT32 CpuBase,
     _In_ UINT32 CpuCount,
     _In_ UINT32 RingCapacity,
+    _In_ UINT32 DrainBatchSize,
     _In_ NDIS_HANDLE NdisHandle,
     _Out_ XDP_CPUMAP **CpuMap
     );

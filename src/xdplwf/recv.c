@@ -1740,11 +1740,24 @@ XdpGenericReceivePostInspectNbs(
                     // duplicate allocation.
                     //
                     if (RxQueue->Generic->CpuMap == NULL) {
-                        UINT32 CpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                        //
+                        // Use CPUMAP parameters from the frame extension,
+                        // which were populated by programinspect from the rule.
+                        //
+                        UINT32 MapCpuBase  = CpuRedirect->CpuBase;
+                        UINT32 MapCpuCount = CpuRedirect->CpuCount != 0
+                            ? CpuRedirect->CpuCount
+                            : KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                        UINT32 RingDepth = CpuRedirect->RingDepth != 0
+                            ? CpuRedirect->RingDepth
+                            : XDP_CPUMAP_RING_DEFAULT_CAPACITY;
+                        UINT32 BatchSize = CpuRedirect->DrainBatchSize;
                         XDP_CPUMAP *NewMap = NULL;
                         NTSTATUS Status = XdpCpuMapCreate(
-                            CpuCount,
-                            XDP_CPUMAP_RING_DEFAULT_CAPACITY,
+                            MapCpuBase,
+                            MapCpuCount,
+                            RingDepth,
+                            BatchSize,
                             RxQueue->Generic->NdisFilterHandle,
                             &NewMap);
 

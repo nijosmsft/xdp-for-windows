@@ -1395,9 +1395,15 @@ XdpInspect(
 
             case XDP_PROGRAM_ACTION_REDIRECT:
                 if (Rule->Redirect.TargetType == XDP_REDIRECT_TARGET_TYPE_CPU) {
+                    UINT32 CpuBase = Rule->Redirect.CpuRedirect.TargetCpuBase;
+                    UINT32 CpuCount = Rule->Redirect.CpuRedirect.TargetCpuCount;
+                    UINT32 TargetCpu;
+
                     //
-                    // CPU redirect: Compute hash from frame and redirect to target CPU.
+                    // Hash-based mode: compute hash from frame headers for
+                    // flow affinity (same 5-tuple always maps to same CPU).
                     //
+                    {
                     UINT32 Hash = 0;
 
                     //
@@ -1493,12 +1499,8 @@ XdpInspect(
                     Hash *= 0xc2b2ae35;
                     Hash ^= Hash >> 16;
 
-                    //
-                    // Map to target CPU.
-                    //
-                    UINT32 CpuBase = Rule->Redirect.CpuRedirect.TargetCpuBase;
-                    UINT32 CpuCount = Rule->Redirect.CpuRedirect.TargetCpuCount;
-                    UINT32 TargetCpu = (Hash % CpuCount) + CpuBase;
+                    TargetCpu = (Hash % CpuCount) + CpuBase;
+                    }
 
                     //
                     // Store target CPU in frame extension.
@@ -1506,6 +1508,10 @@ XdpInspect(
                     XDP_FRAME_CPU_REDIRECT *CpuRedirect =
                         XdpGetCpuRedirectExtension(Frame, &InspectionContext->CpuRedirectExtension);
                     CpuRedirect->TargetCpu = TargetCpu;
+                    CpuRedirect->CpuBase = CpuBase;
+                    CpuRedirect->CpuCount = CpuCount;
+                    CpuRedirect->RingDepth = Rule->Redirect.CpuRedirect.RingDepth;
+                    CpuRedirect->DrainBatchSize = Rule->Redirect.CpuRedirect.DrainBatchSize;
 
                     Action = XDP_RX_ACTION_CPU_REDIRECT;
                     STAT_INC(RxQueueStats, InspectFramesRedirected);

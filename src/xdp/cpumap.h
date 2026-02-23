@@ -70,6 +70,7 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
     UINT32 Tail;           // Producer index
     UINT32 Capacity;       // Power of 2
     UINT32 Mask;           // Capacity - 1
+    UINT32 DrainBatchSize; // Max NBLs to drain per DPC iteration
 
     // Statistics
     volatile LONG EnqueueCount;
@@ -103,7 +104,8 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
 // CPUMAP instance implementation (opaque to external callers).
 //
 struct _XDP_CPUMAP {
-    UINT32 CpuCount;
+    UINT32 CpuBase;    // First target CPU (absolute processor index)
+    UINT32 CpuCount;   // Number of target CPUs; rings are indexed [0, CpuCount)
     volatile BOOLEAN Active;
 
     //
