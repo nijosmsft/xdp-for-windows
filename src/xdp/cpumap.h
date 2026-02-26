@@ -92,6 +92,11 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
     volatile LONG DpcMaxLoopIterations;  // Max loop iterations in a single DPC invocation
     volatile LONG DpcEmptyCount;         // DPC fired but ring was already empty
 
+    // Lock contention profiling
+    volatile LONG64 LockWaitCycles;       // Total rdtsc cycles waiting on spinlock (producers + consumer)
+    volatile LONG LockAcquireCount;       // Total lock acquisitions
+    volatile LONG64 SourceCpuMask[2];     // Bitmask of source CPUs that enqueued (up to 128)
+
 #if XDP_CPUMAP_PREALLOC
     DECLSPEC_CACHEALIGN SLIST_HEADER PreallocFreeList;
     XDP_CPUMAP_PREALLOC_SHELL *PreallocShellBlock;  // Single contiguous allocation for all shells

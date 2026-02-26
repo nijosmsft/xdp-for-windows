@@ -313,13 +313,30 @@ XdpCpuMapDestroy(
                 TotalDpcLoop += R->DpcLoopIterations;
                 TotalDpcEmpty += R->DpcEmptyCount;
 
+                //
+                // Count distinct source CPUs from bitmask.
+                //
+                UINT32 SrcCount = 0;
+                {
+                    LONG64 m0 = R->SourceCpuMask[0];
+                    LONG64 m1 = R->SourceCpuMask[1];
+                    while (m0) { SrcCount++; m0 &= m0 - 1; }
+                    while (m1) { SrcCount++; m1 &= m1 - 1; }
+                }
+
+                LONG64 LkUs = 0;
+                if (TscFreqHz > 1 && R->LockAcquireCount > 0) {
+                    LkUs = R->LockWaitCycles * 1000000LL / TscFreqHz;
+                }
+
                 DbgPrintEx(
                     DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
                     "Ring[%2u]: Enq=%d Drain=%d Drop=%d "
                     "Full=%d CFail=%d "
                     "PHit=%d PMiss=%d Over=%d "
                     "DPC=%d MaxB=%d Req=%d MaxD=%d "
-                    "EBat=%d Loop=%d MxL=%d Emp=%d\n",
+                    "EBat=%d Loop=%d MxL=%d Emp=%d "
+                    "Src=%u Lk=%d LkUs=%lld\n",
                     s, R->EnqueueCount, R->DrainCount, R->DropCount,
                     R->RingFullCount, R->CloneFailCount,
                     R->PreallocHitCount, R->PreallocMissCount,
@@ -327,7 +344,8 @@ XdpCpuMapDestroy(
                     R->DpcInvokeCount, R->DpcMaxBatchDrained,
                     R->DpcRequeueCount, R->MaxRingDepth,
                     R->EnqueueBatchCount, R->DpcLoopIterations,
-                    R->DpcMaxLoopIterations, R->DpcEmptyCount);
+                    R->DpcMaxLoopIterations, R->DpcEmptyCount,
+                    SrcCount, R->LockAcquireCount, LkUs);
             }
         }
 
@@ -516,7 +534,19 @@ XdpCpuMapEnqueue(
     //
     // Acquire spinlock and enqueue
     //
-    KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+    {
+        UINT64 LockStart = __rdtsc();
+        KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+        InterlockedAdd64(&Ring->LockWaitCycles, (LONG64)(__rdtsc() - LockStart));
+        InterlockedIncrement(&Ring->LockAcquireCount);
+    }
+
+    //
+    // Track source CPU.
+    //
+    if (SourceCpu < 128) {
+        InterlockedOr64(&Ring->SourceCpuMask[SourceCpu / 64], 1LL << (SourceCpu % 64));
+    }
 
     NextTail = Ring->Tail + 1;
     if ((NextTail - Ring->Head) > Ring->Capacity) {
@@ -795,7 +825,19 @@ Routine Description:
         //
         // Acquire the target ring lock ONCE for all entries going to this CPU.
         //
-        KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+        {
+            UINT64 LockStart = __rdtsc();
+            KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+            InterlockedAdd64(&Ring->LockWaitCycles, (LONG64)(__rdtsc() - LockStart));
+            InterlockedIncrement(&Ring->LockAcquireCount);
+        }
+
+        //
+        // Track source CPU.
+        //
+        if (SourceCpu < 128) {
+            InterlockedOr64(&Ring->SourceCpuMask[SourceCpu / 64], 1LL << (SourceCpu % 64));
+        }
 
         //
         // Enqueue this entry and all subsequent entries with the same target.
@@ -939,7 +981,12 @@ XdpCpuMapDrainDpc(
     //
     // Dequeue batch
     //
-    KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+    {
+        UINT64 LockStart = __rdtsc();
+        KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+        InterlockedAdd64(&Ring->LockWaitCycles, (LONG64)(__rdtsc() - LockStart));
+        InterlockedIncrement(&Ring->LockAcquireCount);
+    }
 
 #if XDP_CPUMAP_DRAIN_ALL
     //
