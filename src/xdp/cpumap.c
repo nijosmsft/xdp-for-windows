@@ -269,6 +269,27 @@ XdpCpuMapDestroy(
         LONG TotalDpcInvoke = 0, TotalDpcRequeue = 0;
         LONG TotalEnqBatch = 0, TotalDpcLoop = 0, TotalDpcEmpty = 0;
 
+        //
+        // Calibrate rdtsc frequency: measure cycles over a known QPC interval.
+        //
+        LONG64 TscFreqHz = 1;
+#if XDP_CPUMAP_PREALLOC
+        {
+            LARGE_INTEGER QpcStart, QpcEnd, QpcFreq;
+            UINT64 TscStart, TscEnd;
+            KeQueryPerformanceCounter(&QpcFreq);
+            QpcStart = KeQueryPerformanceCounter(NULL);
+            TscStart = __rdtsc();
+            KeStallExecutionProcessor(100); // 100us stall
+            QpcEnd = KeQueryPerformanceCounter(NULL);
+            TscEnd = __rdtsc();
+            LONG64 QpcElapsed = QpcEnd.QuadPart - QpcStart.QuadPart;
+            if (QpcElapsed > 0) {
+                TscFreqHz = (LONG64)((TscEnd - TscStart) * QpcFreq.QuadPart / QpcElapsed);
+            }
+        }
+#endif
+
         DbgPrintEx(
             DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
             "CPUMAP: Destroying map (%u CPUs, ring capacity %u)\n",
@@ -329,6 +350,20 @@ XdpCpuMapDestroy(
                 TotalPreallocHit, TotalPreallocMiss, TotalOversize,
                 TotalDpcInvoke, TotalDpcRequeue,
                 TotalEnqBatch, TotalDpcLoop, TotalDpcEmpty);
+#if XDP_CPUMAP_PREALLOC
+            if (CpuMap->CopyCount > 0 && TscFreqHz > 1) {
+                LONG64 TotalCycles = CpuMap->CopyTotalCycles;
+                LONG CopyN = CpuMap->CopyCount;
+                LONG64 CopyBytes = CpuMap->CopyTotalBytes;
+                LONG64 AvgNs = TotalCycles * 1000000000LL / TscFreqHz / CopyN;
+                LONG64 TotalUs = TotalCycles * 1000000LL / TscFreqHz;
+                LONG64 TotalMB = CopyBytes / (1024 * 1024);
+                DbgPrintEx(
+                    DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+                    "Copy: N=%d TotUs=%lld AvgNs=%lld MB=%lld TscHz=%lld\n",
+                    CopyN, TotalUs, AvgNs, TotalMB, TscFreqHz);
+            }
+#endif
         }
     }
 
@@ -344,6 +379,7 @@ XdpCpuMapDestroy(
                 //
                 while (Ring->Head != Ring->Tail) {
                     XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
+#pragma prefast(suppress:6001, "Ring entries between Head and Tail are always initialized by enqueue.")
                     if (Entry->Nbl != NULL) {
 #if XDP_CPUMAP_PREALLOC
                         if (Entry->Shell != NULL) {
@@ -352,6 +388,7 @@ XdpCpuMapDestroy(
                         } else
 #endif
                         {
+#pragma prefast(suppress:6001, "Ring entries between Head and Tail are always initialized by enqueue.")
                             NdisFreeCloneNetBufferList(Entry->Nbl, 0);
                         }
                     }
@@ -558,8 +595,14 @@ Routine Description:
 
     Flush all collected CPU redirect decisions in a single pass.
 
-    Phase 1: Clone all NBLs in a tight loop (no locks held) using the
-             source CPU's per-CPU clone pool for cache-hot L1 lookaside.
+    Phase 1: Prepare all NBLs in a tight loop (no locks held).
+             When XDP_CPUMAP_PREALLOC=1 (default), pops a pre-allocated
+             shell from the target ring's lock-free SLIST and memcpys the
+             packet data into it.  Falls back to NdisAllocateCloneNetBufferList
+             (using the source CPU's per-CPU clone pool) for oversized packets
+             or when the SLIST is empty.
+             When XDP_CPUMAP_PREALLOC=0, clones all NBLs via the source CPU's
+             per-CPU clone pool for cache-hot L1 lookaside.
 
     Phase 2: For each unique target CPU, acquire the ring lock once,
              enqueue all clones destined for that target, release the lock,
@@ -592,6 +635,12 @@ Routine Description:
     } else {
         ClonePool = CpuMap->PerCpuClonePools[0];
     }
+
+#if XDP_CPUMAP_PREALLOC
+    UINT64 BatchCopyStart = 0, BatchCopyCycles = 0;
+    LONG BatchCopyCount = 0;
+    LONG64 BatchCopyBytes = 0;
+#endif
 
     //
     // Phase 1: Prepare NBLs for each batch entry. No locks held.
@@ -637,8 +686,12 @@ Routine Description:
                             NET_BUFFER *DstNb;
 
                             if (SrcData != Shell->DataBuffer) {
+                                BatchCopyStart = __rdtsc();
                                 RtlCopyMemory(
                                     Shell->DataBuffer, SrcData, DataLen);
+                                BatchCopyCycles += __rdtsc() - BatchCopyStart;
+                                BatchCopyCount++;
+                                BatchCopyBytes += DataLen;
                             }
 
                             //
@@ -817,6 +870,18 @@ Routine Description:
     }
 
     Batch->Count = 0;
+
+#if XDP_CPUMAP_PREALLOC
+    //
+    // Flush batch-local copy stats to map-level counters (one interlocked
+    // add per FlushBatch call instead of per packet).
+    //
+    if (BatchCopyCount > 0) {
+        InterlockedAdd64(&CpuMap->CopyTotalCycles, (LONG64)BatchCopyCycles);
+        InterlockedAdd(&CpuMap->CopyCount, BatchCopyCount);
+        InterlockedAdd64(&CpuMap->CopyTotalBytes, BatchCopyBytes);
+    }
+#endif
 }
 
 _Function_class_(KDEFERRED_ROUTINE)

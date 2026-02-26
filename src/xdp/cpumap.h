@@ -119,6 +119,9 @@ struct _XDP_CPUMAP {
 
 #if XDP_CPUMAP_PREALLOC
     NDIS_HANDLE PreallocNblPool;
+    volatile LONG64 CopyTotalCycles;      // Sum of rdtsc cycles spent in RtlCopyMemory
+    volatile LONG CopyCount;              // Number of RtlCopyMemory calls
+    volatile LONG64 CopyTotalBytes;       // Total bytes copied
 #endif
 
     XDP_CPUMAP_RING **PerCpuRings;
