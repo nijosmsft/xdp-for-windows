@@ -1512,6 +1512,7 @@ XdpInspect(
                     CpuRedirect->CpuCount = CpuCount;
                     CpuRedirect->RingDepth = Rule->Redirect.CpuRedirect.RingDepth;
                     CpuRedirect->DrainBatchSize = Rule->Redirect.CpuRedirect.DrainBatchSize;
+                    CpuRedirect->Flags = Rule->Redirect.CpuRedirect.Flags;
 
                     Action = XDP_RX_ACTION_CPU_REDIRECT;
                     STAT_INC(RxQueueStats, InspectFramesRedirected);
@@ -1753,6 +1754,12 @@ XdpProgramValidateRule(
                 if (CpuBase >= ActiveCpuCount ||
                     CpuCount == 0 ||
                     CpuBase + CpuCount > ActiveCpuCount) {
+                    Status = STATUS_INVALID_PARAMETER;
+                    goto Exit;
+                }
+
+                if ((UserRule->Redirect.CpuRedirect.Flags &
+                    ~XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) != 0) {
                     Status = STATUS_INVALID_PARAMETER;
                     goto Exit;
                 }

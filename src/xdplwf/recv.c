@@ -1748,6 +1748,21 @@ XdpGenericReceivePostInspectNbs(
                     UINT32 TargetCpu = CpuRedirect->TargetCpu;
 
                     //
+                    // Guard: when !CanPend (low-resource / RESOURCES flag)
+                    // and an existing AZC map is active, we cannot safely
+                    // enqueue the original NBL to the ring because the
+                    // caller will also return it to the miniport inline.
+                    // Drop the packet instead of risking a use-after-free.
+                    //
+                    if (!CanPend &&
+                        RxQueue->Generic->CpuMap != NULL &&
+                        (XdpCpuMapGetFlags(RxQueue->Generic->CpuMap) &
+                         XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY)) {
+                        NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
+                        break;
+                    }
+
+                    //
                     // Ensure CPUMAP is created (race-safe lazy initialization).
                     // Multiple RX queues share Generic->CpuMap, so use
                     // InterlockedCompareExchangePointer to avoid leaking a
@@ -1766,12 +1781,18 @@ XdpGenericReceivePostInspectNbs(
                             ? CpuRedirect->RingDepth
                             : XDP_CPUMAP_RING_DEFAULT_CAPACITY;
                         UINT32 BatchSize = CpuRedirect->DrainBatchSize;
+                        UINT32 MapFlags = CpuRedirect->Flags;
+
+                        if (!CanPend) {
+                            MapFlags &= ~XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY;
+                        }
                         XDP_CPUMAP *NewMap = NULL;
                         NTSTATUS Status = XdpCpuMapCreate(
                             MapCpuBase,
                             MapCpuCount,
                             RingDepth,
                             BatchSize,
+                            MapFlags,
                             RxQueue->Generic->NdisFilterHandle,
                             &NewMap);
 
@@ -1812,6 +1833,18 @@ XdpGenericReceivePostInspectNbs(
                         //
                         XdpCpuMapFlushBatch(
                             RxQueue->Generic->CpuMap, &CpuRedirectBatch);
+                        //
+                        // Drain any originals that FlushBatch couldn't enqueue.
+                        //
+                        {
+                            NET_BUFFER_LIST *Ret = CpuRedirectBatch.ReturnableOriginals;
+                            while (Ret != NULL) {
+                                NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Ret);
+                                NdisAppendSingleNblToNblQueue(DropList, Ret);
+                                Ret = Next;
+                            }
+                            CpuRedirectBatch.ReturnableOriginals = NULL;
+                        }
                         XdpCpuMapBatchAdd(
                             &CpuRedirectBatch,
                             ActionNbl,
@@ -1821,9 +1854,17 @@ XdpGenericReceivePostInspectNbs(
                     }
 
                     //
-                    // Return original NBL (like DROP).
+                    // When not using absolute zero-copy, return the original
+                    // NBL to the miniport immediately (like DROP).  In absolute
+                    // zero-copy mode, FlushBatch holds the original for async
+                    // indication; originals that can’t be enqueued are returned
+                    // via ReturnableOriginals above.
                     //
-                    NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
+                    if (!CanPend ||
+                        RxQueue->Generic->CpuMap == NULL ||
+                        !(XdpCpuMapGetFlags(RxQueue->Generic->CpuMap) & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY)) {
+                        NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
+                    }
                 }
                 break;
 
@@ -1858,6 +1899,19 @@ XdpGenericReceivePostInspectNbs(
     //
     if (CpuRedirectBatch.Count > 0 && RxQueue->Generic->CpuMap != NULL) {
         XdpCpuMapFlushBatch(RxQueue->Generic->CpuMap, &CpuRedirectBatch);
+    }
+
+    //
+    // Drain any originals that the final FlushBatch couldn't enqueue
+    // (ring full, invalid target, etc.).
+    //
+    {
+        NET_BUFFER_LIST *Ret = CpuRedirectBatch.ReturnableOriginals;
+        while (Ret != NULL) {
+            NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Ret);
+            NdisAppendSingleNblToNblQueue(DropList, Ret);
+            Ret = Next;
+        }
     }
 
     ASSERT(FrameRing->InterfaceReserved == FrameRing->ProducerIndex);

@@ -143,6 +143,7 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
 struct _XDP_CPUMAP {
     UINT32 CpuBase;    // First target CPU (absolute processor index)
     UINT32 CpuCount;   // Number of target CPUs; rings are indexed [0, CpuCount)
+    UINT32 Flags;      // XDP_CPUMAP_FLAG_* runtime behavior flags
     volatile BOOLEAN Active;
 
     //
@@ -172,6 +173,9 @@ struct _XDP_CPUMAP {
     // Miniport indication flags tracking
     volatile LONG MiniportResourcesCount;    // Miniport indicated WITH RESOURCES
     volatile LONG MiniportNoResourcesCount;  // Miniport indicated WITHOUT RESOURCES
+
+    // Absolute zero-copy stats
+    volatile LONG AbsoluteZeroCopyIndicateCount;  // Originals indicated directly (no copy)
 
     XDP_CPUMAP_RING **PerCpuRings;
     KDPC *PerCpuDpcs;

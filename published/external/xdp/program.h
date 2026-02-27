@@ -106,11 +106,14 @@ typedef enum _XDP_REDIRECT_TARGET_TYPE {
     XDP_REDIRECT_TARGET_TYPE_CPU,
 } XDP_REDIRECT_TARGET_TYPE;
 
+#define XDP_CPU_REDIRECT_FLAG_ABSOLUTE_ZERO_COPY  0x1  // Indicate original miniport NBL directly (no copy)
+
 typedef struct _XDP_CPU_REDIRECT_PARAMS {
     UINT32 TargetCpuBase;
     UINT32 TargetCpuCount;
     UINT32 RingDepth;       // 0 = use default (XDP_CPUMAP_RING_DEFAULT_CAPACITY)
     UINT32 DrainBatchSize;  // 0 = use default (256)
+    UINT32 Flags;           // XDP_CPU_REDIRECT_FLAG_* (0 = default shell-copy path)
 } XDP_CPU_REDIRECT_PARAMS;
 
 typedef struct _XDP_REDIRECT_PARAMS {

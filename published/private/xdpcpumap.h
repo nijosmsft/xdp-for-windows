@@ -14,7 +14,14 @@ typedef struct _XDP_FRAME_CPU_REDIRECT {
     UINT32 CpuCount;       // Number of CPUs in the redirect range
     UINT32 RingDepth;      // Per-CPU ring capacity (0 = default)
     UINT32 DrainBatchSize; // DPC drain batch limit (0 = default)
+    UINT32 Flags;          // XDP_CPUMAP_FLAG_* runtime behavior flags
 } XDP_FRAME_CPU_REDIRECT;
+
+//
+// Runtime behavior flags for CPUMAP (set via XDP_FRAME_CPU_REDIRECT.Flags).
+// The public API define is XDP_CPU_REDIRECT_FLAG_ABSOLUTE_ZERO_COPY in program.h.
+//
+#define XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY      XDP_CPU_REDIRECT_FLAG_ABSOLUTE_ZERO_COPY
 
 #define XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME L"ms_frame_cpu_redirect"
 #define XDP_FRAME_EXTENSION_CPU_REDIRECT_VERSION_1 1U
@@ -61,6 +68,7 @@ XdpCpuMapCreate(
     _In_ UINT32 CpuCount,
     _In_ UINT32 RingCapacity,
     _In_ UINT32 DrainBatchSize,
+    _In_ UINT32 Flags,
     _In_ NDIS_HANDLE NdisHandle,
     _Out_ XDP_CPUMAP **CpuMap
     );
@@ -97,6 +105,7 @@ typedef struct _XDP_CPUMAP_BATCH_ENTRY {
 
 typedef struct _XDP_CPUMAP_BATCH {
     UINT32 Count;
+    NET_BUFFER_LIST *ReturnableOriginals;  // Originals to return to miniport (ring-full / error)
     XDP_CPUMAP_BATCH_ENTRY Entries[XDP_CPUMAP_MAX_BATCH_ENTRIES];
 } XDP_CPUMAP_BATCH;
 
@@ -131,6 +140,15 @@ VOID
 XdpCpuMapTrackMiniportIndication(
     _In_ XDP_CPUMAP *CpuMap,
     _In_ BOOLEAN IsResources
+    );
+
+//
+// Query the runtime flags of a CPUMAP instance.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+UINT32
+XdpCpuMapGetFlags(
+    _In_ XDP_CPUMAP *CpuMap
     );
 
 #if XDP_CPUMAP_ZERO_COPY_INDICATE

@@ -13,6 +13,7 @@ XdpCpuMapCreate(
     _In_ UINT32 CpuCount,
     _In_ UINT32 RingCapacity,
     _In_ UINT32 DrainBatchSize,
+    _In_ UINT32 Flags,
     _In_ NDIS_HANDLE NdisHandle,
     _Out_ XDP_CPUMAP **CpuMap
     )
@@ -43,6 +44,7 @@ XdpCpuMapCreate(
 
     Map->CpuBase = CpuBase;
     Map->CpuCount = CpuCount;
+    Map->Flags = Flags;
     Map->Active = TRUE;
     Map->RefCount = 1;
 
@@ -269,6 +271,15 @@ XdpCpuMapTrackMiniportIndication(
     }
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+UINT32
+XdpCpuMapGetFlags(
+    _In_ XDP_CPUMAP *Map
+    )
+{
+    return Map->Flags;
+}
+
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 XdpCpuMapDestroy(
@@ -289,6 +300,36 @@ XdpCpuMapDestroy(
     // Flush all DPCs to ensure no more are executing
     //
     KeFlushQueuedDpcs();
+
+    //
+    // Drain any remaining ring entries for absolute zero-copy maps.
+    // After Active=FALSE + DPC flush, no new enqueues or DPC drains
+    // can happen. Originals in the ring were never indicated to tcpip,
+    // so return them to the miniport.
+    //
+    // Non-AZC maps do not need this — their ring entries (shells/clones)
+    // are freed during the per-CPU ring teardown below.
+    //
+    if ((CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) &&
+        CpuMap->PerCpuRings != NULL) {
+        for (UINT32 i = 0; i < CpuMap->CpuCount; i++) {
+            XDP_CPUMAP_RING *Ring = CpuMap->PerCpuRings[i];
+            if (Ring == NULL) {
+                continue;
+            }
+            while (Ring->Head != Ring->Tail) {
+                XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
+                //
+                // Original miniport NBL — return to miniport.
+                //
+                if (Entry->FilterHandle != NULL) {
+                    NdisFReturnNetBufferLists(
+                        Entry->FilterHandle, Entry->Nbl, 0);
+                }
+                Ring->Head++;
+            }
+        }
+    }
 
 #if XDP_CPUMAP_ZERO_COPY_INDICATE
     //
@@ -446,6 +487,11 @@ XdpCpuMapDestroy(
                 "Miniport: Resources=%d NoResources=%d\n",
                 CpuMap->MiniportResourcesCount,
                 CpuMap->MiniportNoResourcesCount);
+            DbgPrintEx(
+                DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+                "AbsoluteZeroCopy: Flags=0x%x Indicated=%d\n",
+                CpuMap->Flags,
+                CpuMap->AbsoluteZeroCopyIndicateCount);
 
         }
     }
@@ -652,6 +698,7 @@ XdpCpuMapBatchInit(
     )
 {
     Batch->Count = 0;
+    Batch->ReturnableOriginals = NULL;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -715,7 +762,19 @@ Routine Description:
     XDP_CPUMAP_PREALLOC_SHELL *Shells[XDP_CPUMAP_MAX_BATCH_ENTRIES];
 #endif
 
-    if (Batch->Count == 0 || !CpuMap->Active) {
+    if (Batch->Count == 0) {
+        return;
+    }
+
+    if (!CpuMap->Active) {
+        if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+            for (i = 0; i < Batch->Count; i++) {
+                NET_BUFFER_LIST *Original = Batch->Entries[i].OriginalNbl;
+                NET_BUFFER_LIST_NEXT_NBL(Original) = Batch->ReturnableOriginals;
+                Batch->ReturnableOriginals = Original;
+            }
+        }
+        Batch->Count = 0;
         return;
     }
 
@@ -749,6 +808,17 @@ Routine Description:
 #endif
         Clones[i] = NULL;
         Processed[i] = TRUE;
+
+        //
+        // Absolute zero-copy: use the original miniport NBL directly.
+        // No shell pop, no clone, no memcpy. The original is enqueued
+        // to the ring and indicated to tcpip from DrainDpc.
+        //
+        if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+            Clones[i] = Original;
+            Processed[i] = FALSE;
+            continue;
+        }
 
 #if XDP_CPUMAP_PREALLOC
         //
@@ -878,9 +948,14 @@ Routine Description:
 
         if (TargetCpu < CpuMap->CpuBase || TargetCpu >= CpuMap->CpuBase + CpuMap->CpuCount) {
             //
-            // Invalid target — free the clone and skip.
+            // Invalid target — free the clone (or return original) and skip.
             //
-            NdisFreeCloneNetBufferList(Clones[i], 0);
+            if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+                NET_BUFFER_LIST_NEXT_NBL(Clones[i]) = Batch->ReturnableOriginals;
+                Batch->ReturnableOriginals = Clones[i];
+            } else {
+                NdisFreeCloneNetBufferList(Clones[i], 0);
+            }
             Processed[i] = TRUE;
             continue;
         }
@@ -918,8 +993,12 @@ Routine Description:
             NextTail = Ring->Tail + 1;
             if ((NextTail - Ring->Head) > Ring->Capacity) {
                 //
-                // Ring full — recycle shell or free clone, count the drop.
+                // Ring full — recycle shell, free clone, or return original.
                 //
+                if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+                    NET_BUFFER_LIST_NEXT_NBL(Clones[j]) = Batch->ReturnableOriginals;
+                    Batch->ReturnableOriginals = Clones[j];
+                } else {
 #if XDP_CPUMAP_PREALLOC
                 if (Shells[j] != NULL) {
                     InterlockedPushEntrySList(
@@ -928,6 +1007,7 @@ Routine Description:
 #endif
                 {
                     NdisFreeCloneNetBufferList(Clones[j], 0);
+                }
                 }
                 Dropped++;
                 InterlockedIncrement(&Ring->RingFullCount);
@@ -1192,6 +1272,21 @@ XdpCpuMapDrainDpc(
     // Re-indicate to NDIS
     //
     if (BatchHead != NULL && FilterHandle != NULL) {
+        //
+        // Absolute zero-copy: indicate original miniport NBLs directly.
+        // No magic stamping, no OutstandingIndications tracking (originals
+        // return through normal NDIS ReturnNetBufferLists → miniport).
+        //
+        if (Ring->OwnerMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+            NdisFIndicateReceiveNetBufferLists(
+                FilterHandle,
+                BatchHead,
+                PortNumber,
+                Count,
+                NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
+
+            InterlockedAdd(&Ring->OwnerMap->AbsoluteZeroCopyIndicateCount, Count);
+        } else {
 #if XDP_CPUMAP_ZERO_COPY_INDICATE
         //
         // Zero-copy indicate: stamp magic tags so the return path can
@@ -1294,6 +1389,7 @@ XdpCpuMapDrainDpc(
             }
         }
 #endif // XDP_CPUMAP_ZERO_COPY_INDICATE
+        } // end else (non-absolute-zero-copy path)
     }
 
 #if XDP_CPUMAP_DRAIN_ALL
