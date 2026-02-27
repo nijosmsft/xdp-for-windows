@@ -42,6 +42,15 @@ XdpGetCpuRedirectExtension(
 #ifdef _KERNEL_MODE
 
 //
+// Zero-copy indicate toggle.  When enabled, CPUMAP indicates NBLs
+// without NDIS_RECEIVE_FLAGS_RESOURCES, avoiding a copy in tcpip.
+// Requires XDP_CPUMAP_PREALLOC=1.
+//
+#ifndef XDP_CPUMAP_ZERO_COPY_INDICATE
+#define XDP_CPUMAP_ZERO_COPY_INDICATE 1
+#endif
+
+//
 // CPUMAP lifecycle APIs (callable from xdplwf).
 // Kernel-mode only.
 //
@@ -113,5 +122,29 @@ XdpCpuMapFlushBatch(
     _In_ XDP_CPUMAP *CpuMap,
     _Inout_ XDP_CPUMAP_BATCH *Batch
     );
+
+//
+// Track whether the miniport indicates with or without RESOURCES.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapTrackMiniportIndication(
+    _In_ XDP_CPUMAP *CpuMap,
+    _In_ BOOLEAN IsResources
+    );
+
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+//
+// Return path for zero-copy indicated NBLs.  Called from the LWF
+// ReturnNetBufferLists handler.  Walks the chain, recycles CPUMAP
+// shells/clones, and passes through any non-CPUMAP NBLs via the
+// returned PassThrough chain.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NET_BUFFER_LIST *
+XdpCpuMapReturnShells(
+    _In_ NET_BUFFER_LIST *NetBufferLists
+    );
+#endif // XDP_CPUMAP_ZERO_COPY_INDICATE
 
 #endif // _KERNEL_MODE

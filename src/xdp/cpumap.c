@@ -124,6 +124,15 @@ XdpCpuMapCreate(
     }
 #endif
 
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+    //
+    // Initialize zero-copy indicate tracking. Event starts signaled;
+    // destroy only waits if OutstandingIndications > 0.
+    //
+    Map->OutstandingIndications = 0;
+    KeInitializeEvent(&Map->AllReturnedEvent, NotificationEvent, TRUE);
+#endif
+
     //
     // Allocate and initialize per-CPU rings and DPCs
     //
@@ -203,6 +212,11 @@ XdpCpuMapCreate(
                 goto Exit;
             }
 
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+            Shell->OwnerFreeList = &Ring->PreallocFreeList;
+            Shell->OwnerMap = Map;
+#endif
+
             InterlockedPushEntrySList(
                 &Ring->PreallocFreeList, &Shell->SListEntry);
         }
@@ -210,6 +224,10 @@ XdpCpuMapCreate(
 
 #pragma prefast(suppress:6386, "Buffer size is sizeof(XDP_CPUMAP_RING *) * CpuCount, indexed by i < CpuCount.")
         Map->PerCpuRings[i] = Ring;
+
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+        Ring->OwnerMap = Map;
+#endif
 
         //
         // Initialize DPC with target CPU affinity
@@ -237,6 +255,20 @@ Exit:
     return Status;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapTrackMiniportIndication(
+    _In_ XDP_CPUMAP *Map,
+    _In_ BOOLEAN IsResources
+    )
+{
+    if (IsResources) {
+        InterlockedIncrement(&Map->MiniportResourcesCount);
+    } else {
+        InterlockedIncrement(&Map->MiniportNoResourcesCount);
+    }
+}
+
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 XdpCpuMapDestroy(
@@ -257,6 +289,24 @@ XdpCpuMapDestroy(
     // Flush all DPCs to ensure no more are executing
     //
     KeFlushQueuedDpcs();
+
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+    //
+    // Wait for all outstanding indicated NBLs to be returned by tcpip.
+    // After KeFlushQueuedDpcs, no new indications can happen, so the
+    // count can only decrease.  The event starts signaled and is set
+    // on each decrement-to-zero in XdpCpuMapReturnShells.
+    //
+    if (InterlockedCompareExchange(&CpuMap->OutstandingIndications, 0, 0) > 0) {
+        LARGE_INTEGER Timeout;
+        Timeout.QuadPart = -10LL * 1000 * 1000 * 30; // 30 seconds
+        NTSTATUS WaitStatus =
+            KeWaitForSingleObject(
+                &CpuMap->AllReturnedEvent, Executive, KernelMode, FALSE, &Timeout);
+        ASSERT(WaitStatus == STATUS_SUCCESS);
+        UNREFERENCED_PARAMETER(WaitStatus);
+    }
+#endif
 
     //
     // Dump per-ring statistics via DbgPrintEx (works at any IRQL).
@@ -382,6 +432,21 @@ XdpCpuMapDestroy(
                     CopyN, TotalUs, AvgNs, TotalMB, TscFreqHz);
             }
 #endif
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+            DbgPrintEx(
+                DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+                "ZeroCopy: Indicated=%d ShellRet=%d CloneRet=%d Outstanding=%d\n",
+                CpuMap->ZeroCopyIndicateCount,
+                CpuMap->ShellReturnCount,
+                CpuMap->CloneReturnCount,
+                CpuMap->OutstandingIndications);
+#endif
+            DbgPrintEx(
+                DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+                "Miniport: Resources=%d NoResources=%d\n",
+                CpuMap->MiniportResourcesCount,
+                CpuMap->MiniportNoResourcesCount);
+
         }
     }
 
@@ -926,6 +991,83 @@ Routine Description:
 #endif
 }
 
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NET_BUFFER_LIST *
+XdpCpuMapReturnShells(
+    _In_ NET_BUFFER_LIST *NetBufferLists
+    )
+/*++
+
+Routine Description:
+
+    Walk a returned NBL chain and pull out any CPUMAP-indicated NBLs
+    (identified by magic tags in MiniportReserved[1]).
+
+    Shell-backed NBLs (SHELL_MAGIC): push the shell back to its ring's
+    lock-free free list and decrement the map's outstanding count.
+
+    Clone-backed NBLs (CLONE_MAGIC): free the clone NBL and decrement
+    the map's outstanding count.
+
+    Returns the remaining (non-CPUMAP) NBL chain.
+
+--*/
+{
+    NET_BUFFER_LIST *PassHead = NULL;
+    NET_BUFFER_LIST **PassTail = &PassHead;
+    NET_BUFFER_LIST *Current = NetBufferLists;
+
+    while (Current != NULL) {
+        NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Current);
+
+        if (Current->MiniportReserved[1] == XDP_CPUMAP_SHELL_MAGIC) {
+            //
+            // Shell-backed: recycle shell to ring's SLIST.
+            //
+            XDP_CPUMAP_PREALLOC_SHELL *Shell =
+                (XDP_CPUMAP_PREALLOC_SHELL *)Current->MiniportReserved[0];
+
+            Current->MiniportReserved[0] = NULL;
+            Current->MiniportReserved[1] = NULL;
+
+            InterlockedPushEntrySList(Shell->OwnerFreeList, &Shell->SListEntry);
+            InterlockedIncrement(&Shell->OwnerMap->ShellReturnCount);
+
+            if (InterlockedDecrement(&Shell->OwnerMap->OutstandingIndications) == 0) {
+                KeSetEvent(&Shell->OwnerMap->AllReturnedEvent, IO_NO_INCREMENT, FALSE);
+            }
+        } else if (Current->MiniportReserved[1] == XDP_CPUMAP_CLONE_MAGIC) {
+            //
+            // Clone-backed (fallback path): free clone, decrement count.
+            //
+            XDP_CPUMAP *Map = (XDP_CPUMAP *)Current->MiniportReserved[0];
+
+            Current->MiniportReserved[0] = NULL;
+            Current->MiniportReserved[1] = NULL;
+
+            NdisFreeCloneNetBufferList(Current, 0);
+            InterlockedIncrement(&Map->CloneReturnCount);
+
+            if (InterlockedDecrement(&Map->OutstandingIndications) == 0) {
+                KeSetEvent(&Map->AllReturnedEvent, IO_NO_INCREMENT, FALSE);
+            }
+        } else {
+            //
+            // Not a CPUMAP NBL — pass through.
+            //
+            NET_BUFFER_LIST_NEXT_NBL(Current) = NULL;
+            *PassTail = Current;
+            PassTail = &NET_BUFFER_LIST_NEXT_NBL(Current);
+        }
+
+        Current = Next;
+    }
+
+    return PassHead;
+}
+#endif // XDP_CPUMAP_ZERO_COPY_INDICATE
+
 _Function_class_(KDEFERRED_ROUTINE)
 _IRQL_requires_(DISPATCH_LEVEL)
 _IRQL_requires_same_
@@ -1050,6 +1192,53 @@ XdpCpuMapDrainDpc(
     // Re-indicate to NDIS
     //
     if (BatchHead != NULL && FilterHandle != NULL) {
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+        //
+        // Zero-copy indicate: stamp magic tags so the return path can
+        // identify and recycle CPUMAP NBLs.  Increment outstanding count
+        // for each NBL.  Indicate WITHOUT RESOURCES flag — tcpip takes
+        // ownership and returns NBLs asynchronously.
+        //
+        {
+            NET_BUFFER_LIST *Cur = BatchHead;
+#if !XDP_CPUMAP_DRAIN_ALL
+            UINT32 StampIdx = 0;
+#endif
+            while (Cur != NULL) {
+#if XDP_CPUMAP_DRAIN_ALL
+                XDP_CPUMAP_PREALLOC_SHELL *Shell =
+                    (XDP_CPUMAP_PREALLOC_SHELL *)Cur->MiniportReserved[0];
+#else
+                XDP_CPUMAP_PREALLOC_SHELL *Shell = ShellBatch[StampIdx];
+#endif
+                if (Shell != NULL) {
+                    Cur->MiniportReserved[0] = Shell;
+                    Cur->MiniportReserved[1] = XDP_CPUMAP_SHELL_MAGIC;
+                } else {
+                    Cur->MiniportReserved[0] = Ring->OwnerMap;
+                    Cur->MiniportReserved[1] = XDP_CPUMAP_CLONE_MAGIC;
+                }
+                InterlockedIncrement(&Ring->OwnerMap->OutstandingIndications);
+#if !XDP_CPUMAP_DRAIN_ALL
+                StampIdx++;
+#endif
+                Cur = NET_BUFFER_LIST_NEXT_NBL(Cur);
+            }
+        }
+
+        NdisFIndicateReceiveNetBufferLists(
+            FilterHandle,
+            BatchHead,
+            PortNumber,
+            Count,
+            NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
+
+        InterlockedAdd(&Ring->OwnerMap->ZeroCopyIndicateCount, Count);
+        //
+        // No synchronous recycle — shells/clones are returned via
+        // XdpCpuMapReturnShells when tcpip calls ReturnNetBufferLists.
+        //
+#else // !XDP_CPUMAP_ZERO_COPY_INDICATE
         NdisFIndicateReceiveNetBufferLists(
             FilterHandle,           // FilterModuleContext
             BatchHead,              // NetBufferLists (the NBL chain to indicate)
@@ -1104,6 +1293,7 @@ XdpCpuMapDrainDpc(
                 Current = Next;
             }
         }
+#endif // XDP_CPUMAP_ZERO_COPY_INDICATE
     }
 
 #if XDP_CPUMAP_DRAIN_ALL

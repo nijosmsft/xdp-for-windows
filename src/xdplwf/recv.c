@@ -165,6 +165,20 @@ XdpGenericReturnNetBufferLists(
         OldIrql = KeRaiseIrqlToDpcLevel();
     }
 
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+    //
+    // Recycle any CPUMAP zero-copy NBLs before the inject-complete path.
+    // Non-CPUMAP NBLs are returned as the pass-through chain.
+    //
+    NetBufferLists = XdpCpuMapReturnShells(NetBufferLists);
+    if (NetBufferLists == NULL) {
+        if (OldIrql != DISPATCH_LEVEL) {
+            KeLowerIrql(OldIrql);
+        }
+        return;
+    }
+#endif
+
     NetBufferLists = XdpGenericInjectNetBufferListsComplete(Generic, NetBufferLists);
 
     if (OldIrql != DISPATCH_LEVEL) {
@@ -2005,6 +2019,15 @@ XdpGenericReceiveNetBufferLists(
     NBL_COUNTED_QUEUE TxList;
 
     UNREFERENCED_PARAMETER(NumberOfNetBufferLists);
+
+    //
+    // Track whether miniport indicates with or without RESOURCES.
+    //
+    if (Generic->CpuMap != NULL) {
+        XdpCpuMapTrackMiniportIndication(
+            Generic->CpuMap,
+            (BOOLEAN)!!(ReceiveFlags & NDIS_RECEIVE_FLAGS_RESOURCES));
+    }
 
     XdpGenericReceive(
         Generic, NetBufferLists, PortNumber, &PassList, &DropList, &TxList,

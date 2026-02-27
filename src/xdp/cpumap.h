@@ -38,6 +38,30 @@ EXTERN_C_START
 #define XDP_CPUMAP_PREALLOC 1
 #endif
 
+//
+// Zero-copy indicate: when enabled, CPUMAP indicates shell NBLs to NDIS
+// without NDIS_RECEIVE_FLAGS_RESOURCES, letting tcpip process the data
+// in-place (no tcpip copy). Shells are recycled asynchronously when
+// tcpip returns them via FilterReturnNetBufferLists.
+// Requires XDP_CPUMAP_PREALLOC=1.
+//
+#ifndef XDP_CPUMAP_ZERO_COPY_INDICATE
+#define XDP_CPUMAP_ZERO_COPY_INDICATE 1
+#endif
+
+#if XDP_CPUMAP_ZERO_COPY_INDICATE && !XDP_CPUMAP_PREALLOC
+#error "XDP_CPUMAP_ZERO_COPY_INDICATE requires XDP_CPUMAP_PREALLOC=1"
+#endif
+
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+//
+// Magic tags stamped in Nbl->MiniportReserved[1] before indication.
+// MiniportReserved is originator-owned; we allocated the NBL so it's ours.
+//
+#define XDP_CPUMAP_SHELL_MAGIC  ((PVOID)(ULONG_PTR)0x584D4150)  // 'XMAP'
+#define XDP_CPUMAP_CLONE_MAGIC  ((PVOID)(ULONG_PTR)0x584D4151)  // 'XMAQ'
+#endif
+
 #if XDP_CPUMAP_PREALLOC
 #define XDP_CPUMAP_PREALLOC_BUFFER_SIZE 2048
 
@@ -45,6 +69,10 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_PREALLOC_SHELL {
     SLIST_ENTRY SListEntry;
     NET_BUFFER_LIST *Nbl;
     MDL *Mdl;
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+    PSLIST_HEADER OwnerFreeList;            // Points to Ring->PreallocFreeList for async recycle
+    struct _XDP_CPUMAP *OwnerMap;           // Back-pointer for OutstandingIndications decrement
+#endif
     UCHAR DataBuffer[XDP_CPUMAP_PREALLOC_BUFFER_SIZE];
 } XDP_CPUMAP_PREALLOC_SHELL;
 #endif
@@ -102,6 +130,10 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
     XDP_CPUMAP_PREALLOC_SHELL *PreallocShellBlock;  // Single contiguous allocation for all shells
 #endif
 
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+    struct _XDP_CPUMAP *OwnerMap;  // Back-pointer for OutstandingIndications in DrainDpc
+#endif
+
     XDP_CPUMAP_ENTRY Entries[ANYSIZE_ARRAY];
 } XDP_CPUMAP_RING;
 
@@ -128,6 +160,18 @@ struct _XDP_CPUMAP {
     volatile LONG CopyCount;              // Number of RtlCopyMemory calls
     volatile LONG64 CopyTotalBytes;       // Total bytes copied
 #endif
+
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+    volatile LONG OutstandingIndications;  // NBLs indicated but not yet returned (shell + clone)
+    KEVENT AllReturnedEvent;               // Signaled when OutstandingIndications reaches 0
+    volatile LONG ZeroCopyIndicateCount;   // Total NBLs indicated without RESOURCES flag
+    volatile LONG ShellReturnCount;        // Shells recycled via async return path
+    volatile LONG CloneReturnCount;        // Clones freed via async return path
+#endif
+
+    // Miniport indication flags tracking
+    volatile LONG MiniportResourcesCount;    // Miniport indicated WITH RESOURCES
+    volatile LONG MiniportNoResourcesCount;  // Miniport indicated WITHOUT RESOURCES
 
     XDP_CPUMAP_RING **PerCpuRings;
     KDPC *PerCpuDpcs;
