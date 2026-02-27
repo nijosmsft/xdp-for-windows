@@ -5,6 +5,7 @@
 
 #include "precomp.h"
 #include "cpumap.h"
+#include <ndis/ndl/mdl.h>
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
@@ -134,6 +135,30 @@ XdpCpuMapCreate(
     Map->OutstandingIndications = 0;
     KeInitializeEvent(&Map->AllReturnedEvent, NotificationEvent, TRUE);
 #endif
+
+    //
+    // Create AZC !CanPend deep-copy fallback pool.
+    // Only for AZC maps. No NBLs pre-allocated — lazy growth on demand.
+    //
+    if (Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+        NET_BUFFER_LIST_POOL_PARAMETERS DcPoolParams;
+        RtlZeroMemory(&DcPoolParams, sizeof(DcPoolParams));
+        DcPoolParams.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+        DcPoolParams.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        DcPoolParams.Header.Size = sizeof(DcPoolParams);
+        DcPoolParams.PoolTag = POOLTAG_CPUMAP;
+        DcPoolParams.fAllocateNetBuffer = TRUE;
+        DcPoolParams.ContextSize = 0;
+
+        Map->DeepCopyNblPool = NdisAllocateNetBufferListPool(NdisHandle, &DcPoolParams);
+        if (Map->DeepCopyNblPool == NULL) {
+            Status = STATUS_NO_MEMORY;
+            goto Exit;
+        }
+        InitializeSListHead(&Map->DeepCopyFreeList);
+        Map->DeepCopyAllocCount = 0;
+        Map->DeepCopyAllocLimit = (LONG)(CpuCount * XDP_CPUMAP_MAX_BATCH_ENTRIES);
+    }
 
     //
     // Allocate and initialize per-CPU rings and DPCs
@@ -319,12 +344,22 @@ XdpCpuMapDestroy(
             }
             while (Ring->Head != Ring->Tail) {
                 XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
-                //
-                // Original miniport NBL — return to miniport.
-                //
-                if (Entry->FilterHandle != NULL) {
-                    NdisFReturnNetBufferLists(
-                        Entry->FilterHandle, Entry->Nbl, 0);
+                if (Entry->IsDeepCopy) {
+                    //
+                    // Deep-copy NBL (never indicated): recycle to pool.
+                    //
+                    NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(Entry->Nbl);
+                    NdisAdvanceNetBufferDataStart(Nb, Nb->DataLength, TRUE, NULL);
+                    InterlockedPushEntrySList(
+                        &CpuMap->DeepCopyFreeList, (PSLIST_ENTRY)&Entry->Nbl->Next);
+                } else {
+                    //
+                    // Original miniport NBL — return to miniport.
+                    //
+                    if (Entry->FilterHandle != NULL) {
+                        NdisFReturnNetBufferLists(
+                            Entry->FilterHandle, Entry->Nbl, 0);
+                    }
                 }
                 Ring->Head++;
             }
@@ -492,6 +527,15 @@ XdpCpuMapDestroy(
                 "AbsoluteZeroCopy: Flags=0x%x Indicated=%d\n",
                 CpuMap->Flags,
                 CpuMap->AbsoluteZeroCopyIndicateCount);
+            DbgPrintEx(
+                DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
+                "DeepCopy: Alloc=%d Limit=%d Hit=%d Miss=%d Fail=%d Indicated=%d\n",
+                CpuMap->DeepCopyAllocCount,
+                CpuMap->DeepCopyAllocLimit,
+                CpuMap->DeepCopyHitCount,
+                CpuMap->DeepCopyMissCount,
+                CpuMap->DeepCopyFailCount,
+                CpuMap->DeepCopyIndicateCount);
 
         }
     }
@@ -575,6 +619,19 @@ XdpCpuMapDestroy(
         NdisFreeNetBufferListPool(CpuMap->PreallocNblPool);
     }
 #endif
+
+    //
+    // Drain and free the deep-copy fallback pool (AZC maps only).
+    //
+    if (CpuMap->DeepCopyNblPool != NULL) {
+        PSLIST_ENTRY Sle;
+        while ((Sle = InterlockedPopEntrySList(&CpuMap->DeepCopyFreeList)) != NULL) {
+            NET_BUFFER_LIST *Nbl = CONTAINING_RECORD(Sle, NET_BUFFER_LIST, Next);
+            NdisFreeNetBufferList(Nbl);
+        }
+        NdisFreeNetBufferListPool(CpuMap->DeepCopyNblPool);
+        CpuMap->DeepCopyNblPool = NULL;
+    }
 
     //
     // Free CPUMAP structure
@@ -698,6 +755,7 @@ XdpCpuMapBatchInit(
     )
 {
     Batch->Count = 0;
+    Batch->CanPend = TRUE;
     Batch->ReturnableOriginals = NULL;
 }
 
@@ -799,6 +857,7 @@ Routine Description:
     //
     // Phase 1: Prepare NBLs for each batch entry. No locks held.
     //
+    BOOLEAN IsDeepCopyBatch[XDP_CPUMAP_MAX_BATCH_ENTRIES];
     for (i = 0; i < Batch->Count; i++) {
         XDP_CPUMAP_BATCH_ENTRY *BatchEntry = &Batch->Entries[i];
         NET_BUFFER_LIST *Original = BatchEntry->OriginalNbl;
@@ -808,15 +867,116 @@ Routine Description:
 #endif
         Clones[i] = NULL;
         Processed[i] = TRUE;
+        IsDeepCopyBatch[i] = FALSE;
 
         //
-        // Absolute zero-copy: use the original miniport NBL directly.
-        // No shell pop, no clone, no memcpy. The original is enqueued
-        // to the ring and indicated to tcpip from DrainDpc.
+        // Absolute zero-copy: when CanPend, use the original miniport NBL
+        // directly.  When !CanPend, deep-copy the packet data into a
+        // lazily-allocated NBL so the original can return to the miniport.
         //
         if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
-            Clones[i] = Original;
-            Processed[i] = FALSE;
+            if (Batch->CanPend) {
+                //
+                // Normal AZC: use original directly.
+                //
+                Clones[i] = Original;
+                Processed[i] = FALSE;
+                continue;
+            }
+
+            //
+            // AZC !CanPend deep-copy fallback.
+            // Allocate bare NBL+NB from SList or pool, retreat to get pages,
+            // copy data.  Result is fully independent of original.
+            //
+            {
+                NET_BUFFER_LIST *DeepCopy = NULL;
+                PSLIST_ENTRY Sle = InterlockedPopEntrySList(&CpuMap->DeepCopyFreeList);
+
+                if (Sle != NULL) {
+                    DeepCopy = CONTAINING_RECORD(Sle, NET_BUFFER_LIST, Next);
+                    InterlockedIncrement(&CpuMap->DeepCopyHitCount);
+                } else if (CpuMap->DeepCopyAllocCount < CpuMap->DeepCopyAllocLimit) {
+                    DeepCopy = NdisAllocateNetBufferAndNetBufferList(
+                        CpuMap->DeepCopyNblPool, 0, 0, NULL, 0, 0);
+                    if (DeepCopy != NULL) {
+                        InterlockedIncrement(&CpuMap->DeepCopyAllocCount);
+                        InterlockedIncrement(&CpuMap->DeepCopyMissCount);
+                    }
+                }
+
+                if (DeepCopy == NULL) {
+                    InterlockedIncrement(&CpuMap->DeepCopyFailCount);
+                    //
+                    // Return original to miniport via ReturnableOriginals.
+                    //
+                    NET_BUFFER_LIST_NEXT_NBL(Original) = Batch->ReturnableOriginals;
+                    Batch->ReturnableOriginals = Original;
+                    continue;
+                }
+
+                //
+                // Clear stale NB fields from previous use (recycled NBL).
+                //
+                {
+                    NET_BUFFER *DstNb = NET_BUFFER_LIST_FIRST_NB(DeepCopy);
+                    DstNb->MdlChain = NULL;
+                    DstNb->CurrentMdl = NULL;
+                    DstNb->DataLength = 0;
+                    DstNb->DataOffset = 0;
+                    DstNb->CurrentMdlOffset = 0;
+                }
+
+                //
+                // Retreat: NDIS allocates MDL + physical pages.
+                //
+                {
+                    NET_BUFFER *SrcNb = NET_BUFFER_LIST_FIRST_NB(Original);
+                    ULONG DataLen = NET_BUFFER_DATA_LENGTH(SrcNb);
+                    NET_BUFFER *DstNb = NET_BUFFER_LIST_FIRST_NB(DeepCopy);
+
+                    NDIS_STATUS NdisStatus =
+                        NdisRetreatNetBufferDataStart(DstNb, DataLen, 0, NULL);
+
+                    if (NdisStatus != NDIS_STATUS_SUCCESS) {
+                        //
+                        // Page alloc failed.  Return bare NBL to free list.
+                        //
+                        InterlockedPushEntrySList(
+                            &CpuMap->DeepCopyFreeList, (PSLIST_ENTRY)&DeepCopy->Next);
+                        InterlockedIncrement(&CpuMap->DeepCopyFailCount);
+                        NET_BUFFER_LIST_NEXT_NBL(Original) = Batch->ReturnableOriginals;
+                        Batch->ReturnableOriginals = Original;
+                        continue;
+                    }
+
+                    //
+                    // Non-temporal MDL-to-MDL data copy.
+                    //
+                    NT_VERIFY(NT_SUCCESS(
+                        MdlCopyMdlChainToMdlChainAtOffsetNonTemporal(
+                            DstNb->CurrentMdl, DstNb->CurrentMdlOffset,
+                            SrcNb->CurrentMdl, SrcNb->CurrentMdlOffset,
+                            DataLen)));
+
+                    //
+                    // Preserve RSS hash metadata.
+                    //
+                    NET_BUFFER_LIST_SET_HASH_VALUE(DeepCopy,
+                        NET_BUFFER_LIST_GET_HASH_VALUE(Original));
+                    NET_BUFFER_LIST_SET_HASH_TYPE(DeepCopy,
+                        NET_BUFFER_LIST_GET_HASH_TYPE(Original));
+                }
+
+                Clones[i] = DeepCopy;
+                IsDeepCopyBatch[i] = TRUE;
+                Processed[i] = FALSE;
+
+                //
+                // Original NBL goes back to miniport via DropList.
+                // (recv.c already adds to DropList when !CanPend.)
+                //
+            }
             continue;
         }
 
@@ -948,9 +1108,17 @@ Routine Description:
 
         if (TargetCpu < CpuMap->CpuBase || TargetCpu >= CpuMap->CpuBase + CpuMap->CpuCount) {
             //
-            // Invalid target — free the clone (or return original) and skip.
+            // Invalid target — free the clone/deep-copy or return original.
             //
-            if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+            if (IsDeepCopyBatch[i]) {
+                //
+                // Deep-copy: advance frees pages, push bare NBL to SList.
+                //
+                NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(Clones[i]);
+                NdisAdvanceNetBufferDataStart(Nb, Nb->DataLength, TRUE, NULL);
+                InterlockedPushEntrySList(
+                    &CpuMap->DeepCopyFreeList, (PSLIST_ENTRY)&Clones[i]->Next);
+            } else if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
                 NET_BUFFER_LIST_NEXT_NBL(Clones[i]) = Batch->ReturnableOriginals;
                 Batch->ReturnableOriginals = Clones[i];
             } else {
@@ -993,9 +1161,14 @@ Routine Description:
             NextTail = Ring->Tail + 1;
             if ((NextTail - Ring->Head) > Ring->Capacity) {
                 //
-                // Ring full — recycle shell, free clone, or return original.
+                // Ring full — recycle deep-copy, shell, clone, or return original.
                 //
-                if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
+                if (IsDeepCopyBatch[j]) {
+                    NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(Clones[j]);
+                    NdisAdvanceNetBufferDataStart(Nb, Nb->DataLength, TRUE, NULL);
+                    InterlockedPushEntrySList(
+                        &CpuMap->DeepCopyFreeList, (PSLIST_ENTRY)&Clones[j]->Next);
+                } else if (CpuMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
                     NET_BUFFER_LIST_NEXT_NBL(Clones[j]) = Batch->ReturnableOriginals;
                     Batch->ReturnableOriginals = Clones[j];
                 } else {
@@ -1019,6 +1192,7 @@ Routine Description:
             RingEntry->Nbl = Clones[j];
             RingEntry->FilterHandle = Batch->Entries[j].FilterHandle;
             RingEntry->PortNumber = Batch->Entries[j].PortNumber;
+            RingEntry->IsDeepCopy = IsDeepCopyBatch[j];
 #if XDP_CPUMAP_PREALLOC
             RingEntry->Shell = Shells[j];
 #endif
@@ -1174,6 +1348,9 @@ XdpCpuMapDrainDpc(
 #if !XDP_CPUMAP_DRAIN_ALL && XDP_CPUMAP_PREALLOC
     XDP_CPUMAP_PREALLOC_SHELL *ShellBatch[XDP_CPUMAP_MAX_BATCH_SIZE];
 #endif
+#if !XDP_CPUMAP_DRAIN_ALL
+    BOOLEAN IsDeepCopyDpc[XDP_CPUMAP_MAX_BATCH_SIZE];
+#endif
 
     if (Ring == NULL) {
         return;
@@ -1246,6 +1423,16 @@ XdpCpuMapDrainDpc(
         ShellBatch[Count] = Entry->Shell;
 #endif
 
+#if XDP_CPUMAP_DRAIN_ALL
+        //
+        // Stash IsDeepCopy in MiniportReserved[1] for AZC maps.
+        // AZC maps don't use MiniportReserved for shells/clone magic.
+        //
+        Entry->Nbl->MiniportReserved[1] = (PVOID)(ULONG_PTR)Entry->IsDeepCopy;
+#else
+        IsDeepCopyDpc[Count] = Entry->IsDeepCopy;
+#endif
+
         Ring->Head++;
         Count++;
     }
@@ -1273,19 +1460,89 @@ XdpCpuMapDrainDpc(
     //
     if (BatchHead != NULL && FilterHandle != NULL) {
         //
-        // Absolute zero-copy: indicate original miniport NBLs directly.
-        // No magic stamping, no OutstandingIndications tracking (originals
-        // return through normal NDIS ReturnNetBufferLists → miniport).
+        // Absolute zero-copy: split the chain into originals (indicate
+        // normally, async return to miniport) and deep-copies (indicate
+        // with RESOURCES, then recycle inline to SList).
         //
         if (Ring->OwnerMap->Flags & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) {
-            NdisFIndicateReceiveNetBufferLists(
-                FilterHandle,
-                BatchHead,
-                PortNumber,
-                Count,
-                NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
+            NET_BUFFER_LIST *OrigHead = NULL, **OrigTailPtr = &OrigHead;
+            NET_BUFFER_LIST *DcHead = NULL, **DcTailPtr = &DcHead;
+            UINT32 OrigCount = 0, DcCount = 0;
+            NET_BUFFER_LIST *Cur = BatchHead;
+#if !XDP_CPUMAP_DRAIN_ALL
+            UINT32 SplitIdx = 0;
+#endif
 
-            InterlockedAdd(&Ring->OwnerMap->AbsoluteZeroCopyIndicateCount, Count);
+            while (Cur != NULL) {
+                NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Cur);
+                NET_BUFFER_LIST_NEXT_NBL(Cur) = NULL;
+
+#if XDP_CPUMAP_DRAIN_ALL
+                BOOLEAN IsDc = (BOOLEAN)(ULONG_PTR)Cur->MiniportReserved[1];
+                Cur->MiniportReserved[1] = NULL;
+#else
+                BOOLEAN IsDc = IsDeepCopyDpc[SplitIdx];
+                SplitIdx++;
+#endif
+
+                if (IsDc) {
+                    *DcTailPtr = Cur;
+                    DcTailPtr = &NET_BUFFER_LIST_NEXT_NBL(Cur);
+                    DcCount++;
+                } else {
+                    *OrigTailPtr = Cur;
+                    OrigTailPtr = &NET_BUFFER_LIST_NEXT_NBL(Cur);
+                    OrigCount++;
+                }
+                Cur = Next;
+            }
+
+            //
+            // Indicate originals without RESOURCES (async return to miniport).
+            //
+            if (OrigHead != NULL) {
+                NdisFIndicateReceiveNetBufferLists(
+                    FilterHandle,
+                    OrigHead,
+                    PortNumber,
+                    OrigCount,
+                    NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
+
+                InterlockedAdd(&Ring->OwnerMap->AbsoluteZeroCopyIndicateCount, OrigCount);
+            }
+
+            //
+            // Indicate deep-copies with RESOURCES (synchronous return).
+            //
+            if (DcHead != NULL) {
+                NdisFIndicateReceiveNetBufferLists(
+                    FilterHandle,
+                    DcHead,
+                    PortNumber,
+                    DcCount,
+                    NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL | NDIS_RECEIVE_FLAGS_RESOURCES);
+
+                InterlockedAdd(&Ring->OwnerMap->DeepCopyIndicateCount, DcCount);
+
+                //
+                // Recycle: free data pages, push bare NBL to SList.
+                //
+                {
+                    NET_BUFFER_LIST *DcCur = DcHead;
+                    while (DcCur != NULL) {
+                        NET_BUFFER_LIST *DcNext = NET_BUFFER_LIST_NEXT_NBL(DcCur);
+                        NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(DcCur);
+
+                        NdisAdvanceNetBufferDataStart(Nb, Nb->DataLength, TRUE, NULL);
+
+                        InterlockedPushEntrySList(
+                            &Ring->OwnerMap->DeepCopyFreeList,
+                            (PSLIST_ENTRY)&DcCur->Next);
+
+                        DcCur = DcNext;
+                    }
+                }
+            }
         } else {
 #if XDP_CPUMAP_ZERO_COPY_INDICATE
         //

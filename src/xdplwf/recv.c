@@ -1643,6 +1643,7 @@ XdpGenericReceivePostInspectNbs(
     NET_BUFFER_LIST *CachedNextNbl = NULL;
     XDP_CPUMAP_BATCH CpuRedirectBatch;
     XdpCpuMapBatchInit(&CpuRedirectBatch);
+    CpuRedirectBatch.CanPend = CanPend;
 
     while (NbHead != NbTail) {
         XDP_FRAME *Frame;
@@ -1746,21 +1747,6 @@ XdpGenericReceivePostInspectNbs(
                     XDP_FRAME_CPU_REDIRECT *CpuRedirect =
                         XdpGetCpuRedirectExtension(Frame, &RxQueue->CpuRedirectExtension);
                     UINT32 TargetCpu = CpuRedirect->TargetCpu;
-
-                    //
-                    // Guard: when !CanPend (low-resource / RESOURCES flag)
-                    // and an existing AZC map is active, we cannot safely
-                    // enqueue the original NBL to the ring because the
-                    // caller will also return it to the miniport inline.
-                    // Drop the packet instead of risking a use-after-free.
-                    //
-                    if (!CanPend &&
-                        RxQueue->Generic->CpuMap != NULL &&
-                        (XdpCpuMapGetFlags(RxQueue->Generic->CpuMap) &
-                         XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY)) {
-                        NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
-                        break;
-                    }
 
                     //
                     // Ensure CPUMAP is created (race-safe lazy initialization).

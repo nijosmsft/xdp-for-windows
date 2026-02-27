@@ -105,6 +105,7 @@ typedef struct _XDP_CPUMAP_BATCH_ENTRY {
 
 typedef struct _XDP_CPUMAP_BATCH {
     UINT32 Count;
+    BOOLEAN CanPend;                       // FALSE when miniport indicated with RESOURCES
     NET_BUFFER_LIST *ReturnableOriginals;  // Originals to return to miniport (ring-full / error)
     XDP_CPUMAP_BATCH_ENTRY Entries[XDP_CPUMAP_MAX_BATCH_ENTRIES];
 } XDP_CPUMAP_BATCH;

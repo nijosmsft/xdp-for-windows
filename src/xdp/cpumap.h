@@ -46,11 +46,7 @@ EXTERN_C_START
 // Requires XDP_CPUMAP_PREALLOC=1.
 //
 #ifndef XDP_CPUMAP_ZERO_COPY_INDICATE
-#define XDP_CPUMAP_ZERO_COPY_INDICATE 1
-#endif
-
-#if XDP_CPUMAP_ZERO_COPY_INDICATE && !XDP_CPUMAP_PREALLOC
-#error "XDP_CPUMAP_ZERO_COPY_INDICATE requires XDP_CPUMAP_PREALLOC=1"
+#define XDP_CPUMAP_ZERO_COPY_INDICATE 0
 #endif
 
 #if XDP_CPUMAP_ZERO_COPY_INDICATE
@@ -84,6 +80,7 @@ typedef struct _XDP_CPUMAP_ENTRY {
     NET_BUFFER_LIST *Nbl;
     NDIS_HANDLE FilterHandle;
     NDIS_PORT_NUMBER PortNumber;
+    BOOLEAN IsDeepCopy;  // TRUE = deep-copy NBL (AZC !CanPend fallback), FALSE = original or shell
 #if XDP_CPUMAP_PREALLOC
     struct _XDP_CPUMAP_PREALLOC_SHELL *Shell;
 #endif
@@ -169,6 +166,22 @@ struct _XDP_CPUMAP {
     volatile LONG ShellReturnCount;        // Shells recycled via async return path
     volatile LONG CloneReturnCount;        // Clones freed via async return path
 #endif
+
+    //
+    // AZC !CanPend deep-copy fallback pool.
+    // Lazy allocation: NBL structs allocated on first use, cached in SList.
+    // No pre-allocated data buffers — NdisRetreatNetBufferDataStart allocates
+    // pages on each use, NdisAdvanceNetBufferDataStart frees them on recycle.
+    //
+    NDIS_HANDLE DeepCopyNblPool;              // NdisAllocateNetBufferListPool (bare NBL+NB)
+    DECLSPEC_CACHEALIGN
+    SLIST_HEADER DeepCopyFreeList;             // Cross-CPU SList: DrainDpc pushes recycled NBLs
+    volatile LONG DeepCopyAllocCount;          // Total NBLs ever allocated (monotonic up to limit)
+    LONG DeepCopyAllocLimit;                   // Cap on total allocated NBLs
+    volatile LONG DeepCopyHitCount;            // Stats: reused from free list
+    volatile LONG DeepCopyMissCount;           // Stats: allocated new from pool
+    volatile LONG DeepCopyFailCount;           // Stats: allocation or retreat failed
+    volatile LONG DeepCopyIndicateCount;       // Stats: deep-copy NBLs indicated to tcpip
 
     // Miniport indication flags tracking
     volatile LONG MiniportResourcesCount;    // Miniport indicated WITH RESOURCES
