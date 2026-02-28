@@ -22,6 +22,7 @@
 #include <xdp/framerxaction.h>
 #include <xdp/program.h>
 #include <xdp/rtl.h>
+#include <xdpcpumap.h>
 
 #include <stubs/ntos.h>
 #include <stubs/ebpf.h>

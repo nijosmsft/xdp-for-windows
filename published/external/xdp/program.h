@@ -103,11 +103,22 @@ typedef enum _XDP_RULE_ACTION {
 
 typedef enum _XDP_REDIRECT_TARGET_TYPE {
     XDP_REDIRECT_TARGET_TYPE_XSK,
+    XDP_REDIRECT_TARGET_TYPE_CPU,
 } XDP_REDIRECT_TARGET_TYPE;
+
+typedef struct _XDP_CPU_REDIRECT_PARAMS {
+    UINT32 TargetCpuBase;
+    UINT32 TargetCpuCount;
+    UINT32 RingDepth;       // 0 = use default (XDP_CPUMAP_RING_DEFAULT_CAPACITY)
+    UINT32 DrainBatchSize;  // 0 = use default (256)
+} XDP_CPU_REDIRECT_PARAMS;
 
 typedef struct _XDP_REDIRECT_PARAMS {
     XDP_REDIRECT_TARGET_TYPE TargetType;
-    HANDLE Target;
+    union {
+        HANDLE Target;
+        XDP_CPU_REDIRECT_PARAMS CpuRedirect;
+    };
 } XDP_REDIRECT_PARAMS;
 
 typedef struct _XDP_EBPF_PARAMS {

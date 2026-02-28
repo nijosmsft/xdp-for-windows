@@ -43,6 +43,7 @@
 
 #include <xdpassert.h>
 #include <xdpchecksum.h>
+#include <xdpcpumap.h>
 #include <xdpetw.h>
 #include <xdpif.h>
 #include <xdplifetime.h>

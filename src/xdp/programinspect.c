@@ -1394,12 +1394,138 @@ XdpInspect(
             switch (Rule->Action) {
 
             case XDP_PROGRAM_ACTION_REDIRECT:
-                XdpRedirect(
-                    &InspectionContext->RedirectContext, FrameIndex, FragmentIndex,
-                    Rule->Redirect.TargetType, Rule->Redirect.Target);
+                if (Rule->Redirect.TargetType == XDP_REDIRECT_TARGET_TYPE_CPU) {
+                    UINT32 CpuBase = Rule->Redirect.CpuRedirect.TargetCpuBase;
+                    UINT32 CpuCount = Rule->Redirect.CpuRedirect.TargetCpuCount;
+                    UINT32 TargetCpu;
 
-                Action = XDP_RX_ACTION_DROP;
-                STAT_INC(RxQueueStats, InspectFramesRedirected);
+                    //
+                    // Hash-based mode: compute hash from frame headers for
+                    // flow affinity (same 5-tuple always maps to same CPU).
+                    //
+                    {
+                    UINT32 Hash = 0;
+
+                    //
+                    // Ensure frame is parsed for hash computation.
+                    //
+                    if (!FrameCache.UdpCached) {
+                        XdpParseFrame(
+                            Frame, FragmentRing, FragmentExtension, FragmentIndex,
+                            VirtualAddressExtension, &FrameCache, &Program->FrameStorage);
+                    }
+
+                    //
+                    // Compute improved hash from IP addresses and ports.
+                    // Uses symmetric hash to ensure bidirectional flows
+                    // map to the same CPU for better cache locality and
+                    // more uniform distribution across CPUs.
+                    //
+                    if (FrameCache.Ip4Valid) {
+                        UINT32 SrcIp = *(UINT32 *)&FrameCache.Ip4Hdr->SourceAddress;
+                        UINT32 DstIp = *(UINT32 *)&FrameCache.Ip4Hdr->DestinationAddress;
+
+                        //
+                        // Symmetric combination: ensures hash(A→B) == hash(B→A).
+                        // Using min + rotl(max, 16) provides better distribution
+                        // than simple XOR while maintaining symmetry.
+                        //
+                        UINT32 MinIp = (SrcIp < DstIp) ? SrcIp : DstIp;
+                        UINT32 MaxIp = (SrcIp > DstIp) ? SrcIp : DstIp;
+                        Hash = MinIp + ((MaxIp << 16) | (MaxIp >> 16));  // Rotate left 16
+                    } else if (FrameCache.Ip6Valid) {
+                        //
+                        // Hash IPv6 symmetrically by combining all address dwords.
+                        //
+                        UINT32 SrcHash = 0;
+                        UINT32 DstHash = 0;
+
+                        for (ULONG i = 0; i < 4; i++) {
+                            SrcHash ^= ((UINT32 *)&FrameCache.Ip6Hdr->SourceAddress)[i];
+                            DstHash ^= ((UINT32 *)&FrameCache.Ip6Hdr->DestinationAddress)[i];
+                        }
+
+                        //
+                        // Symmetric combination for IPv6 hash values.
+                        //
+                        UINT32 MinHash = (SrcHash < DstHash) ? SrcHash : DstHash;
+                        UINT32 MaxHash = (SrcHash > DstHash) ? SrcHash : DstHash;
+                        Hash = MinHash + ((MaxHash << 16) | (MaxHash >> 16));  // Rotate left 16
+                    }
+
+                    if (FrameCache.UdpValid) {
+                        UINT16 SrcPort = FrameCache.UdpHdr->uh_sport;
+                        UINT16 DstPort = FrameCache.UdpHdr->uh_dport;
+
+                        //
+                        // Symmetric port combination: min in low word, max in high word.
+                        //
+                        UINT16 MinPort = (SrcPort < DstPort) ? SrcPort : DstPort;
+                        UINT16 MaxPort = (SrcPort > DstPort) ? SrcPort : DstPort;
+                        UINT32 PortHash = (UINT32)MinPort + ((UINT32)MaxPort << 16);
+
+                        //
+                        // Mix IP and port hashes using multiplicative constant.
+                        // 0x9E3779B9 is the golden ratio, provides good avalanche.
+                        //
+                        Hash = Hash * 0x9E3779B9 + PortHash;
+                    } else if (FrameCache.TcpValid) {
+                        UINT16 SrcPort = FrameCache.TcpHdr->th_sport;
+                        UINT16 DstPort = FrameCache.TcpHdr->th_dport;
+
+                        //
+                        // Symmetric port combination: min in low word, max in high word.
+                        //
+                        UINT16 MinPort = (SrcPort < DstPort) ? SrcPort : DstPort;
+                        UINT16 MaxPort = (SrcPort > DstPort) ? SrcPort : DstPort;
+                        UINT32 PortHash = (UINT32)MinPort + ((UINT32)MaxPort << 16);
+
+                        //
+                        // Mix IP and port hashes using multiplicative constant.
+                        // 0x9E3779B9 is the golden ratio, provides good avalanche.
+                        //
+                        Hash = Hash * 0x9E3779B9 + PortHash;
+                    }
+
+                    //
+                    // Finalize hash: spread entropy across all bits so that
+                    // the subsequent modulo distributes evenly, especially
+                    // for non-power-of-2 CPU counts.  Uses murmur3 32-bit
+                    // finalizer constants.
+                    //
+                    Hash ^= Hash >> 16;
+                    Hash *= 0x85ebca6b;
+                    Hash ^= Hash >> 13;
+                    Hash *= 0xc2b2ae35;
+                    Hash ^= Hash >> 16;
+
+                    TargetCpu = (Hash % CpuCount) + CpuBase;
+                    }
+
+                    //
+                    // Store target CPU in frame extension.
+                    //
+                    XDP_FRAME_CPU_REDIRECT *CpuRedirect =
+                        XdpGetCpuRedirectExtension(Frame, &InspectionContext->CpuRedirectExtension);
+                    CpuRedirect->TargetCpu = TargetCpu;
+                    CpuRedirect->CpuBase = CpuBase;
+                    CpuRedirect->CpuCount = CpuCount;
+                    CpuRedirect->RingDepth = Rule->Redirect.CpuRedirect.RingDepth;
+                    CpuRedirect->DrainBatchSize = Rule->Redirect.CpuRedirect.DrainBatchSize;
+
+                    Action = XDP_RX_ACTION_CPU_REDIRECT;
+                    STAT_INC(RxQueueStats, InspectFramesRedirected);
+                } else {
+                    //
+                    // XSK redirect.
+                    //
+                    XdpRedirect(
+                        &InspectionContext->RedirectContext, FrameIndex, FragmentIndex,
+                        Rule->Redirect.TargetType, Rule->Redirect.Target);
+
+                    Action = XDP_RX_ACTION_DROP;
+                    STAT_INC(RxQueueStats, InspectFramesRedirected);
+                }
                 break;
 
             case XDP_PROGRAM_ACTION_EBPF:
@@ -1477,6 +1603,12 @@ XdpProgramDeleteRule(
                 XskDereferenceDatapathHandle(Rule->Redirect.Target);
                 Rule->Redirect.Target = NULL;
             }
+            break;
+
+        case XDP_REDIRECT_TARGET_TYPE_CPU:
+            //
+            // CPU redirect has no handle to dereference.
+            //
             break;
 
         default:
@@ -1598,10 +1730,40 @@ XdpProgramValidateRule(
         switch (UserRule->Redirect.TargetType) {
 
         case XDP_REDIRECT_TARGET_TYPE_XSK:
+            ValidatedRule->Redirect.TargetType = XDP_REDIRECT_TARGET_TYPE_XSK;
             Status =
                 XskReferenceDatapathHandle(
                     RequestorMode, &UserRule->Redirect.Target, TRUE,
                     &ValidatedRule->Redirect.Target);
+            break;
+
+        case XDP_REDIRECT_TARGET_TYPE_CPU:
+            {
+                UINT32 ActiveCpuCount;
+                UINT32 CpuBase;
+                UINT32 CpuCount;
+
+                //
+                // Validate CPU redirect parameters.
+                //
+                ActiveCpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                CpuBase = UserRule->Redirect.CpuRedirect.TargetCpuBase;
+                CpuCount = UserRule->Redirect.CpuRedirect.TargetCpuCount;
+
+                if (CpuBase >= ActiveCpuCount ||
+                    CpuCount == 0 ||
+                    CpuBase + CpuCount > ActiveCpuCount) {
+                    Status = STATUS_INVALID_PARAMETER;
+                    goto Exit;
+                }
+
+                //
+                // Copy CPU redirect target type and parameters.
+                //
+                ValidatedRule->Redirect.TargetType = XDP_REDIRECT_TARGET_TYPE_CPU;
+                ValidatedRule->Redirect.CpuRedirect = UserRule->Redirect.CpuRedirect;
+                Status = STATUS_SUCCESS;
+            }
             break;
 
         default:

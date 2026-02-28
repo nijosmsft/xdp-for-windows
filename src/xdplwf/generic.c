@@ -618,6 +618,14 @@ XdpGenericCleanupInterface(
     XdpGenericCleanupDatapath(Generic, &Generic->Tx.Datapath);
     XdpGenericCleanupDatapath(Generic, &Generic->Rx.Datapath);
 
+    //
+    // Cleanup CPUMAP if allocated.
+    //
+    if (Generic->CpuMap != NULL) {
+        XdpCpuMapDestroy(Generic->CpuMap);
+        Generic->CpuMap = NULL;
+    }
+
     if (Generic->Registration != NULL) {
         XdpDeregisterInterface(Generic->Registration);
         Generic->Registration = NULL;

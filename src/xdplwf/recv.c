@@ -165,6 +165,20 @@ XdpGenericReturnNetBufferLists(
         OldIrql = KeRaiseIrqlToDpcLevel();
     }
 
+#if XDP_CPUMAP_ZERO_COPY_INDICATE
+    //
+    // Recycle any CPUMAP zero-copy NBLs before the inject-complete path.
+    // Non-CPUMAP NBLs are returned as the pass-through chain.
+    //
+    NetBufferLists = XdpCpuMapReturnShells(NetBufferLists);
+    if (NetBufferLists == NULL) {
+        if (OldIrql != DISPATCH_LEVEL) {
+            KeLowerIrql(OldIrql);
+        }
+        return;
+    }
+#endif
+
     NetBufferLists = XdpGenericInjectNetBufferListsComplete(Generic, NetBufferLists);
 
     if (OldIrql != DISPATCH_LEVEL) {
@@ -1627,6 +1641,8 @@ XdpGenericReceivePostInspectNbs(
         FrameRing->InterfaceReserved == FrameRing->ProducerIndex - 1);
 
     NET_BUFFER_LIST *CachedNextNbl = NULL;
+    XDP_CPUMAP_BATCH CpuRedirectBatch;
+    XdpCpuMapBatchInit(&CpuRedirectBatch);
 
     while (NbHead != NbTail) {
         XDP_FRAME *Frame;
@@ -1722,6 +1738,95 @@ XdpGenericReceivePostInspectNbs(
                 NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
                 break;
 
+            case XDP_RX_ACTION_CPU_REDIRECT:
+                {
+                    //
+                    // Get target CPU from frame extension.
+                    //
+                    XDP_FRAME_CPU_REDIRECT *CpuRedirect =
+                        XdpGetCpuRedirectExtension(Frame, &RxQueue->CpuRedirectExtension);
+                    UINT32 TargetCpu = CpuRedirect->TargetCpu;
+
+                    //
+                    // Ensure CPUMAP is created (race-safe lazy initialization).
+                    // Multiple RX queues share Generic->CpuMap, so use
+                    // InterlockedCompareExchangePointer to avoid leaking a
+                    // duplicate allocation.
+                    //
+                    if (RxQueue->Generic->CpuMap == NULL) {
+                        //
+                        // Use CPUMAP parameters from the frame extension,
+                        // which were populated by programinspect from the rule.
+                        //
+                        UINT32 MapCpuBase  = CpuRedirect->CpuBase;
+                        UINT32 MapCpuCount = CpuRedirect->CpuCount != 0
+                            ? CpuRedirect->CpuCount
+                            : KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                        UINT32 RingDepth = CpuRedirect->RingDepth != 0
+                            ? CpuRedirect->RingDepth
+                            : XDP_CPUMAP_RING_DEFAULT_CAPACITY;
+                        UINT32 BatchSize = CpuRedirect->DrainBatchSize;
+                        XDP_CPUMAP *NewMap = NULL;
+                        NTSTATUS Status = XdpCpuMapCreate(
+                            MapCpuBase,
+                            MapCpuCount,
+                            RingDepth,
+                            BatchSize,
+                            RxQueue->Generic->NdisFilterHandle,
+                            &NewMap);
+
+                        if (!NT_SUCCESS(Status)) {
+                            //
+                            // Failed to create CPUMAP, drop packet.
+                            //
+                            NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
+                            STAT_INC(&RxQueue->PcwStats, ForwardingFailuresAllocation);
+                            break;
+                        }
+
+                        //
+                        // Atomically install the new map. If another thread
+                        // already installed one, destroy ours and use theirs.
+                        //
+                        if (InterlockedCompareExchangePointer(
+                                (PVOID *)&RxQueue->Generic->CpuMap,
+                                NewMap,
+                                NULL) != NULL) {
+                            XdpCpuMapDestroy(NewMap);
+                        }
+                    }
+
+                    //
+                    // Collect redirect decision in the batch. The batch
+                    // is flushed after the while loop to minimize lock
+                    // acquisitions and DPC inserts.
+                    //
+                    if (!XdpCpuMapBatchAdd(
+                            &CpuRedirectBatch,
+                            ActionNbl,
+                            TargetCpu,
+                            RxQueue->Generic->NdisFilterHandle,
+                            PortNumber)) {
+                        //
+                        // Batch full — flush current batch and retry.
+                        //
+                        XdpCpuMapFlushBatch(
+                            RxQueue->Generic->CpuMap, &CpuRedirectBatch);
+                        XdpCpuMapBatchAdd(
+                            &CpuRedirectBatch,
+                            ActionNbl,
+                            TargetCpu,
+                            RxQueue->Generic->NdisFilterHandle,
+                            PortNumber);
+                    }
+
+                    //
+                    // Return original NBL (like DROP).
+                    //
+                    NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
+                }
+                break;
+
             default:
                 ASSERT(FALSE);
             }
@@ -1746,6 +1851,13 @@ XdpGenericReceivePostInspectNbs(
                 RxQueue->Generic->NdisFilterHandle, &RxQueue->EcLock, PassList, DropList,
                 LowResourcesList, PortNumber, (NbHead == NULL));
         }
+    }
+
+    //
+    // Flush any remaining batched CPU redirect entries.
+    //
+    if (CpuRedirectBatch.Count > 0 && RxQueue->Generic->CpuMap != NULL) {
+        XdpCpuMapFlushBatch(RxQueue->Generic->CpuMap, &CpuRedirectBatch);
     }
 
     ASSERT(FrameRing->InterfaceReserved == FrameRing->ProducerIndex);
@@ -1907,6 +2019,15 @@ XdpGenericReceiveNetBufferLists(
     NBL_COUNTED_QUEUE TxList;
 
     UNREFERENCED_PARAMETER(NumberOfNetBufferLists);
+
+    //
+    // Track whether miniport indicates with or without RESOURCES.
+    //
+    if (Generic->CpuMap != NULL) {
+        XdpCpuMapTrackMiniportIndication(
+            Generic->CpuMap,
+            (BOOLEAN)!!(ReceiveFlags & NDIS_RECEIVE_FLAGS_RESOURCES));
+    }
 
     XdpGenericReceive(
         Generic, NetBufferLists, PortNumber, &PassList, &DropList, &TxList,
@@ -2412,6 +2533,11 @@ XdpGenericRxActivateQueue(
     XdpRxQueueGetExtension(Config, &ExtensionInfo, &RxQueue->RxActionExtension);
 
     XdpInitializeExtensionInfo(
+        &ExtensionInfo, XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME,
+        XDP_FRAME_EXTENSION_CPU_REDIRECT_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
+    XdpRxQueueGetExtension(Config, &ExtensionInfo, &RxQueue->CpuRedirectExtension);
+
+    XdpInitializeExtensionInfo(
         &ExtensionInfo, XDP_FRAME_EXTENSION_FRAGMENT_NAME,
         XDP_FRAME_EXTENSION_FRAGMENT_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
     XdpRxQueueGetExtension(Config, &ExtensionInfo, &RxQueue->FragmentExtension);
@@ -2513,6 +2639,25 @@ XdpGenericRxDeleteQueue(
     RxQueue->DeleteComplete = &DeleteComplete;
     XdpLifetimeDelete(XdpGenericRxDeleteTxInspectEc, &RxQueue->DeleteEntry);
     KeWaitForSingleObject(&DeleteComplete, Executive, KernelMode, FALSE, NULL);
+
+    //
+    // If this was the last RX queue, destroy the CpuMap so stats are dumped
+    // and resources freed. The CpuMap is lazily created on first CPU redirect
+    // action and lives on Generic, so we clean it up here when no more queues
+    // can reference it.
+    //
+    {
+        XDP_CPUMAP *OldMap = NULL;
+        RtlAcquirePushLockExclusive(&Generic->Lock);
+        if (IsListEmpty(&Generic->Rx.Queues) && Generic->CpuMap != NULL) {
+            OldMap = Generic->CpuMap;
+            Generic->CpuMap = NULL;
+        }
+        RtlReleasePushLockExclusive(&Generic->Lock);
+        if (OldMap != NULL) {
+            XdpCpuMapDestroy(OldMap);
+        }
+    }
 
     TraceExitSuccess(TRACE_GENERIC);
 }
