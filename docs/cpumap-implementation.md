@@ -26,12 +26,11 @@ This document describes the design and implementation of CPU-affinity packet ste
    - 6.2 [XDP_CPUMAP_RING struct](#62-xdp_cpumap_ring-struct)
    - 6.3 [Per-Source-CPU Clone Pools](#63-per-source-cpu-clone-pools)
    - 6.4 [Selective CPU Range Allocation](#64-selective-cpu-range-allocation)
-   - 6.5 [Pre-allocated Shell Pool (PREALLOC)](#65-pre-allocated-shell-pool-prealloc)
-   - 6.6 [Drain DPC Options: Batched vs DRAIN_ALL](#66-drain-dpc-options-batched-vs-drain_all)
-   - 6.7 [Statistics and Diagnostics](#67-statistics-and-diagnostics)
-   - 6.8 [XdpCpuMapCreate](#68-xdpcpumapcreate)
-   - 6.9 [XdpCpuMapDestroy](#69-xdpcpumapdestroy)
-   - 6.10 [XdpCpuMapFlushBatch](#610-xdpcpumapflushbatch)
+   - 6.5 [Drain DPC Options: Batched vs DRAIN_ALL](#65-drain-dpc-options-batched-vs-drain_all)
+   - 6.6 [Statistics and Diagnostics](#66-statistics-and-diagnostics)
+   - 6.7 [XdpCpuMapCreate](#67-xdpcpumapcreate)
+   - 6.8 [XdpCpuMapDestroy](#68-xdpcpumapdestroy)
+   - 6.9 [XdpCpuMapFlushBatch](#69-xdpcpumapflushbatch)
 7. [Program Inspection Layer (programinspect.c)](#7-program-inspection-layer-programinspectc)
    - 7.1 [Rule Validation](#71-rule-validation)
    - 7.2 [Per-Frame Classification: Hash and CPU Selection](#72-per-frame-classification-hash-and-cpu-selection)
@@ -486,6 +485,7 @@ Both files are new (`src/xdp/cpumap.h`, `src/xdp/cpumap.c`).
 struct _XDP_CPUMAP {
     UINT32 CpuBase;    // Absolute index of first target CPU
     UINT32 CpuCount;   // Number of target CPUs; rings indexed [0, CpuCount)
+    UINT32 Flags;      // XDP_CPUMAP_FLAG_* runtime behavior flags
 
     volatile BOOLEAN Active;
 
@@ -495,7 +495,9 @@ struct _XDP_CPUMAP {
     UINT32 ClonePoolCount;
     NDIS_HANDLE *PerCpuClonePools;
 
-    NDIS_HANDLE PreallocNblPool;    // Only when XDP_CPUMAP_PREALLOC=1
+    // AZC !CanPend deep-copy fallback pool (lazy allocation).
+    NDIS_HANDLE DeepCopyNblPool;
+    SLIST_HEADER DeepCopyFreeList;
 
     XDP_CPUMAP_RING **PerCpuRings;  // [CpuCount] rings, indexed by (TargetCpu - CpuBase)
     KDPC *PerCpuDpcs;               // [CpuCount] DPCs, pinned to target CPUs
@@ -523,20 +525,19 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
     UINT32 Mask;            // Capacity - 1 (for fast modulo via &)
     UINT32 DrainBatchSize;  // Runtime-configurable drain cap (default 256)
 
-    // Per-ring statistics (see Section 6.7)
+    // Per-ring statistics (see Section 6.6)
     volatile LONG EnqueueCount;
     volatile LONG DrainCount;
     volatile LONG DropCount;
     // ... plus 12 more diagnostic counters
 
-    SLIST_HEADER PreallocFreeList;       // Lock-free stack of available shells
-    XDP_CPUMAP_PREALLOC_SHELL *PreallocShellBlock; // Contiguous shell allocation
+    struct _XDP_CPUMAP *OwnerMap;  // Back-pointer for map flags and stats in DrainDpc
 
     XDP_CPUMAP_ENTRY Entries[ANYSIZE_ARRAY]; // Ring buffer (sized at create time)
 } XDP_CPUMAP_RING;
 ```
 
-**Ring sizing:** At 32768 entries × ~24 bytes/entry (pointer + filter handle + port + shell pointer) = ~768 KB per ring. With 24 target CPUs this is ~18 MB NonPagedPool. This is intentionally large to absorb bursts when the drain DPC doesn't fire fast enough on each target CPU.
+**Ring sizing:** At 32768 entries × ~20 bytes/entry (pointer + filter handle + port + IsDeepCopy) = ~640 KB per ring. With 24 target CPUs this is ~15 MB NonPagedPool. This is intentionally large to absorb bursts when the drain DPC doesn't fire fast enough on each target CPU.
 
 **Previous default (32 entries)** was the original XDP CPUMAP stub size and was completely inadequate for sustained load — the ring filled in microseconds at 200K+ PPS.
 
@@ -553,7 +554,7 @@ NDIS_HANDLE ClonePool = CpuMap->PerCpuClonePools[SourceCpu];
 Clone = NdisAllocateCloneNetBufferList(Nbl, ClonePool, NULL, 0);
 ```
 
-Clone pools are allocated in **all** configurations (both `XDP_CPUMAP_PREALLOC=0` and `=1`). When PREALLOC is **disabled** (`=0`), clone pools are the **primary** allocation path for every redirected packet. When PREALLOC is **enabled** (`=1`, the default), the pre-allocated shell pool handles most packets and clone pools serve as a **fallback** for oversized packets whose payload exceeds the shell's inline buffer.
+Clone pools are the primary allocation path for every redirected packet. Each RSS CPU allocates clones from its own pool; NDIS auto-routes frees back to the originating pool regardless of which CPU calls `NdisFreeCloneNetBufferList`.
 
 ### 6.4 Selective CPU Range Allocation
 
@@ -573,43 +574,7 @@ for (UINT32 i = 0; i < CpuCount; i++) {
 
 Memory reduction: from ~45 MB to ~18 MB for the 80-CPU → 24-target case.
 
-### 6.5 Pre-Allocated Shell Pool (PREALLOC)
-
-**File:** Controlled by `#define XDP_CPUMAP_PREALLOC 1` (default enabled).
-
-**Problem:** Even with per-CPU clone pools, `NdisAllocateCloneNetBufferList` is expensive: it allocates `NET_BUFFER_LIST` + `NET_BUFFER` + MDL structures per packet and requires the NDIS pool lock. At 200K+ PPS this is significant.
-
-**Solution:** Pre-allocate a pool of "shells" at ring creation time. Each shell is a fixed-size structure containing:
-- An `NBL` header
-- A `NET_BUFFER` header  
-- An `MDL` pointing to a 2048-byte inline data buffer
-- The 2048-byte data buffer itself
-
-```c
-typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_PREALLOC_SHELL {
-    SLIST_ENTRY SListEntry;                        // For lock-free freelist
-    NET_BUFFER_LIST *Nbl;                          // Pre-built NBL
-    MDL *Mdl;                                      // Pre-built MDL
-    UCHAR DataBuffer[XDP_CPUMAP_PREALLOC_BUFFER_SIZE]; // 2048 bytes
-} XDP_CPUMAP_PREALLOC_SHELL;
-```
-
-**Enqueue (PREALLOC path):**
-1. Pop a shell from the per-ring `PreallocFreeList` (SLIST — lock-free, uses `InterlockedPopEntrySList`).
-2. `memcpy` the original packet data into `Shell->DataBuffer`.
-3. Update the MDL to reflect the actual packet length.
-4. Enqueue the pre-built NBL to the ring.
-
-**Drain (PREALLOC path):**
-1. NBL is indicated up via `NdisFIndicateReceiveNetBufferLists(..., NDIS_RECEIVE_FLAGS_RESOURCES)`.
-2. The `RESOURCES` flag causes NDIS to call `FilterReturnNetBufferLists` synchronously before returning from the indicate call.
-3. On return, push the shell back onto the `PreallocFreeList`.
-
-**Fallback:** If the SLIST is empty (all shells in use) or the packet is larger than 2048 bytes (`PreallocOversizeCount`), falls back to `NdisAllocateCloneNetBufferList` from the per-CPU clone pool.
-
-**Memory per ring:** `RingCapacity` × `sizeof(XDP_CPUMAP_PREALLOC_SHELL)` ≈ 32768 × 2112 bytes ≈ **67 MB per ring**. With 24 target CPUs: ~1.6 GB NonPagedPool total. This is allocated lazily on first packet (see Section 8.2).
-
-### 6.6 Drain DPC Options: Batched vs DRAIN_ALL
+### 6.5 Drain DPC Options: Batched vs DRAIN_ALL
 
 Controlled by `#define XDP_CPUMAP_DRAIN_ALL 0` (default: batched mode).
 
@@ -623,17 +588,17 @@ The drain loop iterates inside the DPC (not re-queuing between each batch) to el
 ```c
 do {  // drain-until-empty inner loop
     // Acquire lock, dequeue up to DrainBatchSize, release lock
-    // NdisFIndicateReceiveNetBufferLists(...)
-    // Recycle shells
+    // NdisFIndicateReceiveNetBufferLists(...)  
+    // Free clones immediately (RESOURCES flag)
 } while (MoreWork && ++LoopIter < MAX_LOOP_ITERATIONS);
 ```
 
 **DRAIN_ALL mode (`XDP_CPUMAP_DRAIN_ALL=1`):**
 - Dequeues the **entire ring** in one lock acquisition.
-- Uses `NBL->MiniportReserved[0]` to stash the shell pointer (avoids the stack-allocated `ShellBatch[]` array which would overflow the DPC stack at large ring sizes).
+- Uses `NBL->MiniportReserved[1]` to stash the `IsDeepCopy` flag (avoids a fixed-size stack array which would overflow the DPC stack at large ring sizes).
 - Eliminates the re-queue gap but holds the DPC thread longer, potentially starving other DPCs on the target CPU under sustained line-rate load.
 
-### 6.7 Statistics and Diagnostics
+### 6.6 Statistics and Diagnostics
 
 Every `XDP_CPUMAP_RING` has 16+ counters, all `volatile LONG` (updated with `InterlockedIncrement` / `InterlockedExchangeIfGreater`):
 
@@ -644,9 +609,6 @@ Every `XDP_CPUMAP_RING` has 16+ counters, all `volatile LONG` (updated with `Int
 | `DropCount` | Total NBLs dropped (ring full + clone fail) |
 | `RingFullCount` | Drops due to ring full at enqueue time |
 | `CloneFailCount` | Drops due to `NdisAllocateCloneNetBufferList` returning NULL |
-| `PreallocHitCount` | Packets handled by pre-alloc shell (hot path) |
-| `PreallocMissCount` | Fell back to NDIS clone (SLIST empty) |
-| `PreallocOversizeCount` | Packet > 2048 bytes, had to clone |
 | `DpcInvokeCount` | Number of times the drain DPC fired |
 | `DpcMaxBatchDrained` | Largest batch size in a single DPC iteration |
 | `DpcRequeueCount` | DPC re-queued because ring had more work |
@@ -655,44 +617,48 @@ Every `XDP_CPUMAP_RING` has 16+ counters, all `volatile LONG` (updated with `Int
 | `EnqueueBatchCount` | Number of `FlushBatch` calls that touched this ring |
 | `DpcLoopIterations` | Total inner drain-until-empty loop iterations |
 | `DpcMaxLoopIterations` | Max loop iterations in a single DPC invocation |
+| `LockWaitCycles` | Total rdtsc cycles waiting on spinlock (producers + consumer) |
+| `LockAcquireCount` | Total lock acquisitions |
+| `SourceCpuMask` | Bitmask of source CPUs that enqueued (up to 128) |
 
 **Stats dump:** `XdpCpuMapDestroy` dumps per-ring stats and totals (including loss percentage) via `DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL, ...)`. To see this output:
 - **With kernel debugger attached:** `ed nt!Kd_IHVNETWORK_Mask 0xffffffff`
 - **Without debugger:** Set `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter\IHVNETWORK = 0xffffffff` (DWORD, requires reboot), then run **DebugView** (Sysinternals) with `Capture → Capture Kernel`.
 
-### 6.8 `XdpCpuMapCreate`
+### 6.7 `XdpCpuMapCreate`
 
 **IRQL:** PASSIVE_LEVEL  
-**Signature:** `XdpCpuMapCreate(CpuBase, CpuCount, RingCapacity, DrainBatchSize, NdisHandle, &CpuMap)`
+**Signature:** `XdpCpuMapCreate(CpuBase, CpuCount, RingCapacity, DrainBatchSize, Flags, NdisHandle, &CpuMap)`
 
 Allocation sequence:
 1. Validate: `CpuCount > 0`, `RingCapacity` is power-of-2, `CpuBase + CpuCount <= ActiveCpuCount`.
 2. Clamp `DrainBatchSize` to `[1, XDP_CPUMAP_MAX_BATCH_SIZE (256)]` if 0 or out of range.
 3. Allocate `XDP_CPUMAP` struct.
 4. Allocate `PerCpuClonePools` array for ALL system CPUs; call `NdisAllocateNetBufferListPool` for each.
-5. (PREALLOC) Allocate one `PreallocNblPool` for building shell NBLs.
+5. If AZC flag set, allocate `DeepCopyNblPool` for !CanPend deep-copy fallback.
 6. For each target CPU `i` in `[0, CpuCount)`:
    - Allocate ring: `sizeof(XDP_CPUMAP_RING) + sizeof(XDP_CPUMAP_ENTRY) * RingCapacity`
    - Initialize ring fields, stat counters, `DrainBatchSize`.
-   - (PREALLOC) Allocate `PreallocShellBlock` (`RingCapacity` shells contiguously), build MDL + NBL for each, push all onto `PreallocFreeList`.
    - Store at `PerCpuRings[i]`.
    - Initialize DPC at `PerCpuDpcs[i]`, target to processor `CpuBase + i`.
 7. Set `Active = TRUE`, `RefCount = 1`.
 
-### 6.9 `XdpCpuMapDestroy`
+### 6.8 `XdpCpuMapDestroy`
 
 **IRQL:** PASSIVE_LEVEL  
 **Called from:** `XdpGenericRxDeleteQueue` (when last RX queue deleted) and `XdpGenericCleanupInterface`.
 
 Sequence:
 1. Set `Active = FALSE` to block new enqueues (checked in `XdpCpuMapFlushBatch`).
-2. (Debug) Dump per-ring statistics via `DbgPrintEx`.
-3. For each ring: drain any remaining in-flight NBLs, recycle/free shells, free ring memory.
-4. (PREALLOC) Free pre-alloc shell memory and pool.
-5. Free all per-CPU clone pools (`NdisFreeNetBufferListPool` × ClonePoolCount).
-6. Free `XDP_CPUMAP` struct.
+2. Flush all DPCs via `KeFlushQueuedDpcs`.
+3. For AZC maps: drain ring entries — recycle deep-copies and return originals to miniport.
+4. Dump per-ring statistics via `DbgPrintEx` (with TSC-calibrated lock timing).
+5. For each ring: drain any remaining clones, free ring memory.
+6. Free all per-CPU clone pools (`NdisFreeNetBufferListPool` × ClonePoolCount).
+7. If AZC, drain and free `DeepCopyNblPool`.
+8. Free `XDP_CPUMAP` struct.
 
-### 6.10 `XdpCpuMapFlushBatch`
+### 6.9 `XdpCpuMapFlushBatch`
 
 **IRQL:** DISPATCH_LEVEL (called from post-inspect on RSS CPU)
 
@@ -701,20 +667,15 @@ Sequence:
 for each entry in Batch:
     SourceCpu = KeGetCurrentProcessorIndex()
     ClonePool = CpuMap->PerCpuClonePools[SourceCpu]
-    if PREALLOC:
-        Shell = InterlockedPopEntrySList(&PerCpuRings[TargetCpu - CpuBase]->PreallocFreeList)
-        if Shell != NULL and packet fits in 2048 bytes:
-            memcpy(Shell->DataBuffer, packetData, packetLen)
-            adjust MDL length
-            Clones[i] = Shell->Nbl
-            Shells[i]  = Shell
-            PreallocHitCount++
-        else:
-            Clones[i] = NdisAllocateCloneNetBufferList(OrigNbl, ClonePool, ...)
-            Shells[i]  = NULL
-            PreallocMissCount++ / PreallocOversizeCount++
+    if AZC && !CanPend:
+        Allocate or pop deep-copy NBL from DeepCopyFreeList
+        NdisRetreatNetBufferDataStart to allocate data pages
+        MdlCopyMdlChainToMdlChainAtOffsetNonTemporal (memcpy)
+        Clones[i] = DeepCopy
+        IsDeepCopyBatch[i] = TRUE
     else:
         Clones[i] = NdisAllocateCloneNetBufferList(OrigNbl, ClonePool, ...)
+        IsDeepCopyBatch[i] = FALSE
 ```
 
 **Phase 2 — Enqueue by target CPU, one lock per target:**
@@ -727,12 +688,12 @@ for each unprocessed entry i:
     KeAcquireInStackQueuedSpinLock(&Ring->Lock)
     for each entry j >= i with same TargetCpu:
         if Ring->Tail - Ring->Head < Ring->Capacity:
-            Ring->Entries[Ring->Tail & Ring->Mask] = { Clone[j], FilterHandle, Port, Shell[j] }
+            Ring->Entries[Ring->Tail & Ring->Mask] = { Clone[j], FilterHandle, Port, IsDeepCopy[j] }
             Ring->Tail++
             Ring->EnqueueCount++
             MaxRingDepth = max(MaxRingDepth, Tail - Head)
         else:
-            NdisFreeCloneNetBufferList or recycle Shell
+            NdisFreeCloneNetBufferList or recycle deep-copy
             Ring->DropCount++
             Ring->RingFullCount++
         mark j as processed
@@ -1180,9 +1141,7 @@ Defined in `src/xdp/cpumap.h`, overridable via MSBuild preprocessor defines:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `XDP_CPUMAP_PREALLOC` | `1` | Enable pre-allocated shell pool. Eliminates NDIS alloc/free on hot path. Costs ~67 MB/ring. |
 | `XDP_CPUMAP_DRAIN_ALL` | `0` | Drain entire ring per DPC invocation. Better throughput, potential DPC starvation. |
-| `XDP_CPUMAP_PREALLOC_BUFFER_SIZE` | `2048` | Max packet size for PREALLOC path. Packets larger than this fall back to clone. |
 
 To enable DRAIN_ALL mode at build time:
 ```xml
@@ -1210,7 +1169,7 @@ To enable DRAIN_ALL mode at build time:
 | Peak ops/sec on hottest pool | ~2M | ~250K |
 | L1 lookaside behavior | Exhausted → pool spinlock | Typically lock-free |
 
-With `PREALLOC=1`, clone pools are almost never used (only for oversized packets), so this is largely moot in the default configuration.
+With per-source-CPU clone pools, each RSS CPU allocates from its own NDIS pool with L1 lookaside behavior.
 
 ### DPC Insert Reduction (Bottleneck #4)
 
@@ -1272,11 +1231,10 @@ Second major performance optimization:
 
 Comprehensive performance tuning:
 - **Ring depth increase:** Default from 32 → 32,768 entries to absorb bursts.
-- **Pre-allocated shell pool (`XDP_CPUMAP_PREALLOC`):** Eliminates `NdisAllocateCloneNetBufferList` from the hot path. Each ring pre-allocates `RingCapacity` shells with NBL + NB + MDL + 2048-byte data buffer. Enqueue pops from lock-free SLIST (`InterlockedPopEntrySList`), memcpy's packet data; drain pushes back.
 - **Drain-until-empty inner loop:** DPC loops inside itself (up to `MAX_LOOP_ITERATIONS`) rather than re-queuing between batches, eliminating the DPC scheduling gap.
-- **`DRAIN_ALL` mode option:** Alternative drain strategy that dequeues the entire ring per DPC (stashes shell pointers in `NBL->MiniportReserved[0]`).
-- **16+ per-ring statistics counters** (`EnqueueCount`, `DrainCount`, `DropCount`, `RingFullCount`, `CloneFailCount`, `PreallocHitCount/MissCount/OversizeCount`, `DpcInvokeCount`, `DpcMaxBatchDrained`, `DpcRequeueCount`, `MaxRingDepth`, `EnqueueBatchCount`, `DpcLoopIterations`, `DpcMaxLoopIterations`, `DpcEmptyCount`).
-- **Stats dump on destroy** via `DbgPrintEx` with loss percentage calculation.
+- **`DRAIN_ALL` mode option:** Alternative drain strategy that dequeues the entire ring per DPC (stashes `IsDeepCopy` in `NBL->MiniportReserved[1]`).
+- **16+ per-ring statistics counters** (`EnqueueCount`, `DrainCount`, `DropCount`, `RingFullCount`, `CloneFailCount`, `DpcInvokeCount`, `DpcMaxBatchDrained`, `DpcRequeueCount`, `MaxRingDepth`, `EnqueueBatchCount`, `DpcLoopIterations`, `DpcMaxLoopIterations`, `DpcEmptyCount`, `LockWaitCycles`, `LockAcquireCount`).
+- **Stats dump on destroy** via `DbgPrintEx` with loss percentage calculation and TSC-calibrated lock timing.
 
 ### Commit 7: `a37ecac` — "xdp/cpumap: selective CPU range allocation, configurable ring depth and drain batch"
 
@@ -1296,8 +1254,8 @@ Final optimization and configurability:
 | 1 | `published/external/xdp/datapath.h` | Modified | +1 | Added `XDP_RX_ACTION_CPU_REDIRECT` to `XDP_RX_ACTION` enum |
 | 2 | `published/external/xdp/program.h` | Modified | +13/-1 | Added `XDP_REDIRECT_TARGET_TYPE_CPU`, `XDP_CPU_REDIRECT_PARAMS` struct, union in `XDP_REDIRECT_PARAMS` |
 | 3 | `published/private/xdpcpumap.h` | **New** | +117 | Frame extension type, CPUMAP lifecycle APIs, batch enqueue API (kernel-mode header shared between xdp.sys and xdplwf.sys) |
-| 4 | `src/xdp/cpumap.c` | **New** | +1021 | Full CPUMAP implementation: create/destroy, enqueue (single + batch), drain DPC, pre-alloc shell pool, stats |
-| 5 | `src/xdp/cpumap.h` | **New** | +141 | Internal types: `XDP_CPUMAP_RING`, `XDP_CPUMAP_ENTRY`, `XDP_CPUMAP_PREALLOC_SHELL`, `XDP_CPUMAP` struct, feature flag defines |
+| 4 | `src/xdp/cpumap.c` | **New** | +1021 | Full CPUMAP implementation: create/destroy, enqueue (single + batch), drain DPC, per-CPU clone pools, AZC deep-copy fallback, stats |
+| 5 | `src/xdp/cpumap.h` | **New** | +141 | Internal types: `XDP_CPUMAP_RING`, `XDP_CPUMAP_ENTRY`, `XDP_CPUMAP` struct, feature flag defines |
 | 6 | `src/xdp/precomp.h` | Modified | +1 | `#include "cpumap.h"` |
 | 7 | `src/xdp/program.c` | Modified | +9/-1 | Handle `XDP_REDIRECT_TARGET_TYPE_CPU` in binding attach; reject unknown target types |
 | 8 | `src/xdp/program.h` | Modified | +1 | `XDP_EXTENSION CpuRedirectExtension` added to `XDP_INSPECTION_CONTEXT` |
@@ -1324,8 +1282,6 @@ Final optimization and configurability:
 
 `XdpCpuMapCreate` is called from `recv.c` at `DISPATCH_LEVEL` on the first packet. If NDIS pool creation (`NdisAllocateNetBufferListPool`) internally requires `PASSIVE_LEVEL` on some driver versions, this will bugcheck. A work item deferral is the safe fix if this proves to be an issue.
 
-The ~1.6 GB PREALLOC allocation at first-packet time also causes a latency spike on the first processed packet. A preheat option (sending a single warm-up packet before the actual test) mitigates this.
-
 ### Spinlock on Ring (Future: Lock-Free SPSC Rings)
 
 Each `XDP_CPUMAP_RING` is shared among multiple source CPUs (RSS queues) under a `KSPIN_LOCK`. Under high fan-out (8 source CPUs × 24 target CPUs), each ring's lock is contended by up to 8 producers. Replacing MPSC rings with per-(source, target) SPSC rings (zero atomics on producer path, scan-all-sources on drain) would eliminate this remaining lock contention.
@@ -1340,4 +1296,4 @@ CPU redirect only operates on the RX inspect path. TX path CPU affinity is not i
 
 ### `NDIS_RECEIVE_FLAGS_RESOURCES` Synchronous Drain
 
-The drain DPC uses `NDIS_RECEIVE_FLAGS_RESOURCES`, which forces TCP/IP to process the packet synchronously before the DPC returns the NBL. Under heavy stack load this adds latency to the DPC. Removing this flag would require deep-copy cloning (so the clone owns its data buffer independently) and hooking `FilterReturnNetBufferLists` to recycle shells asynchronously.
+For non-AZC (clone-based) maps, the drain DPC uses `NDIS_RECEIVE_FLAGS_RESOURCES`, which forces TCP/IP to process the packet synchronously before the DPC returns the NBL. Under heavy stack load this adds latency to the DPC. For AZC maps with `CanPend`, originals are indicated without `RESOURCES` and returned asynchronously by tcpip; deep-copy fallback NBLs are still indicated with `RESOURCES`.

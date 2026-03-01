@@ -18,59 +18,11 @@ EXTERN_C_START
 
 //
 // When XDP_CPUMAP_DRAIN_ALL is 1, the drain DPC dequeues the entire ring
-// in one pass (no batch limit).  Shells are recycled inline after NDIS
-// indication rather than via a fixed-size stack array.
+// in one pass (no batch limit).
 // When 0, the legacy batched path (XDP_CPUMAP_MAX_BATCH_SIZE cap) is used.
 //
 #ifndef XDP_CPUMAP_DRAIN_ALL
 #define XDP_CPUMAP_DRAIN_ALL 0
-#endif
-
-//
-// Pre-allocated buffer pool hack: eliminate clone alloc/free from the
-// hot path.  Enable by defining XDP_CPUMAP_PREALLOC=1 at build time
-// (or toggle the default below).  Each per-CPU ring pre-allocates
-// RingCapacity shells containing NBL + NB + MDL + 2048-byte buffer.
-// Enqueue memcpy's packet data into a shell (no NDIS pool alloc);
-// drain recycles the shell (no NDIS pool free).
-//
-#ifndef XDP_CPUMAP_PREALLOC
-#define XDP_CPUMAP_PREALLOC 1
-#endif
-
-//
-// Zero-copy indicate: when enabled, CPUMAP indicates shell NBLs to NDIS
-// without NDIS_RECEIVE_FLAGS_RESOURCES, letting tcpip process the data
-// in-place (no tcpip copy). Shells are recycled asynchronously when
-// tcpip returns them via FilterReturnNetBufferLists.
-// Requires XDP_CPUMAP_PREALLOC=1.
-//
-#ifndef XDP_CPUMAP_ZERO_COPY_INDICATE
-#define XDP_CPUMAP_ZERO_COPY_INDICATE 0
-#endif
-
-#if XDP_CPUMAP_ZERO_COPY_INDICATE
-//
-// Magic tags stamped in Nbl->MiniportReserved[1] before indication.
-// MiniportReserved is originator-owned; we allocated the NBL so it's ours.
-//
-#define XDP_CPUMAP_SHELL_MAGIC  ((PVOID)(ULONG_PTR)0x584D4150)  // 'XMAP'
-#define XDP_CPUMAP_CLONE_MAGIC  ((PVOID)(ULONG_PTR)0x584D4151)  // 'XMAQ'
-#endif
-
-#if XDP_CPUMAP_PREALLOC
-#define XDP_CPUMAP_PREALLOC_BUFFER_SIZE 2048
-
-typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_PREALLOC_SHELL {
-    SLIST_ENTRY SListEntry;
-    NET_BUFFER_LIST *Nbl;
-    MDL *Mdl;
-#if XDP_CPUMAP_ZERO_COPY_INDICATE
-    PSLIST_HEADER OwnerFreeList;            // Points to Ring->PreallocFreeList for async recycle
-    struct _XDP_CPUMAP *OwnerMap;           // Back-pointer for OutstandingIndications decrement
-#endif
-    UCHAR DataBuffer[XDP_CPUMAP_PREALLOC_BUFFER_SIZE];
-} XDP_CPUMAP_PREALLOC_SHELL;
 #endif
 
 //
@@ -80,10 +32,7 @@ typedef struct _XDP_CPUMAP_ENTRY {
     NET_BUFFER_LIST *Nbl;
     NDIS_HANDLE FilterHandle;
     NDIS_PORT_NUMBER PortNumber;
-    BOOLEAN IsDeepCopy;  // TRUE = deep-copy NBL (AZC !CanPend fallback), FALSE = original or shell
-#if XDP_CPUMAP_PREALLOC
-    struct _XDP_CPUMAP_PREALLOC_SHELL *Shell;
-#endif
+    BOOLEAN IsDeepCopy;  // TRUE = deep-copy NBL (!CanPend fallback), FALSE = original
 } XDP_CPUMAP_ENTRY;
 
 //
@@ -104,10 +53,6 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
 
     // Diagnostic counters (POC profiling)
     volatile LONG RingFullCount;         // Enqueue saw ring full (subset of DropCount)
-    volatile LONG CloneFailCount;        // NdisAllocateCloneNetBufferList returned NULL
-    volatile LONG PreallocHitCount;      // Pre-alloc shell used successfully
-    volatile LONG PreallocMissCount;     // Pre-alloc SLIST empty, fell back to clone
-    volatile LONG PreallocOversizeCount; // Packet > PREALLOC_BUFFER_SIZE
     volatile LONG DpcInvokeCount;        // Number of DPC firings
     volatile LONG DpcMaxBatchDrained;    // Largest batch in a single DPC
     volatile LONG DpcRequeueCount;       // DPC re-queued itself (more work)
@@ -122,14 +67,7 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
     volatile LONG LockAcquireCount;       // Total lock acquisitions
     volatile LONG64 SourceCpuMask[2];     // Bitmask of source CPUs that enqueued (up to 128)
 
-#if XDP_CPUMAP_PREALLOC
-    DECLSPEC_CACHEALIGN SLIST_HEADER PreallocFreeList;
-    XDP_CPUMAP_PREALLOC_SHELL *PreallocShellBlock;  // Single contiguous allocation for all shells
-#endif
-
-#if XDP_CPUMAP_ZERO_COPY_INDICATE
-    struct _XDP_CPUMAP *OwnerMap;  // Back-pointer for OutstandingIndications in DrainDpc
-#endif
+    struct _XDP_CPUMAP *OwnerMap;  // Back-pointer for map flags and stats in DrainDpc
 
     XDP_CPUMAP_ENTRY Entries[ANYSIZE_ARRAY];
 } XDP_CPUMAP_RING;
@@ -140,35 +78,10 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
 struct _XDP_CPUMAP {
     UINT32 CpuBase;    // First target CPU (absolute processor index)
     UINT32 CpuCount;   // Number of target CPUs; rings are indexed [0, CpuCount)
-    UINT32 Flags;      // XDP_CPUMAP_FLAG_* runtime behavior flags
     volatile BOOLEAN Active;
 
     //
-    // Per-source-CPU NBL clone pools. Indexed by KeGetCurrentProcessorIndex().
-    // Each RSS CPU allocates clones from its own pool; NDIS auto-routes frees
-    // back to the originating pool regardless of which CPU calls
-    // NdisFreeCloneNetBufferList.
-    //
-    UINT32 ClonePoolCount;
-    NDIS_HANDLE *PerCpuClonePools;
-
-#if XDP_CPUMAP_PREALLOC
-    NDIS_HANDLE PreallocNblPool;
-    volatile LONG64 CopyTotalCycles;      // Sum of rdtsc cycles spent in RtlCopyMemory
-    volatile LONG CopyCount;              // Number of RtlCopyMemory calls
-    volatile LONG64 CopyTotalBytes;       // Total bytes copied
-#endif
-
-#if XDP_CPUMAP_ZERO_COPY_INDICATE
-    volatile LONG OutstandingIndications;  // NBLs indicated but not yet returned (shell + clone)
-    KEVENT AllReturnedEvent;               // Signaled when OutstandingIndications reaches 0
-    volatile LONG ZeroCopyIndicateCount;   // Total NBLs indicated without RESOURCES flag
-    volatile LONG ShellReturnCount;        // Shells recycled via async return path
-    volatile LONG CloneReturnCount;        // Clones freed via async return path
-#endif
-
-    //
-    // AZC !CanPend deep-copy fallback pool.
+    // !CanPend deep-copy fallback pool.
     // Lazy allocation: NBL structs allocated on first use, cached in SList.
     // No pre-allocated data buffers — NdisRetreatNetBufferDataStart allocates
     // pages on each use, NdisAdvanceNetBufferDataStart frees them on recycle.
@@ -176,8 +89,7 @@ struct _XDP_CPUMAP {
     NDIS_HANDLE DeepCopyNblPool;              // NdisAllocateNetBufferListPool (bare NBL+NB)
     DECLSPEC_CACHEALIGN
     SLIST_HEADER DeepCopyFreeList;             // Cross-CPU SList: DrainDpc pushes recycled NBLs
-    volatile LONG DeepCopyAllocCount;          // Total NBLs ever allocated (monotonic up to limit)
-    LONG DeepCopyAllocLimit;                   // Cap on total allocated NBLs
+    volatile LONG DeepCopyAllocCount;          // Total NBLs ever allocated (grows on demand)
     volatile LONG DeepCopyHitCount;            // Stats: reused from free list
     volatile LONG DeepCopyMissCount;           // Stats: allocated new from pool
     volatile LONG DeepCopyFailCount;           // Stats: allocation or retreat failed

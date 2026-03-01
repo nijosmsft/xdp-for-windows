@@ -14,14 +14,8 @@ typedef struct _XDP_FRAME_CPU_REDIRECT {
     UINT32 CpuCount;       // Number of CPUs in the redirect range
     UINT32 RingDepth;      // Per-CPU ring capacity (0 = default)
     UINT32 DrainBatchSize; // DPC drain batch limit (0 = default)
-    UINT32 Flags;          // XDP_CPUMAP_FLAG_* runtime behavior flags
+    UINT32 Flags;          // Reserved, must be 0
 } XDP_FRAME_CPU_REDIRECT;
-
-//
-// Runtime behavior flags for CPUMAP (set via XDP_FRAME_CPU_REDIRECT.Flags).
-// The public API define is XDP_CPU_REDIRECT_FLAG_ABSOLUTE_ZERO_COPY in program.h.
-//
-#define XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY      XDP_CPU_REDIRECT_FLAG_ABSOLUTE_ZERO_COPY
 
 #define XDP_FRAME_EXTENSION_CPU_REDIRECT_NAME L"ms_frame_cpu_redirect"
 #define XDP_FRAME_EXTENSION_CPU_REDIRECT_VERSION_1 1U
@@ -49,15 +43,6 @@ XdpGetCpuRedirectExtension(
 #ifdef _KERNEL_MODE
 
 //
-// Zero-copy indicate toggle.  When enabled, CPUMAP indicates NBLs
-// without NDIS_RECEIVE_FLAGS_RESOURCES, avoiding a copy in tcpip.
-// Requires XDP_CPUMAP_PREALLOC=1.
-//
-#ifndef XDP_CPUMAP_ZERO_COPY_INDICATE
-#define XDP_CPUMAP_ZERO_COPY_INDICATE 1
-#endif
-
-//
 // CPUMAP lifecycle APIs (callable from xdplwf).
 // Kernel-mode only.
 //
@@ -77,16 +62,6 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 XdpCpuMapDestroy(
     _In_ XDP_CPUMAP *CpuMap
-    );
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-NTSTATUS
-XdpCpuMapEnqueue(
-    _In_ XDP_CPUMAP *CpuMap,
-    _In_ UINT32 TargetCpu,
-    _In_ NET_BUFFER_LIST *Nbl,
-    _In_ NDIS_HANDLE FilterHandle,
-    _In_ NDIS_PORT_NUMBER PortNumber
     );
 
 //
@@ -142,28 +117,5 @@ XdpCpuMapTrackMiniportIndication(
     _In_ XDP_CPUMAP *CpuMap,
     _In_ BOOLEAN IsResources
     );
-
-//
-// Query the runtime flags of a CPUMAP instance.
-//
-_IRQL_requires_max_(DISPATCH_LEVEL)
-UINT32
-XdpCpuMapGetFlags(
-    _In_ XDP_CPUMAP *CpuMap
-    );
-
-#if XDP_CPUMAP_ZERO_COPY_INDICATE
-//
-// Return path for zero-copy indicated NBLs.  Called from the LWF
-// ReturnNetBufferLists handler.  Walks the chain, recycles CPUMAP
-// shells/clones, and passes through any non-CPUMAP NBLs via the
-// returned PassThrough chain.
-//
-_IRQL_requires_max_(DISPATCH_LEVEL)
-NET_BUFFER_LIST *
-XdpCpuMapReturnShells(
-    _In_ NET_BUFFER_LIST *NetBufferLists
-    );
-#endif // XDP_CPUMAP_ZERO_COPY_INDICATE
 
 #endif // _KERNEL_MODE

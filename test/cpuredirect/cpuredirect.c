@@ -16,9 +16,12 @@
 #include <stdlib.h>
 
 CONST CHAR *UsageText =
-"cpuredirect.exe <IfIndex> <Port> <CpuBase> <CpuCount> [RingDepth] [DrainBatch] [--azc]\n"
+"cpuredirect.exe <IfIndex> <Port> <CpuBase> <CpuCount> [RingDepth] [DrainBatch]\n"
 "\n"
 "Creates an XDP program that redirects UDP traffic to CPUs for load distribution.\n"
+"Uses zero-copy mode: original miniport NBLs are indicated directly to TCP/IP\n"
+"when the miniport allows pending (CanPend=TRUE). When the miniport indicates\n"
+"with RESOURCES (!CanPend), packet data is deep-copied into independent NBLs.\n"
 "\n"
 "ARGUMENTS:\n"
 "\n"
@@ -40,10 +43,6 @@ CONST CHAR *UsageText =
 "\n"
 "   DrainBatch (optional, default 256)\n"
 "       Max NBLs drained per DPC iteration. Range: 1-256.\n"
-"\n"
-"   --azc\n"
-"       Enable absolute zero-copy mode. Indicates original miniport NBLs\n"
-"       directly to TCP/IP without any copy. Requires CanPend=TRUE from miniport.\n"
 "\n"
 "EXAMPLES:\n"
 "\n"
@@ -79,11 +78,10 @@ ParseArgs(
     UINT32 *CpuBase,
     UINT32 *CpuCount,
     UINT32 *RingDepth,
-    UINT32 *DrainBatch,
-    UINT32 *Flags
+    UINT32 *DrainBatch
     )
 {
-    if (ArgC < 5 || ArgC > 8) {
+    if (ArgC < 5 || ArgC > 7) {
         return FALSE;
     }
 
@@ -93,16 +91,6 @@ ParseArgs(
     *CpuCount = (UINT32)atoi(ArgV[4]);
     *RingDepth = (ArgC >= 6) ? (UINT32)atoi(ArgV[5]) : 0;
     *DrainBatch = (ArgC >= 7) ? (UINT32)atoi(ArgV[6]) : 0;
-    *Flags = 0;
-
-    //
-    // Scan for named flags anywhere in the argument list.
-    //
-    for (INT i = 5; i < ArgC; i++) {
-        if (_stricmp(ArgV[i], "--azc") == 0) {
-            *Flags |= XDP_CPU_REDIRECT_FLAG_ABSOLUTE_ZERO_COPY;
-        }
-    }
 
     //
     // Basic validation.
@@ -160,7 +148,6 @@ main(
     UINT32 CpuCount;
     UINT32 RingDepth;
     UINT32 DrainBatch;
-    UINT32 Flags;
     XDP_STATUS XdpStatus;
     HANDLE Program = NULL;
     XDP_RULE Rule;
@@ -175,7 +162,7 @@ main(
     //
     // Parse command line arguments.
     //
-    if (!ParseArgs(ArgC, ArgV, &IfIndex, &Port, &CpuBase, &CpuCount, &RingDepth, &DrainBatch, &Flags)) {
+    if (!ParseArgs(ArgC, ArgV, &IfIndex, &Port, &CpuBase, &CpuCount, &RingDepth, &DrainBatch)) {
         printf(UsageText);
         return 1;
     }
@@ -194,8 +181,6 @@ main(
             CpuBase, CpuBase + CpuCount - 1, CpuCount);
     LOGINFO("Ring Depth:  %u (0=default 32768)", RingDepth);
     LOGINFO("Drain Batch: %u (0=default 256)", DrainBatch);
-    LOGINFO("Flags:       0x%x%s", Flags,
-            (Flags & XDP_CPU_REDIRECT_FLAG_ABSOLUTE_ZERO_COPY) ? " (absolute zero-copy)" : "");
     LOGINFO("");
 
     //
@@ -216,7 +201,7 @@ main(
     Rule.Redirect.CpuRedirect.TargetCpuCount = CpuCount;
     Rule.Redirect.CpuRedirect.RingDepth = RingDepth;
     Rule.Redirect.CpuRedirect.DrainBatchSize = DrainBatch;
-    Rule.Redirect.CpuRedirect.Flags = Flags;
+    Rule.Redirect.CpuRedirect.Flags = 0;
 
     //
     // Use generic mode and apply to all queues.

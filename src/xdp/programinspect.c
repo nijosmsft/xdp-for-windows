@@ -1758,8 +1758,7 @@ XdpProgramValidateRule(
                     goto Exit;
                 }
 
-                if ((UserRule->Redirect.CpuRedirect.Flags &
-                    ~XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY) != 0) {
+                if (UserRule->Redirect.CpuRedirect.Flags != 0) {
                     Status = STATUS_INVALID_PARAMETER;
                     goto Exit;
                 }

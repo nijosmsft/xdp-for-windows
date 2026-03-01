@@ -165,20 +165,6 @@ XdpGenericReturnNetBufferLists(
         OldIrql = KeRaiseIrqlToDpcLevel();
     }
 
-#if XDP_CPUMAP_ZERO_COPY_INDICATE
-    //
-    // Recycle any CPUMAP zero-copy NBLs before the inject-complete path.
-    // Non-CPUMAP NBLs are returned as the pass-through chain.
-    //
-    NetBufferLists = XdpCpuMapReturnShells(NetBufferLists);
-    if (NetBufferLists == NULL) {
-        if (OldIrql != DISPATCH_LEVEL) {
-            KeLowerIrql(OldIrql);
-        }
-        return;
-    }
-#endif
-
     NetBufferLists = XdpGenericInjectNetBufferListsComplete(Generic, NetBufferLists);
 
     if (OldIrql != DISPATCH_LEVEL) {
@@ -1769,9 +1755,6 @@ XdpGenericReceivePostInspectNbs(
                         UINT32 BatchSize = CpuRedirect->DrainBatchSize;
                         UINT32 MapFlags = CpuRedirect->Flags;
 
-                        if (!CanPend) {
-                            MapFlags &= ~XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY;
-                        }
                         XDP_CPUMAP *NewMap = NULL;
                         NTSTATUS Status = XdpCpuMapCreate(
                             MapCpuBase,
@@ -1840,15 +1823,13 @@ XdpGenericReceivePostInspectNbs(
                     }
 
                     //
-                    // When not using absolute zero-copy, return the original
-                    // NBL to the miniport immediately (like DROP).  In absolute
-                    // zero-copy mode, FlushBatch holds the original for async
+                    // When !CanPend, return the original NBL to the miniport
+                    // immediately (FlushBatch deep-copies the data).  When
+                    // CanPend, FlushBatch holds the original for async
                     // indication; originals that can’t be enqueued are returned
                     // via ReturnableOriginals above.
                     //
-                    if (!CanPend ||
-                        RxQueue->Generic->CpuMap == NULL ||
-                        !(XdpCpuMapGetFlags(RxQueue->Generic->CpuMap) & XDP_CPUMAP_FLAG_ABSOLUTE_ZERO_COPY)) {
+                    if (!CanPend || RxQueue->Generic->CpuMap == NULL) {
                         NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
                     }
                 }
