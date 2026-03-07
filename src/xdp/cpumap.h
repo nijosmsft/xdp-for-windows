@@ -17,15 +17,6 @@ EXTERN_C_START
 #define POOLTAG_CPUMAP 'PMUC' // 'CUPM'
 
 //
-// When XDP_CPUMAP_DRAIN_ALL is 1, the drain DPC dequeues the entire ring
-// in one pass (no batch limit).
-// When 0, the legacy batched path (XDP_CPUMAP_MAX_BATCH_SIZE cap) is used.
-//
-#ifndef XDP_CPUMAP_DRAIN_ALL
-#define XDP_CPUMAP_DRAIN_ALL 0
-#endif
-
-//
 // Ring entry: NBL + metadata for re-indication
 //
 typedef struct _XDP_CPUMAP_ENTRY {
@@ -61,6 +52,7 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
     volatile LONG DpcLoopIterations;     // Total inner-loop iterations (batched drain-until-empty)
     volatile LONG DpcMaxLoopIterations;  // Max loop iterations in a single DPC invocation
     volatile LONG DpcEmptyCount;         // DPC fired but ring was already empty
+    volatile LONG DpcYieldCount;         // DPC yielded via KeShouldYieldProcessor
 
     // Lock contention profiling
     volatile LONG64 LockWaitCycles;       // Total rdtsc cycles waiting on spinlock (producers + consumer)

@@ -245,7 +245,7 @@ XdpCpuMapDestroy(
         LONG TotalEnqueue = 0, TotalDrain = 0, TotalDrop = 0;
         LONG TotalRingFull = 0;
         LONG TotalDpcInvoke = 0, TotalDpcRequeue = 0;
-        LONG TotalEnqBatch = 0, TotalDpcLoop = 0, TotalDpcEmpty = 0;
+        LONG TotalEnqBatch = 0, TotalDpcLoop = 0, TotalDpcEmpty = 0, TotalDpcYield = 0;
         LONG64 TscFreqHz = 1;
 
         //
@@ -284,6 +284,7 @@ XdpCpuMapDestroy(
                 TotalEnqBatch += R->EnqueueBatchCount;
                 TotalDpcLoop += R->DpcLoopIterations;
                 TotalDpcEmpty += R->DpcEmptyCount;
+                TotalDpcYield += R->DpcYieldCount;
 
                 //
                 // Count distinct source CPUs from bitmask.
@@ -306,7 +307,7 @@ XdpCpuMapDestroy(
                     "Ring[%2u]: Enq=%d Drain=%d Drop=%d "
                     "Full=%d "
                     "DPC=%d MaxB=%d Req=%d MaxD=%d "
-                    "EBat=%d Loop=%d MxL=%d Emp=%d "
+                    "EBat=%d Loop=%d MxL=%d Emp=%d Yld=%d "
                     "Src=%u Lk=%d LkUs=%lld\n",
                     s, R->EnqueueCount, R->DrainCount, R->DropCount,
                     R->RingFullCount,
@@ -314,6 +315,7 @@ XdpCpuMapDestroy(
                     R->DpcRequeueCount, R->MaxRingDepth,
                     R->EnqueueBatchCount, R->DpcLoopIterations,
                     R->DpcMaxLoopIterations, R->DpcEmptyCount,
+                    R->DpcYieldCount,
                     SrcCount, R->LockAcquireCount, LkUs);
             }
         }
@@ -329,11 +331,11 @@ XdpCpuMapDestroy(
                 DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
                 "Totals: Enq=%d Drain=%d Drop=%d (%d.%02d%%) "
                 "Full=%d "
-                "DPC=%d Req=%d "
+                "DPC=%d Req=%d Yld=%d "
                 "EBat=%d Loop=%d Emp=%d\n",
                 TotalEnqueue, TotalDrain, TotalDrop, LossWhole, LossFrac,
                 TotalRingFull,
-                TotalDpcInvoke, TotalDpcRequeue,
+                TotalDpcInvoke, TotalDpcRequeue, TotalDpcYield,
                 TotalEnqBatch, TotalDpcLoop, TotalDpcEmpty);
             DbgPrintEx(
                 DPFLTR_IHVNETWORK_ID, DPFLTR_INFO_LEVEL,
@@ -746,7 +748,6 @@ XdpCpuMapDrainDpc(
     _In_opt_ PVOID SystemArgument2
     )
 {
-    UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
@@ -758,9 +759,7 @@ XdpCpuMapDrainDpc(
     NDIS_PORT_NUMBER PortNumber = 0;
     KLOCK_QUEUE_HANDLE LockHandle;
     BOOLEAN MoreWork;
-#if !XDP_CPUMAP_DRAIN_ALL
     BOOLEAN IsDeepCopyDpc[XDP_CPUMAP_MAX_BATCH_SIZE];
-#endif
 
     if (Ring == NULL) {
         return;
@@ -768,18 +767,18 @@ XdpCpuMapDrainDpc(
 
     InterlockedIncrement(&Ring->DpcInvokeCount);
 
-#if !XDP_CPUMAP_DRAIN_ALL
     //
-    // Batched drain-until-empty: loop inside the DPC, draining up to
-    // XDP_CPUMAP_MAX_BATCH_SIZE per iteration. This keeps per-indication
-    // batch sizes small (low latency) while eliminating the DPC re-queue
-    // gap that causes ring drops under load.
+    // Yield-aware batched drain: loop inside the DPC, draining up to
+    // DrainBatchSize per iteration. After each batch, check
+    // KeShouldYieldProcessor() to avoid DPC watchdog timeout.
+    // If the OS says yield, re-queue the DPC and return — remaining
+    // packets stay in the ring.
     //
     {
+    BOOLEAN ShouldYield = FALSE;
     UINT32 LoopIter = 0;
     do {
     LoopIter++;
-#endif
 
     BatchHead = NULL;
     BatchTail = NULL;
@@ -797,16 +796,7 @@ XdpCpuMapDrainDpc(
         InterlockedIncrement(&Ring->LockAcquireCount);
     }
 
-#if XDP_CPUMAP_DRAIN_ALL
-    //
-    // Drain-all mode: dequeue the entire ring in one pass. No batch cap.
-    // IsDeepCopy is stashed in MiniportReserved[1] for AZC maps,
-    // avoiding a fixed-size stack array.
-    //
-    while (Ring->Head != Ring->Tail) {
-#else
     while (Ring->Head != Ring->Tail && Count < Ring->DrainBatchSize) {
-#endif
         XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
 
         FilterHandle = Entry->FilterHandle;
@@ -823,15 +813,7 @@ XdpCpuMapDrainDpc(
         }
         BatchTail = Entry->Nbl;
 
-#if XDP_CPUMAP_DRAIN_ALL
-        //
-        // Stash IsDeepCopy in MiniportReserved[1] to avoid a fixed-size
-        // stack array in drain-all mode.
-        //
-        Entry->Nbl->MiniportReserved[1] = (PVOID)(ULONG_PTR)Entry->IsDeepCopy;
-#else
         IsDeepCopyDpc[Count] = Entry->IsDeepCopy;
-#endif
 
         Ring->Head++;
         Count++;
@@ -869,21 +851,14 @@ XdpCpuMapDrainDpc(
             NET_BUFFER_LIST *DcHead = NULL, **DcTailPtr = &DcHead;
             UINT32 OrigCount = 0, DcCount = 0;
             NET_BUFFER_LIST *Cur = BatchHead;
-#if !XDP_CPUMAP_DRAIN_ALL
             UINT32 SplitIdx = 0;
-#endif
 
             while (Cur != NULL) {
                 NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Cur);
                 NET_BUFFER_LIST_NEXT_NBL(Cur) = NULL;
 
-#if XDP_CPUMAP_DRAIN_ALL
-                BOOLEAN IsDc = (BOOLEAN)(ULONG_PTR)Cur->MiniportReserved[1];
-                Cur->MiniportReserved[1] = NULL;
-#else
                 BOOLEAN IsDc = IsDeepCopyDpc[SplitIdx];
                 SplitIdx++;
-#endif
 
                 if (IsDc) {
                     *DcTailPtr = Cur;
@@ -946,28 +921,23 @@ XdpCpuMapDrainDpc(
         }
     }
 
-#if XDP_CPUMAP_DRAIN_ALL
-    //
-    // Drain-all mode: re-queue DPC if more work remains (shouldn't happen).
-    //
+    MoreWork = (Ring->Head != Ring->Tail);
     if (MoreWork) {
         InterlockedIncrement(&Ring->DpcRequeueCount);
+        if (KeShouldYieldProcessor()) {
+            ShouldYield = TRUE;
+        }
+    }
+    } while (MoreWork && !ShouldYield);
+
+    if (ShouldYield) {
+        InterlockedIncrement(&Ring->DpcYieldCount);
         KeInsertQueueDpc(Dpc, NULL, NULL);
     }
-#else
-    //
-    // Batched mode: loop back if more work remains. Track re-queue count
-    // for stats parity (counts loop iterations beyond the first).
-    //
-    if (MoreWork) {
-        InterlockedIncrement(&Ring->DpcRequeueCount);
-    }
-    } while (MoreWork);
 
     InterlockedAdd(&Ring->DpcLoopIterations, (LONG)LoopIter);
     if ((LONG)LoopIter > Ring->DpcMaxLoopIterations) {
         Ring->DpcMaxLoopIterations = (LONG)LoopIter;
     }
-    } // end LoopIter scope
-#endif
+    } // end yield-aware drain scope
 }
