@@ -213,6 +213,7 @@ XdpCpuMapDestroy(
             if (Ring == NULL) {
                 continue;
             }
+
             while (Ring->Head != Ring->Tail) {
                 XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
                 if (Entry->IsDeepCopy) {
@@ -760,6 +761,8 @@ XdpCpuMapDrainDpc(
     KLOCK_QUEUE_HANDLE LockHandle;
     BOOLEAN MoreWork;
     BOOLEAN IsDeepCopyDpc[XDP_CPUMAP_MAX_BATCH_SIZE];
+    BOOLEAN ShouldYield = FALSE;
+    UINT32 LoopIter = 0;
 
     if (Ring == NULL) {
         return;
@@ -774,79 +777,61 @@ XdpCpuMapDrainDpc(
     // If the OS says yield, re-queue the DPC and return — remaining
     // packets stay in the ring.
     //
-    {
-    BOOLEAN ShouldYield = FALSE;
-    UINT32 LoopIter = 0;
     do {
-    LoopIter++;
+        LoopIter++;
 
-    BatchHead = NULL;
-    BatchTail = NULL;
-    Count = 0;
-    FilterHandle = NULL;
-    PortNumber = 0;
-
-    //
-    // Dequeue batch
-    //
-    {
-        UINT64 LockStart = __rdtsc();
-        KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
-        InterlockedAdd64(&Ring->LockWaitCycles, (LONG64)(__rdtsc() - LockStart));
-        InterlockedIncrement(&Ring->LockAcquireCount);
-    }
-
-    while (Ring->Head != Ring->Tail && Count < Ring->DrainBatchSize) {
-        XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
-
-        FilterHandle = Entry->FilterHandle;
-        PortNumber = Entry->PortNumber;
+        BatchHead = NULL;
+        BatchTail = NULL;
+        Count = 0;
+        FilterHandle = NULL;
+        PortNumber = 0;
 
         //
-        // Build NBL chain
-        //
-        NET_BUFFER_LIST_NEXT_NBL(Entry->Nbl) = NULL;
-        if (BatchTail != NULL) {
-            NET_BUFFER_LIST_NEXT_NBL(BatchTail) = Entry->Nbl;
-        } else {
-            BatchHead = Entry->Nbl;
-        }
-        BatchTail = Entry->Nbl;
-
-        IsDeepCopyDpc[Count] = Entry->IsDeepCopy;
-
-        Ring->Head++;
-        Count++;
-    }
-
-    MoreWork = (Ring->Head != Ring->Tail);
-    if (Count > 0) {
-        InterlockedAdd(&Ring->DrainCount, Count);
-        //
-        // Track largest batch drained in a single DPC.
-        //
-        if ((LONG)Count > Ring->DpcMaxBatchDrained) {
-            Ring->DpcMaxBatchDrained = (LONG)Count;
-        }
-    } else if (!MoreWork) {
-        //
-        // DPC fired but ring was already empty.
-        //
-        InterlockedIncrement(&Ring->DpcEmptyCount);
-    }
-
-    KeReleaseInStackQueuedSpinLock(&LockHandle);
-
-    //
-    // Re-indicate to NDIS
-    //
-    if (BatchHead != NULL && FilterHandle != NULL) {
-        //
-        // Split the chain into originals (indicate normally, async return
-        // to miniport) and deep-copies (indicate with RESOURCES, then
-        // recycle inline to SList).
+        // Dequeue batch under lock.
         //
         {
+            UINT64 LockStart = __rdtsc();
+            KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+            InterlockedAdd64(&Ring->LockWaitCycles, (LONG64)(__rdtsc() - LockStart));
+            InterlockedIncrement(&Ring->LockAcquireCount);
+        }
+
+        while (Ring->Head != Ring->Tail && Count < Ring->DrainBatchSize) {
+            XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
+
+            FilterHandle = Entry->FilterHandle;
+            PortNumber = Entry->PortNumber;
+
+            NET_BUFFER_LIST_NEXT_NBL(Entry->Nbl) = NULL;
+            if (BatchTail != NULL) {
+                NET_BUFFER_LIST_NEXT_NBL(BatchTail) = Entry->Nbl;
+            } else {
+                BatchHead = Entry->Nbl;
+            }
+            BatchTail = Entry->Nbl;
+
+            IsDeepCopyDpc[Count] = Entry->IsDeepCopy;
+
+            Ring->Head++;
+            Count++;
+        }
+
+        MoreWork = (Ring->Head != Ring->Tail);
+        if (Count > 0) {
+            InterlockedAdd(&Ring->DrainCount, Count);
+            if ((LONG)Count > Ring->DpcMaxBatchDrained) {
+                Ring->DpcMaxBatchDrained = (LONG)Count;
+            }
+        } else if (!MoreWork) {
+            InterlockedIncrement(&Ring->DpcEmptyCount);
+        }
+
+        KeReleaseInStackQueuedSpinLock(&LockHandle);
+
+        //
+        // Split into orig/dc chains and indicate to NDIS.
+        //
+        if (BatchHead != NULL && FilterHandle != NULL) {
             NET_BUFFER_LIST *OrigHead = NULL, **OrigTailPtr = &OrigHead;
             NET_BUFFER_LIST *DcHead = NULL, **DcTailPtr = &DcHead;
             UINT32 OrigCount = 0, DcCount = 0;
@@ -857,10 +842,7 @@ XdpCpuMapDrainDpc(
                 NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(Cur);
                 NET_BUFFER_LIST_NEXT_NBL(Cur) = NULL;
 
-                BOOLEAN IsDc = IsDeepCopyDpc[SplitIdx];
-                SplitIdx++;
-
-                if (IsDc) {
+                if (IsDeepCopyDpc[SplitIdx]) {
                     *DcTailPtr = Cur;
                     DcTailPtr = &NET_BUFFER_LIST_NEXT_NBL(Cur);
                     DcCount++;
@@ -869,6 +851,7 @@ XdpCpuMapDrainDpc(
                     OrigTailPtr = &NET_BUFFER_LIST_NEXT_NBL(Cur);
                     OrigCount++;
                 }
+                SplitIdx++;
                 Cur = Next;
             }
 
@@ -877,26 +860,18 @@ XdpCpuMapDrainDpc(
             //
             if (OrigHead != NULL) {
                 NdisFIndicateReceiveNetBufferLists(
-                    FilterHandle,
-                    OrigHead,
-                    PortNumber,
-                    OrigCount,
+                    FilterHandle, OrigHead, PortNumber, OrigCount,
                     NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
-
                 InterlockedAdd(&Ring->OwnerMap->AbsoluteZeroCopyIndicateCount, OrigCount);
             }
 
             //
-            // Indicate deep-copies with RESOURCES (synchronous return).
+            // Indicate deep-copies with RESOURCES (synchronous return), then recycle.
             //
             if (DcHead != NULL) {
                 NdisFIndicateReceiveNetBufferLists(
-                    FilterHandle,
-                    DcHead,
-                    PortNumber,
-                    DcCount,
+                    FilterHandle, DcHead, PortNumber, DcCount,
                     NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL | NDIS_RECEIVE_FLAGS_RESOURCES);
-
                 InterlockedAdd(&Ring->OwnerMap->DeepCopyIndicateCount, DcCount);
 
                 //
@@ -907,27 +882,23 @@ XdpCpuMapDrainDpc(
                     while (DcCur != NULL) {
                         NET_BUFFER_LIST *DcNext = NET_BUFFER_LIST_NEXT_NBL(DcCur);
                         NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(DcCur);
-
                         NdisAdvanceNetBufferDataStart(Nb, Nb->DataLength, TRUE, NULL);
-
                         InterlockedPushEntrySList(
                             &Ring->OwnerMap->DeepCopyFreeList,
                             (PSLIST_ENTRY)&DcCur->Next);
-
                         DcCur = DcNext;
                     }
                 }
             }
         }
-    }
 
-    MoreWork = (Ring->Head != Ring->Tail);
-    if (MoreWork) {
-        InterlockedIncrement(&Ring->DpcRequeueCount);
-        if (KeShouldYieldProcessor()) {
-            ShouldYield = TRUE;
+        MoreWork = (Ring->Head != Ring->Tail);
+        if (MoreWork) {
+            InterlockedIncrement(&Ring->DpcRequeueCount);
+            if (KeShouldYieldProcessor()) {
+                ShouldYield = TRUE;
+            }
         }
-    }
     } while (MoreWork && !ShouldYield);
 
     if (ShouldYield) {
@@ -939,5 +910,4 @@ XdpCpuMapDrainDpc(
     if ((LONG)LoopIter > Ring->DpcMaxLoopIterations) {
         Ring->DpcMaxLoopIterations = (LONG)LoopIter;
     }
-    } // end yield-aware drain scope
 }

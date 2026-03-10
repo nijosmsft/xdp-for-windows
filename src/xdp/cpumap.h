@@ -14,6 +14,7 @@ EXTERN_C_START
 // Internal implementation details (not exported).
 //
 #define XDP_CPUMAP_MAX_BATCH_SIZE 256
+
 #define POOLTAG_CPUMAP 'PMUC' // 'CUPM'
 
 //
