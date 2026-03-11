@@ -92,6 +92,7 @@ typedef struct _XDP_PROGRAM_FRAME_CACHE {
             UINT32 Icmp4Valid : 1;
             UINT32 Icmp6Cached : 1;
             UINT32 Icmp6Valid : 1;
+            UINT32 QuicDestCidValid : 1;
         };
         UINT32 Flags;
     };
@@ -114,6 +115,8 @@ typedef struct _XDP_PROGRAM_FRAME_CACHE {
     UINT8 *TcpHdrOptions;
     UINT8 QuicCidLength;
     const UINT8 *QuicCid; // Src CID for long header, Dest CID for short header
+    UINT8 QuicDestCidLength;
+    const UINT8 *QuicDestCid;
     XDP_PROGRAM_PAYLOAD_CACHE TransportPayload;
     XDP_PROGRAM_PAYLOAD_CACHE IpPayload;
 } XDP_PROGRAM_FRAME_CACHE;

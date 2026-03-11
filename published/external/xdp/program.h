@@ -111,8 +111,40 @@ typedef struct _XDP_CPU_REDIRECT_PARAMS {
     UINT32 TargetCpuCount;
     UINT32 RingDepth;       // 0 = use default (XDP_CPUMAP_RING_DEFAULT_CAPACITY)
     UINT32 DrainBatchSize;  // 0 = use default (256)
-    UINT32 Flags;           // Reserved, must be 0
+    UINT32 Flags;           // See XDP_CPU_REDIRECT_FLAG_* below
 } XDP_CPU_REDIRECT_PARAMS;
+
+//
+// Flags for XDP_CPU_REDIRECT_PARAMS.Flags
+//
+
+//
+// When set, hash the QUIC Destination Connection ID instead of the 5-tuple
+// for CPU target selection. Non-QUIC UDP packets fall back to 5-tuple hashing.
+//
+#define XDP_CPU_REDIRECT_FLAG_HASH_QUIC_CID  0x00000001
+
+//
+// Bits 8-15: CID byte offset to start hashing (max XDP_QUIC_MAX_CID_LENGTH-1)
+// Bits 16-23: Number of CID bytes to hash (must be > 0 when flag set)
+// Bits 24-31: Reserved, must be 0
+//
+#define XDP_CPU_REDIRECT_QUIC_CID_OFFSET_SHIFT   8
+#define XDP_CPU_REDIRECT_QUIC_CID_OFFSET_MASK    0x0000FF00
+#define XDP_CPU_REDIRECT_QUIC_CID_LENGTH_SHIFT   16
+#define XDP_CPU_REDIRECT_QUIC_CID_LENGTH_MASK    0x00FF0000
+#define XDP_CPU_REDIRECT_RESERVED_MASK           0xFF000000
+
+#define XDP_CPU_REDIRECT_QUIC_CID_OFFSET(Flags) \
+    (((Flags) & XDP_CPU_REDIRECT_QUIC_CID_OFFSET_MASK) >> XDP_CPU_REDIRECT_QUIC_CID_OFFSET_SHIFT)
+
+#define XDP_CPU_REDIRECT_QUIC_CID_LENGTH(Flags) \
+    (((Flags) & XDP_CPU_REDIRECT_QUIC_CID_LENGTH_MASK) >> XDP_CPU_REDIRECT_QUIC_CID_LENGTH_SHIFT)
+
+#define XDP_CPU_REDIRECT_MAKE_QUIC_FLAGS(Offset, Length) \
+    (XDP_CPU_REDIRECT_FLAG_HASH_QUIC_CID | \
+     (((Offset) << XDP_CPU_REDIRECT_QUIC_CID_OFFSET_SHIFT) & XDP_CPU_REDIRECT_QUIC_CID_OFFSET_MASK) | \
+     (((Length) << XDP_CPU_REDIRECT_QUIC_CID_LENGTH_SHIFT) & XDP_CPU_REDIRECT_QUIC_CID_LENGTH_MASK))
 
 typedef struct _XDP_REDIRECT_PARAMS {
     XDP_REDIRECT_TARGET_TYPE TargetType;

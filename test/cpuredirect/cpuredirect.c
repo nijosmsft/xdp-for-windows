@@ -17,6 +17,7 @@
 
 CONST CHAR *UsageText =
 "cpuredirect.exe <IfIndex> <Port> <CpuBase> <CpuCount> [RingDepth] [DrainBatch]\n"
+"                [QuicCidOffset] [QuicCidLength]\n"
 "\n"
 "Creates an XDP program that redirects UDP traffic to CPUs for load distribution.\n"
 "Uses zero-copy mode: original miniport NBLs are indicated directly to TCP/IP\n"
@@ -44,6 +45,15 @@ CONST CHAR *UsageText =
 "   DrainBatch (optional, default 256)\n"
 "       Max NBLs drained per DPC iteration. Range: 1-256.\n"
 "\n"
+"   QuicCidOffset (optional, default 0)\n"
+"       Byte offset within QUIC Dest CID to start hashing.\n"
+"       Only used when QuicCidLength > 0.\n"
+"\n"
+"   QuicCidLength (optional, default 0 = disabled)\n"
+"       Number of QUIC Dest CID bytes to hash. When > 0, enables\n"
+"       QUIC CID hashing instead of 5-tuple for QUIC packets.\n"
+"       Non-QUIC UDP packets fall back to 5-tuple hashing.\n"
+"\n"
 "EXAMPLES:\n"
 "\n"
 "   cpuredirect.exe 6 9999 40 20\n"
@@ -54,6 +64,12 @@ CONST CHAR *UsageText =
 "\n"
 "   cpuredirect.exe 6 0 0 16\n"
 "       Redirect ALL traffic across CPUs 0-15\n"
+"\n"
+"   cpuredirect.exe 6 0 0 80 0 0 0 2\n"
+"       QUIC CID hash: offset=0, length=2 (MsQuic no load balancing)\n"
+"\n"
+"   cpuredirect.exe 6 0 0 80 0 0 5 2\n"
+"       QUIC CID hash: offset=5, length=2 (MsQuic with load balancing)\n"
 "\n"
 "Press Ctrl+C to stop and detach the XDP program.\n"
 ;
@@ -78,10 +94,12 @@ ParseArgs(
     UINT32 *CpuBase,
     UINT32 *CpuCount,
     UINT32 *RingDepth,
-    UINT32 *DrainBatch
+    UINT32 *DrainBatch,
+    UINT8 *QuicCidOffset,
+    UINT8 *QuicCidLength
     )
 {
-    if (ArgC < 5 || ArgC > 7) {
+    if (ArgC < 5 || ArgC > 9) {
         return FALSE;
     }
 
@@ -91,6 +109,8 @@ ParseArgs(
     *CpuCount = (UINT32)atoi(ArgV[4]);
     *RingDepth = (ArgC >= 6) ? (UINT32)atoi(ArgV[5]) : 0;
     *DrainBatch = (ArgC >= 7) ? (UINT32)atoi(ArgV[6]) : 0;
+    *QuicCidOffset = (ArgC >= 8) ? (UINT8)atoi(ArgV[7]) : 0;
+    *QuicCidLength = (ArgC >= 9) ? (UINT8)atoi(ArgV[8]) : 0;
 
     //
     // Basic validation.
@@ -113,6 +133,14 @@ ParseArgs(
     if (*DrainBatch > 256) {
         LOGERR("DrainBatch must be 0 (default) or in range 1-256");
         return FALSE;
+    }
+
+    if (*QuicCidLength > 0) {
+        if (*QuicCidOffset >= XDP_QUIC_MAX_CID_LENGTH ||
+            *QuicCidOffset + *QuicCidLength > XDP_QUIC_MAX_CID_LENGTH) {
+            LOGERR("QUIC CID offset+length must be <= %u", XDP_QUIC_MAX_CID_LENGTH);
+            return FALSE;
+        }
     }
 
     return TRUE;
@@ -148,6 +176,8 @@ main(
     UINT32 CpuCount;
     UINT32 RingDepth;
     UINT32 DrainBatch;
+    UINT8 QuicCidOffset;
+    UINT8 QuicCidLength;
     XDP_STATUS XdpStatus;
     HANDLE Program = NULL;
     XDP_RULE Rule;
@@ -162,7 +192,8 @@ main(
     //
     // Parse command line arguments.
     //
-    if (!ParseArgs(ArgC, ArgV, &IfIndex, &Port, &CpuBase, &CpuCount, &RingDepth, &DrainBatch)) {
+    if (!ParseArgs(ArgC, ArgV, &IfIndex, &Port, &CpuBase, &CpuCount,
+                   &RingDepth, &DrainBatch, &QuicCidOffset, &QuicCidLength)) {
         printf(UsageText);
         return 1;
     }
@@ -181,6 +212,11 @@ main(
             CpuBase, CpuBase + CpuCount - 1, CpuCount);
     LOGINFO("Ring Depth:  %u (0=default 32768)", RingDepth);
     LOGINFO("Drain Batch: %u (0=default 256)", DrainBatch);
+    if (QuicCidLength > 0) {
+        LOGINFO("QUIC CID Hash: offset=%u, length=%u", QuicCidOffset, QuicCidLength);
+    } else {
+        LOGINFO("QUIC CID Hash: disabled (5-tuple hash)");
+    }
     LOGINFO("");
 
     //
@@ -201,7 +237,12 @@ main(
     Rule.Redirect.CpuRedirect.TargetCpuCount = CpuCount;
     Rule.Redirect.CpuRedirect.RingDepth = RingDepth;
     Rule.Redirect.CpuRedirect.DrainBatchSize = DrainBatch;
-    Rule.Redirect.CpuRedirect.Flags = 0;
+    if (QuicCidLength > 0) {
+        Rule.Redirect.CpuRedirect.Flags =
+            XDP_CPU_REDIRECT_MAKE_QUIC_FLAGS(QuicCidOffset, QuicCidLength);
+    } else {
+        Rule.Redirect.CpuRedirect.Flags = 0;
+    }
 
     //
     // Use generic mode and apply to all queues.

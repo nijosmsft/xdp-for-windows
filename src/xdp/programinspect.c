@@ -16,6 +16,8 @@
 #define ICMP6_ECHOREPLY_CODE 0
 #define TCP_HDR_LEN_TO_BYTES(x) (((UINT64)(x)) * 4)
 
+#define XDP_CPUMAP_SMALL_PACKET_BYPASS
+
 //
 // Data path routines.
 //
@@ -708,6 +710,9 @@ XdpParseQuicHeaderPayload(
         if (DataLength < RTL_SIZEOF_THROUGH_FIELD(QUIC_HEADER_INVARIANT, LONG_HDR)) {
             return FALSE;
         }
+        if (QuicHdr->LONG_HDR.DestCidLength > XDP_QUIC_MAX_CID_LENGTH) {
+            return FALSE;
+        }
         if (DataLength <
                 RTL_SIZEOF_THROUGH_FIELD(QUIC_HEADER_INVARIANT, LONG_HDR) +
                 QuicHdr->LONG_HDR.DestCidLength + sizeof(UCHAR)) {
@@ -726,6 +731,14 @@ XdpParseQuicHeaderPayload(
             QuicHdr->LONG_HDR.DestCid +
             QuicHdr->LONG_HDR.DestCidLength +
             sizeof(UCHAR);
+
+        //
+        // Capture Dest CID for QUIC CID hashing (CPU redirect).
+        //
+        FrameCache->QuicDestCidLength = QuicHdr->LONG_HDR.DestCidLength;
+        FrameCache->QuicDestCid = QuicHdr->LONG_HDR.DestCid;
+        FrameCache->QuicDestCidValid = TRUE;
+
         FrameCache->QuicValid = TRUE;
         FrameCache->QuicIsLongHeader = TRUE;
         return TRUE;
@@ -736,6 +749,14 @@ XdpParseQuicHeaderPayload(
             DataLength - RTL_SIZEOF_THROUGH_FIELD(QUIC_HEADER_INVARIANT, SHORT_HDR),
             XDP_QUIC_MAX_CID_LENGTH);
     FrameCache->QuicCid = QuicHdr->SHORT_HDR.DestCid;
+
+    //
+    // Short header: the only CID is the Dest CID.
+    //
+    FrameCache->QuicDestCidLength = FrameCache->QuicCidLength;
+    FrameCache->QuicDestCid = FrameCache->QuicCid;
+    FrameCache->QuicDestCidValid = TRUE;
+
     FrameCache->QuicValid = TRUE;
     FrameCache->QuicIsLongHeader = FALSE;
     return FrameCache->QuicCidLength == XDP_QUIC_MAX_CID_LENGTH;
@@ -995,6 +1016,66 @@ XdpL2Fwd(
     STAT_INC(RxQueueStats, InspectFramesForwarded);
 
     return XDP_RX_ACTION_TX;
+}
+
+static
+UINT32
+XdpComputeQuicCidHash(
+    _In_reads_(CidLength) const UINT8 *Cid,
+    _In_ UINT8 CidOffset,
+    _In_ UINT8 CidHashLength,
+    _In_ UINT8 CidLength
+    )
+{
+    const UINT8 *Data;
+    UINT32 Len;
+    UINT32 Hash = 0;
+    const UINT32 C1 = 0xcc9e2d51;
+    const UINT32 C2 = 0x1b873593;
+
+    //
+    // If CID is too short for the requested range, return 0 so caller
+    // falls back to 5-tuple hashing.
+    //
+    if (CidOffset + CidHashLength > CidLength) {
+        return 0;
+    }
+
+    Data = Cid + CidOffset;
+    Len = CidHashLength;
+
+    //
+    // Murmur3-32 body: process 4-byte chunks.
+    //
+    while (Len >= 4) {
+        UINT32 K;
+        RtlCopyMemory(&K, Data, sizeof(K));
+        K *= C1;
+        K = (K << 15) | (K >> 17);
+        K *= C2;
+        Hash ^= K;
+        Hash = (Hash << 13) | (Hash >> 19);
+        Hash = Hash * 5 + 0xe6546b64;
+        Data += 4;
+        Len -= 4;
+    }
+
+    //
+    // Handle tail bytes (1-3).
+    //
+    if (Len > 0) {
+        UINT32 K = 0;
+        RtlCopyMemory(&K, Data, Len);
+        K *= C1;
+        K = (K << 15) | (K >> 17);
+        K *= C2;
+        Hash ^= K;
+    }
+
+    //
+    // Note: caller applies the Murmur3 finalizer (shared with 5-tuple path).
+    //
+    return Hash;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1397,14 +1478,18 @@ XdpInspect(
                 if (Rule->Redirect.TargetType == XDP_REDIRECT_TARGET_TYPE_CPU) {
                     UINT32 CpuBase = Rule->Redirect.CpuRedirect.TargetCpuBase;
                     UINT32 CpuCount = Rule->Redirect.CpuRedirect.TargetCpuCount;
-                    UINT32 TargetCpu;
+                    UINT32 TargetCpu = UINT32_MAX;
 
                     //
                     // Hash-based mode: compute hash from frame headers for
                     // flow affinity (same 5-tuple always maps to same CPU).
+                    // When QUIC CID hashing is enabled and the packet is QUIC,
+                    // hash the Dest CID instead for per-connection distribution.
                     //
                     {
                     UINT32 Hash = 0;
+                    UINT32 RedirectFlags = Rule->Redirect.CpuRedirect.Flags;
+                    BOOLEAN UsedQuicCid = FALSE;
 
                     //
                     // Ensure frame is parsed for hash computation.
@@ -1415,6 +1500,89 @@ XdpInspect(
                             VirtualAddressExtension, &FrameCache, &Program->FrameStorage);
                     }
 
+                    //
+                    // QUIC CID hashing: when the flag is set and the packet is
+                    // UDP, try to hash the Dest CID instead of the 5-tuple.
+                    // This distributes QUIC connections that share a 5-tuple
+                    // across different CPUs based on their connection IDs.
+                    //
+                    if ((RedirectFlags & XDP_CPU_REDIRECT_FLAG_HASH_QUIC_CID) &&
+                        FrameCache.UdpValid) {
+                        if (!FrameCache.QuicCached) {
+                            if (FrameCache.TransportPayloadValid) {
+                                XdpParseQuicHeader(
+                                    Frame, FragmentRing, FragmentExtension,
+                                    FragmentIndex, VirtualAddressExtension,
+                                    &FrameCache.TransportPayload,
+                                    &Program->FrameStorage, &FrameCache);
+                            }
+                        }
+
+                        if (FrameCache.QuicDestCidValid) {
+#ifdef XDP_CPUMAP_SMALL_PACKET_BYPASS
+                            //
+                            // Skip CPUMAP redirect for small packets (likely
+                            // QUIC ACKs). ACKs are latency-sensitive for
+                            // congestion control and don't benefit from CPU
+                            // spreading. Let them process on the RSS CPU
+                            // directly to avoid DPC redirect overhead.
+                            //
+                            UINT16 UdpLen = RtlUshortByteSwap(FrameCache.UdpHdr->uh_ulen);
+                            if (UdpLen < 100) {
+                                Action = XDP_RX_ACTION_PASS;
+                                STAT_INC(RxQueueStats, InspectFramesPassed);
+                                goto Done;
+                            }
+#endif
+
+                            UINT8 CidOffset =
+                                (UINT8)XDP_CPU_REDIRECT_QUIC_CID_OFFSET(RedirectFlags);
+                            UINT8 CidHashLength =
+                                (UINT8)XDP_CPU_REDIRECT_QUIC_CID_LENGTH(RedirectFlags);
+
+                            //
+                            // Direct partition index extraction: read the raw
+                            // PartitionID bytes from the CID and compute the
+                            // target CPU using the same mask+modulo that MsQuic
+                            // uses internally. This avoids hash scrambling that
+                            // would map to a different CPU than the one encoded
+                            // in the CID, preventing unnecessary connection
+                            // migrations.
+                            //
+                            if (CidOffset + CidHashLength <= FrameCache.QuicDestCidLength &&
+                                CidHashLength <= 2) {
+                                UINT16 PartitionId = 0;
+                                RtlCopyMemory(&PartitionId,
+                                    FrameCache.QuicDestCid + CidOffset,
+                                    CidHashLength);
+
+                                //
+                                // Compute partition mask (same algorithm as
+                                // MsQuicCalculatePartitionMask): round CpuCount
+                                // up to next power-of-2 minus 1.
+                                //
+                                UINT16 Mask = (UINT16)CpuCount;
+                                Mask |= Mask >> 1;
+                                Mask |= Mask >> 2;
+                                Mask |= Mask >> 4;
+                                Mask |= Mask >> 8;
+
+                                TargetCpu = ((PartitionId & Mask) % CpuCount) + CpuBase;
+                                UsedQuicCid = TRUE;
+                            }
+
+                            if (!UsedQuicCid) {
+                                Hash = XdpComputeQuicCidHash(
+                                    FrameCache.QuicDestCid, CidOffset,
+                                    CidHashLength, FrameCache.QuicDestCidLength);
+                                if (Hash != 0) {
+                                    UsedQuicCid = TRUE;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!UsedQuicCid) {
                     //
                     // Compute improved hash from IP addresses and ports.
                     // Uses symmetric hash to ensure bidirectional flows
@@ -1486,21 +1654,24 @@ XdpInspect(
                         //
                         Hash = Hash * 0x9E3779B9 + PortHash;
                     }
+                    } // !UsedQuicCid
 
-                    //
-                    // Finalize hash: spread entropy across all bits so that
-                    // the subsequent modulo distributes evenly, especially
-                    // for non-power-of-2 CPU counts.  Uses murmur3 32-bit
-                    // finalizer constants.
-                    //
-                    Hash ^= Hash >> 16;
-                    Hash *= 0x85ebca6b;
-                    Hash ^= Hash >> 13;
-                    Hash *= 0xc2b2ae35;
-                    Hash ^= Hash >> 16;
+                    if (TargetCpu == UINT32_MAX) {
+                        //
+                        // Finalize hash: spread entropy across all bits so that
+                        // the subsequent modulo distributes evenly, especially
+                        // for non-power-of-2 CPU counts.  Uses murmur3 32-bit
+                        // finalizer constants.
+                        //
+                        Hash ^= Hash >> 16;
+                        Hash *= 0x85ebca6b;
+                        Hash ^= Hash >> 13;
+                        Hash *= 0xc2b2ae35;
+                        Hash ^= Hash >> 16;
 
-                    TargetCpu = (Hash % CpuCount) + CpuBase;
+                        TargetCpu = (Hash % CpuCount) + CpuBase;
                     }
+                    } // end hash computation scope (opened at line 1487)
 
                     //
                     // Store target CPU in frame extension.
@@ -1758,9 +1929,43 @@ XdpProgramValidateRule(
                     goto Exit;
                 }
 
-                if (UserRule->Redirect.CpuRedirect.Flags != 0) {
-                    Status = STATUS_INVALID_PARAMETER;
-                    goto Exit;
+                {
+                    UINT32 CpuFlags = UserRule->Redirect.CpuRedirect.Flags;
+
+                    //
+                    // Reject reserved bits (bits 24-31).
+                    //
+                    if (CpuFlags & XDP_CPU_REDIRECT_RESERVED_MASK) {
+                        Status = STATUS_INVALID_PARAMETER;
+                        goto Exit;
+                    }
+
+                    //
+                    // Reject unknown flag combinations (only bit 0 + offset/length fields defined).
+                    //
+                    if (CpuFlags & ~(XDP_CPU_REDIRECT_FLAG_HASH_QUIC_CID |
+                                     XDP_CPU_REDIRECT_QUIC_CID_OFFSET_MASK |
+                                     XDP_CPU_REDIRECT_QUIC_CID_LENGTH_MASK)) {
+                        Status = STATUS_INVALID_PARAMETER;
+                        goto Exit;
+                    }
+
+                    //
+                    // Validate QUIC CID hash parameters when the flag is set.
+                    //
+                    if (CpuFlags & XDP_CPU_REDIRECT_FLAG_HASH_QUIC_CID) {
+                        UINT8 CidOffset =
+                            (UINT8)XDP_CPU_REDIRECT_QUIC_CID_OFFSET(CpuFlags);
+                        UINT8 CidHashLength =
+                            (UINT8)XDP_CPU_REDIRECT_QUIC_CID_LENGTH(CpuFlags);
+
+                        if (CidHashLength == 0 ||
+                            CidOffset >= XDP_QUIC_MAX_CID_LENGTH ||
+                            CidOffset + CidHashLength > XDP_QUIC_MAX_CID_LENGTH) {
+                            Status = STATUS_INVALID_PARAMETER;
+                            goto Exit;
+                        }
+                    }
                 }
 
                 //
