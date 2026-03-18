@@ -2,7 +2,7 @@
 
 > **Branch:** `user/nijos/xdp-cpumap-azc`
 > **Base:** `main`
-> **Status:** This document supersedes `cpumap-implementation.md` (which describes an earlier iteration with clone-pool and PREALLOC paths that have since been removed).
+> **Status:** Primary design document for XDP CPUMAP.
 
 ---
 
@@ -38,29 +38,27 @@
 
 When a network packet arrives at a NIC (Network Interface Card), the hardware must decide which CPU core should process it. Modern NICs use a feature called **RSS (Receive Side Scaling)** to distribute packets across multiple CPU cores. RSS works by hashing packet headers (IP addresses, ports) and mapping each hash to one of several **RSS queues**, where each queue is pinned to a specific CPU core.
 
-The problem: **most NICs only have 8-16 RSS queues**, but a modern server may have 40-80+ CPU cores. On Windows, each RSS queue is permanently bound to one CPU core, so only 8-16 cores ever process incoming packets, even if you have 80 cores available.
+When the number of active RSS queues is less than the number of available CPU cores, incoming packet processing is limited to a subset of CPUs. The remaining cores sit idle even under heavy load.
 
 ```
-                    Server with 80 CPU cores
+                    Server with N CPU cores
     ┌──────────────────────────────────────────────────┐
-    │  CPU 0  CPU 1  ...  CPU 7  CPU 8  ...  CPU 79   │
+    │  CPU 0  CPU 1  ...  CPU K  CPU K+1 ...  CPU N   │
     │    ▲      ▲           ▲      x           x      │
     │    │      │           │    idle         idle     │
     └────┼──────┼───────────┼──────────────────────────┘
          │      │           │
     ┌────┴──────┴───────────┴──┐
-    │   NIC with 8 RSS queues  │
-    │   Q0  Q1  Q2 ... Q7     │
+    │   NIC with K RSS queues  │
+    │   Q0  Q1  Q2 ... QK     │
     └──────────────────────────┘
                 ▲
           Network traffic
 ```
 
-**Result:** On Windows, throughput is capped at ~80K packets/sec per RSS queue. With 8 queues, you hit a ceiling around ~650K packets/sec, even though your server's remaining 72 cores sit idle.
+CPUMAP enables **software packet redistribution**: it intercepts packets after they arrive on RSS CPUs and steers them to additional CPUs, spreading the processing load across more cores. This increases aggregate throughput and reduces per-CPU saturation.
 
-Linux overcomes this limitation through a combination of kernel mechanisms. The `SO_REUSEPORT` socket option allows an application to create a pool of sockets all bound to the same port; the kernel then distributes incoming packets among those sockets using a flow hash, effectively fanning out processing beyond the initial RSS distribution. Additionally, Linux's **RPS (Receive Packet Steering)** and **RFS (Receive Flow Steering)** can further redistribute packets in software from the 8 RSS cores to all available cores. Together, these mechanisms let Linux utilize ~28 cores (and achieve ~2.4M RPS) even with only 8 hardware RSS queues.
-
-Windows has no equivalent mechanism. **CPUMAP fills this gap.**
+Linux provides similar functionality through `SO_REUSEPORT` (kernel distributes sockets across CPUs), **RPS** (Receive Packet Steering), and **RFS** (Receive Flow Steering). Windows has no built-in equivalent. **CPUMAP fills this gap.**
 
 ---
 
@@ -140,7 +138,7 @@ CPUMAP spans two kernel-mode drivers that cooperate via a well-defined boundary:
   +------------------------------------------------------------------+
   |                        USER MODE                                  |
   |                                                                   |
-  |   cpuredirect.exe                                                 |
+  |   cpuredirect.exe (test tool)                                     |
   |     XdpCreateProgram(                                             |
   |       IfIndex, XDP_MATCH_UDP_DST,                                 |
   |       XDP_REDIRECT_TARGET_TYPE_CPU,                               |
@@ -351,11 +349,12 @@ Specifies the CPU redirect configuration:
 
 | Field | Description | Default |
 |---|---|---|
-| `TargetCpuBase` | First CPU index in the target range (e.g., 56) | Required |
+| `TargetCpuBase` | First CPU index in the target range (e.g., 40) | Required |
 | `TargetCpuCount` | Number of CPUs to distribute across (e.g., 24) | Required |
 | `RingDepth` | Per-CPU ring buffer capacity (must be power of 2) | 32,768 |
 | `DrainBatchSize` | Max packets drained per DPC firing | 256 |
-| `Flags` | Reserved, must be 0 | 0 |
+| `Flags` | See `XDP_CPU_REDIRECT_FLAG_*`. When `XDP_CPU_REDIRECT_FLAG_HASH_QUIC_CID` is set, uses QUIC Destination Connection ID for CPU selection instead of 5-tuple hash. Bits 8-15 encode CID byte offset, bits 16-23 encode CID byte length. | 0 |
+| `IgnoreCpuBitmap` | 64-byte bitmap (512 CPUs). CPUs with their bit set are skipped as redirect targets. Used to exclude HT siblings of RSS CPUs. | All zeros (no CPUs ignored) |
 
 The existing `XDP_REDIRECT_PARAMS` struct was extended with a union to hold either an XSK handle or CPU redirect parameters, selected by the `TargetType` discriminator.
 
@@ -366,13 +365,15 @@ The inspection engine runs in `xdp.sys` at `DISPATCH_LEVEL` on the RSS CPU. For 
 **Rule validation (control plane, at program creation time):**
 - Verifies `CpuBase + CpuCount` does not exceed the system's active processor count
 - Verifies `CpuCount > 0`
-- Verifies `Flags == 0`
+- Validates QUIC CID flags if set (offset + length within CID bounds)
 - Stores the validated parameters in the compiled program rule
 
 **Per-packet classification (data plane, at packet arrival time):**
 - Parses the packet headers (Ethernet -> IP -> UDP/TCP)
 - Checks whether the packet matches the rule (e.g., UDP destination port)
-- If matched: computes a flow hash from the 5-tuple and selects a target CPU
+- If matched and QUIC CID hashing is enabled: extracts the MsQuic partition index from the QUIC Destination Connection ID using the system CPU count as the partition mask (matching MsQuic's internal `PartitionMask` computation). If the extracted partition falls within the CPUMAP range, steers directly to that CPU; otherwise remaps via modulo.
+- If QUIC CID hashing is not enabled or the packet is not QUIC: computes a symmetric 5-tuple hash with murmur3 finalizer and selects a target CPU via modulo.
+- Skips any target CPU that has its bit set in `IgnoreCpuBitmap`, advancing to the next CPU in the range.
 - Writes the result into the frame's CPU_REDIRECT extension
 - Returns `XDP_RX_ACTION_CPU_REDIRECT`
 
@@ -742,11 +743,24 @@ These enable computing average lock wait time in microseconds and identifying cr
 
 ## 12. Test Tool: cpuredirect.exe
 
-A command-line tool is provided for testing CPUMAP without writing custom code:
+A command-line test tool is provided for validating CPUMAP behavior. It is not intended for production use — production callers should use the `XdpCreateProgram` API directly.
 
 ```
 cpuredirect.exe <IfIndex> <Port> <CpuBase> <CpuCount> [RingDepth] [DrainBatch]
+                [QuicCidOffset] [QuicCidLength] [IgnoreCpus]
 ```
+
+| Argument | Description |
+|----------|-------------|
+| `IfIndex` | Network interface index |
+| `Port` | UDP destination port to match (0 = match all traffic) |
+| `CpuBase` | First CPU index in the target range |
+| `CpuCount` | Number of CPUs to distribute across |
+| `RingDepth` | Per-CPU ring capacity, power of 2 (0 = default 32768) |
+| `DrainBatch` | Max NBLs drained per DPC (0 = default 256) |
+| `QuicCidOffset` | Byte offset in QUIC Dest CID to start reading (0 = default) |
+| `QuicCidLength` | Number of CID bytes to use for CPU selection (0 = disabled, use 5-tuple hash) |
+| `IgnoreCpus` | Comma-separated CPU numbers to skip (e.g., `65,67,69,71,73,75,77,79`) |
 
 **Examples:**
 
@@ -757,8 +771,11 @@ cpuredirect.exe 6 9999 40 20
 # Redirect ALL traffic across CPUs 0-15
 cpuredirect.exe 6 0 0 16
 
-# Custom ring depth and drain batch
-cpuredirect.exe 6 9999 56 24 16384 128
+# QUIC CID hashing: offset=0, length=2 (MsQuic partition ID at CID start)
+cpuredirect.exe 6 4433 40 40 0 0 0 2
+
+# QUIC CID hashing with HT sibling exclusion
+cpuredirect.exe 6 4433 40 40 0 0 0 2 65,67,69,71,73,75,77,79
 ```
 
 The tool creates an XDP program with `XDP_CREATE_PROGRAM_FLAG_GENERIC | XDP_CREATE_PROGRAM_FLAG_ALL_QUEUES`, waits for Ctrl+C, then closes the program handle. The kernel-side teardown dumps statistics and frees all resources.
@@ -772,7 +789,7 @@ When `Port = 0`, the tool uses `XDP_MATCH_ALL` to redirect all traffic (not just
 | File | Change Type | Description |
 |---|---|---|
 | `published/external/xdp/datapath.h` | Modified | Added `XDP_RX_ACTION_CPU_REDIRECT` enum value |
-| `published/external/xdp/program.h` | Modified | Added `XDP_REDIRECT_TARGET_TYPE_CPU`, `XDP_CPU_REDIRECT_PARAMS`, extended `XDP_REDIRECT_PARAMS` union |
+| `published/external/xdp/program.h` | Modified | Added `XDP_REDIRECT_TARGET_TYPE_CPU`, `XDP_CPU_REDIRECT_PARAMS` (with `IgnoreCpuBitmap` and QUIC CID flags), extended `XDP_REDIRECT_PARAMS` union |
 | `published/private/xdpcpumap.h` | **New** | Frame extension definition, CPUMAP lifecycle and batch APIs |
 | `src/xdp/cpumap.h` | **New** | Internal ring/map structures, drain DPC prototype, constants |
 | `src/xdp/cpumap.c` | **New** | Core CPUMAP implementation (~970 lines): Create, Destroy, FlushBatch, DrainDpc |
@@ -795,15 +812,11 @@ When `Port = 0`, the tool uses `XDP_MATCH_ALL` to redirect all traffic (not just
 
 1. **Single rule per interface.** Only one CPU redirect rule can be active per network interface. Multiple rules with different port matches targeting different CPU ranges are not yet supported.
 
-2. **No eBPF integration.** The current implementation uses XDP's built-in rule matching engine (e.g., `XDP_MATCH_UDP_DST`). A future version could allow eBPF programs to make per-packet CPU selection decisions for more flexible classification logic.
+2. **No eBPF integration.** The current implementation uses XDP's built-in rule matching engine (e.g., `XDP_MATCH_UDP_DST`). The plan is to expose CPUMAP as a `BPF_MAP_TYPE_CPUMAP` so eBPF programs can call `bpf_redirect_map()` with custom CPU selection logic. The ring buffer and DPC drain infrastructure is designed to serve as the backing implementation for that eBPF map type.
 
-3. **No RSS queue awareness.** The hash-based CPU selection doesn't consider which RSS queue the packet arrived on. A future optimization could avoid redirecting packets that are already on a target CPU.
+3. **PASSIVE_LEVEL lazy init.** `XdpCpuMapCreate` requires `PASSIVE_LEVEL` for pool allocation, but the first matching packet may trigger it at `DISPATCH_LEVEL`. A more robust solution would use a work item for deferred creation.
 
-4. **PASSIVE_LEVEL lazy init.** `XdpCpuMapCreate` requires `PASSIVE_LEVEL` for pool allocation, but the first matching packet may trigger it at `DISPATCH_LEVEL`. A more robust solution would use a work item for deferred creation.
-
-5. **Fixed hash algorithm.** The symmetric 5-tuple hash with murmur3 finalizer works well for most workloads but cannot be customized. Future work could allow configurable hash keys or Toeplitz hashing to match RSS behavior.
-
-6. **Spinlock on ring (future: lock-free SPSC rings).** Each ring is shared among multiple source CPUs under a spinlock. Under high fan-out (8 source CPUs x 24 targets), each ring may see up to 8 producers contending. Replacing MPSC rings with per-(source, target) SPSC rings would eliminate this contention.
+4. **Spinlock on ring.** Each ring is shared among multiple source CPUs under a spinlock. Under high fan-out (8 source CPUs x 24 targets), each ring may see up to 8 producers contending. Replacing MPSC rings with per-(source, target) SPSC rings would eliminate this contention.
 
 **Performance tuning guidance:**
 
