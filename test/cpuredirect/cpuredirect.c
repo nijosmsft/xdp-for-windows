@@ -17,7 +17,7 @@
 
 CONST CHAR *UsageText =
 "cpuredirect.exe <IfIndex> <Port> <CpuBase> <CpuCount> [RingDepth] [DrainBatch]\n"
-"                [QuicCidOffset] [QuicCidLength]\n"
+"                [QuicCidOffset] [QuicCidLength] [IgnoreCpus]\n"
 "\n"
 "Creates an XDP program that redirects UDP traffic to CPUs for load distribution.\n"
 "Uses zero-copy mode: original miniport NBLs are indicated directly to TCP/IP\n"
@@ -53,6 +53,10 @@ CONST CHAR *UsageText =
 "       Number of QUIC Dest CID bytes to hash. When > 0, enables\n"
 "       QUIC CID hashing instead of 5-tuple for QUIC packets.\n"
 "       Non-QUIC UDP packets fall back to 5-tuple hashing.\n"
+"\n"
+"   IgnoreCpus (optional)\n"
+"       Comma-separated CPU numbers to skip in target range.\n"
+"       E.g., '64,66,68,70,72,74,76,78' to skip RSS CPUs.\n"
 "\n"
 "EXAMPLES:\n"
 "\n"
@@ -96,10 +100,12 @@ ParseArgs(
     UINT32 *RingDepth,
     UINT32 *DrainBatch,
     UINT8 *QuicCidOffset,
-    UINT8 *QuicCidLength
+    UINT8 *QuicCidLength,
+    UINT8 *IgnoreCpuBitmap,
+    UINT32 *IgnoreCpuCount
     )
 {
-    if (ArgC < 5 || ArgC > 9) {
+    if (ArgC < 5 || ArgC > 10) {
         return FALSE;
     }
 
@@ -111,6 +117,20 @@ ParseArgs(
     *DrainBatch = (ArgC >= 7) ? (UINT32)atoi(ArgV[6]) : 0;
     *QuicCidOffset = (ArgC >= 8) ? (UINT8)atoi(ArgV[7]) : 0;
     *QuicCidLength = (ArgC >= 9) ? (UINT8)atoi(ArgV[8]) : 0;
+    *IgnoreCpuCount = 0;
+    ZeroMemory(IgnoreCpuBitmap, 64);
+    if (ArgC >= 10 && ArgV[9][0] != '0') {
+        CHAR *p = ArgV[9];
+        while (*p) {
+            UINT32 cpu = (UINT32)atoi(p);
+            if (cpu < 512) {
+                IgnoreCpuBitmap[cpu / 8] |= (UINT8)(1 << (cpu % 8));
+                (*IgnoreCpuCount)++;
+            }
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
 
     //
     // Basic validation.
@@ -178,6 +198,8 @@ main(
     UINT32 DrainBatch;
     UINT8 QuicCidOffset;
     UINT8 QuicCidLength;
+    UINT8 IgnoreCpuBitmap[64];
+    UINT32 IgnoreCpuCount;
     XDP_STATUS XdpStatus;
     HANDLE Program = NULL;
     XDP_RULE Rule;
@@ -193,7 +215,8 @@ main(
     // Parse command line arguments.
     //
     if (!ParseArgs(ArgC, ArgV, &IfIndex, &Port, &CpuBase, &CpuCount,
-                   &RingDepth, &DrainBatch, &QuicCidOffset, &QuicCidLength)) {
+                   &RingDepth, &DrainBatch, &QuicCidOffset, &QuicCidLength,
+                   IgnoreCpuBitmap, &IgnoreCpuCount)) {
         printf(UsageText);
         return 1;
     }
@@ -216,6 +239,9 @@ main(
         LOGINFO("QUIC CID Hash: offset=%u, length=%u", QuicCidOffset, QuicCidLength);
     } else {
         LOGINFO("QUIC CID Hash: disabled (5-tuple hash)");
+    }
+    if (IgnoreCpuCount > 0) {
+        LOGINFO("Ignore CPUs:   %u CPUs excluded from target range", IgnoreCpuCount);
     }
     LOGINFO("");
 
@@ -243,6 +269,7 @@ main(
     } else {
         Rule.Redirect.CpuRedirect.Flags = 0;
     }
+    memcpy(Rule.Redirect.CpuRedirect.IgnoreCpuBitmap, IgnoreCpuBitmap, sizeof(IgnoreCpuBitmap));
 
     //
     // Use generic mode and apply to all queues.

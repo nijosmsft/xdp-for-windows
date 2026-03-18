@@ -48,6 +48,17 @@
             </Stacks>
         </SystemProvider>
 
+        <!-- Lightweight: CPU sampling + DPC/ISR timing, NO stacks. Tiny traces (~5-20 MB for 3s). -->
+        <SystemProvider Id="SystemProviderCpuLight">
+            <Keywords>
+                <Keyword Value="ProcessThread"/>
+                <Keyword Value="Loader"/>
+                <Keyword Value="SampledProfile"/>
+                <Keyword Value="DPC"/>
+                <Keyword Value="Interrupt"/>
+            </Keywords>
+        </SystemProvider>
+
         <SystemProvider Id="SystemProviderHardwareSampled">
             <Keywords>
                 <Keyword Value="ProcessThread" />
@@ -207,6 +218,14 @@
             <Collectors>
                 <SystemCollectorId Value="SystemCollector">
                     <SystemProviderId Value="SystemProviderCpu"/>
+                </SystemCollectorId>
+            </Collectors>
+        </Profile>
+
+        <Profile Id="CpuLight.Verbose.File" Name="CpuLight" Description="CPU utilization only (no stacks, minimal size)" LoggingMode="File" DetailLevel="Verbose">
+            <Collectors>
+                <SystemCollectorId Value="SystemCollector">
+                    <SystemProviderId Value="SystemProviderCpuLight"/>
                 </SystemCollectorId>
             </Collectors>
         </Profile>

@@ -141,7 +141,7 @@ XdpCpuMapCreate(
         Ring->OwnerMap = Map;
 
         //
-        // Initialize DPC with target CPU affinity
+        // Initialize DPC with target CPU affinity.
         //
         KeInitializeDpc(&Map->PerCpuDpcs[i], XdpCpuMapDrainDpc, Ring);
 
@@ -739,7 +739,6 @@ Routine Description:
 }
 
 _Function_class_(KDEFERRED_ROUTINE)
-_IRQL_requires_(DISPATCH_LEVEL)
 _IRQL_requires_same_
 VOID
 XdpCpuMapDrainDpc(
@@ -751,7 +750,6 @@ XdpCpuMapDrainDpc(
 {
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
-
     XDP_CPUMAP_RING *Ring = (XDP_CPUMAP_RING *)Context;
     NET_BUFFER_LIST *BatchHead = NULL;
     NET_BUFFER_LIST *BatchTail = NULL;

@@ -112,6 +112,7 @@ typedef struct _XDP_CPU_REDIRECT_PARAMS {
     UINT32 RingDepth;       // 0 = use default (XDP_CPUMAP_RING_DEFAULT_CAPACITY)
     UINT32 DrainBatchSize;  // 0 = use default (256)
     UINT32 Flags;           // See XDP_CPU_REDIRECT_FLAG_* below
+    UINT8  IgnoreCpuBitmap[64]; // Bitmap: CPUs to skip (supports up to 512 CPUs)
 } XDP_CPU_REDIRECT_PARAMS;
 
 //

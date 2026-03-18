@@ -16,7 +16,7 @@
 #define ICMP6_ECHOREPLY_CODE 0
 #define TCP_HDR_LEN_TO_BYTES(x) (((UINT64)(x)) * 4)
 
-#define XDP_CPUMAP_SMALL_PACKET_BYPASS
+// #define XDP_CPUMAP_SMALL_PACKET_BYPASS
 
 //
 // Data path routines.
@@ -1542,12 +1542,11 @@ XdpInspect(
 
                             //
                             // Direct partition index extraction: read the raw
-                            // PartitionID bytes from the CID and compute the
-                            // target CPU using the same mask+modulo that MsQuic
-                            // uses internally. This avoids hash scrambling that
-                            // would map to a different CPU than the one encoded
-                            // in the CID, preventing unnecessary connection
-                            // migrations.
+                            // PartitionID bytes from the CID and extract the
+                            // partition index using the system CPU count (same
+                            // mask+modulo that MsQuic uses internally). If the
+                            // partition falls in our CPUMAP range, steer there
+                            // directly to avoid connection migration.
                             //
                             if (CidOffset + CidHashLength <= FrameCache.QuicDestCidLength &&
                                 CidHashLength <= 2) {
@@ -1557,17 +1556,27 @@ XdpInspect(
                                     CidHashLength);
 
                                 //
-                                // Compute partition mask (same algorithm as
-                                // MsQuicCalculatePartitionMask): round CpuCount
-                                // up to next power-of-2 minus 1.
+                                // Use system CPU count for mask (same as MsQuic
+                                // PartitionMask). MsQuic sets PartitionCount =
+                                // min(CpuCount, QUIC_MAX_PARTITION_COUNT).
                                 //
-                                UINT16 Mask = (UINT16)CpuCount;
+                                UINT16 SystemCpuCount =
+                                    (UINT16)KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+                                UINT16 Mask = SystemCpuCount;
                                 Mask |= Mask >> 1;
                                 Mask |= Mask >> 2;
                                 Mask |= Mask >> 4;
                                 Mask |= Mask >> 8;
 
-                                TargetCpu = ((PartitionId & Mask) % CpuCount) + CpuBase;
+                                UINT16 PartitionIndex =
+                                    (PartitionId & Mask) % SystemCpuCount;
+
+                                if (PartitionIndex >= CpuBase &&
+                                    PartitionIndex < CpuBase + CpuCount) {
+                                    TargetCpu = PartitionIndex;
+                                } else {
+                                    TargetCpu = CpuBase + (PartitionIndex % CpuCount);
+                                }
                                 UsedQuicCid = TRUE;
                             }
 
@@ -1672,6 +1681,20 @@ XdpInspect(
                         TargetCpu = (Hash % CpuCount) + CpuBase;
                     }
                     } // end hash computation scope (opened at line 1487)
+
+                    //
+                    // Skip ignored CPUs: advance to next CPU in range.
+                    //
+                    {
+                    const UINT8 *IgnoreBitmap = Rule->Redirect.CpuRedirect.IgnoreCpuBitmap;
+                    UINT32 Attempts = CpuCount;
+                    while (Attempts > 0 &&
+                           TargetCpu < 512 &&
+                           (IgnoreBitmap[TargetCpu / 8] & (1 << (TargetCpu % 8)))) {
+                        TargetCpu = CpuBase + ((TargetCpu - CpuBase + 1) % CpuCount);
+                        --Attempts;
+                    }
+                    }
 
                     //
                     // Store target CPU in frame extension.
