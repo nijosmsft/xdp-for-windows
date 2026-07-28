@@ -36,6 +36,22 @@ static const ebpf_helper_function_prototype_t EbpfXdpHelperFunctionPrototype[] =
     },
 };
 
+// XDP global (virtual) helper function prototype descriptors. These override
+// eBPF's global virtual helpers with XDP-specific implementations.
+static const ebpf_helper_function_prototype_t EbpfXdpGlobalHelperFunctionPrototype[] = {
+    {
+        .header = EBPF_HELPER_FUNCTION_PROTOTYPE_HEADER,
+        .helper_id = BPF_FUNC_redirect_map,
+        .name = "bpf_redirect_map",
+        .return_type = EBPF_RETURN_TYPE_INTEGER,
+        .arguments = {
+            EBPF_ARGUMENT_TYPE_PTR_TO_MAP,
+            EBPF_ARGUMENT_TYPE_ANYTHING,
+            EBPF_ARGUMENT_TYPE_ANYTHING,
+        },
+    },
+};
+
 static const ebpf_program_type_descriptor_t EbpfXdpProgramTypeDescriptor = {
     .header = EBPF_PROGRAM_TYPE_DESCRIPTOR_HEADER,
     .name = "xdp",
@@ -49,6 +65,8 @@ const ebpf_program_info_t EbpfXdpProgramInfo = {
     .program_type_descriptor = &EbpfXdpProgramTypeDescriptor,
     .count_of_program_type_specific_helpers = RTL_NUMBER_OF(EbpfXdpHelperFunctionPrototype),
     .program_type_specific_helper_prototype = EbpfXdpHelperFunctionPrototype,
+    .count_of_global_helpers = RTL_NUMBER_OF(EbpfXdpGlobalHelperFunctionPrototype),
+    .global_helper_prototype = EbpfXdpGlobalHelperFunctionPrototype,
 };
 
 #define DECLARE_XDP_SECTION(_section_name) \
