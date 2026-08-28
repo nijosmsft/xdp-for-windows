@@ -1969,6 +1969,11 @@ XdpProgramStart(
         if (!NT_SUCCESS(Status)) {
             goto Exit;
         }
+
+        Status = XdpCpuMapProviderStart();
+        if (!NT_SUCCESS(Status)) {
+            goto Exit;
+        }
     }
 
     Status = STATUS_SUCCESS;
@@ -1987,6 +1992,7 @@ XdpProgramStop(
 {
     TraceEnter(TRACE_CORE, "-");
 
+    XdpCpuMapProviderStop();
     XdpXskmapStop();
 
     if (EbpfXdpProgramHookProvider != NULL) {

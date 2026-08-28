@@ -1,0 +1,18 @@
+//
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+//
+
+//
+// WPP is not available in the user-mode harness, so the generated trace header
+// is replaced with no-ops. src/xdp/cpumap.c uses only these macros.
+//
+
+#pragma once
+
+#define TraceEnter(...)
+#define TraceExitStatus(...)
+#define TraceExitSuccess(...)
+#define TraceError(...)
+#define TraceInfo(...)
+#define TraceVerbose(...)

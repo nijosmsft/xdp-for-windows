@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Control-plane tests for the CPUMAP engine.
+
+    src/xdp/cpumap.c is compiled UNMODIFIED into a user-mode executable, with the
+    kernel primitives it uses replaced by behavioural stubs. This follows
+    test/pktfuzz, which compiles src/xdp/programinspect.c the same way: $(ProjectDir)
+    precedes $(SolutionDir)src\xdp on the include path, so this project's precomp.h
+    shadows the driver's.
+
+    Because the source under test carries no test-only conditional compilation,
+    the harness cannot drift from the shipping code.
+  -->
+  <ItemGroup>
+    <ClCompile Include="$(SolutionDir)src\xdp\cpumap.c" />
+    <ClCompile Include="cpumaptest.c" />
+    <ClCompile Include="stubs/workqueue.c" />
+  </ItemGroup>
+  <PropertyGroup>
+    <ProjectGuid>{6d2ad3a4-6b1f-4a7a-9b62-2f6ff8f9a4c1}</ProjectGuid>
+    <TargetName>cpumaptest</TargetName>
+    <UndockedType>exe</UndockedType>
+    <ImportWnt>true</ImportWnt>
+    <EnableAsan>true</EnableAsan>
+    <CopyAsanBinariesToOutDir>true</CopyAsanBinariesToOutDir>
+  </PropertyGroup>
+  <Import Project="$(SolutionDir)src\xdp.cpp.props" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>
+        $(ProjectDir);
+        $(ProjectDir)\stubs;
+        $(SolutionDir)published\external;
+        $(SolutionDir)published\private;
+        $(SolutionDir)src\rtl\inc;
+        $(SolutionDir)src\xdp;
+        %(AdditionalIncludeDirectories);
+      </AdditionalIncludeDirectories>
+      <!--
+        cpumap.c includes "cpumap.tmh". WPP does not run for this project, so
+        stubs/cpumap.tmh supplies no-op trace macros.
+      -->
+      <ForcedIncludeFiles>%(ForcedIncludeFiles)</ForcedIncludeFiles>
+      <!--
+        C4324: XDP_CPUMAP_RING is DECLSPEC_CACHEALIGN on purpose, so the padding
+        it reports is the intended layout. This is a difference in the harness's
+        warning configuration, not a finding against the driver, which builds
+        this same file clean at /W4 /WX with code analysis as errors.
+      -->
+      <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <!-- ASAN prefers linking dynamically. -->
+    <ClCompile Condition="'$(Configuration)'=='Debug'">
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+    <ClCompile Condition="'$(Configuration)'=='Release'">
+      <RuntimeLibrary>MultiThreadedDll</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>onecore.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <Import Project="$(SolutionDir)src\xdp.targets" />
+</Project>
