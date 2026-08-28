@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="bind.c" />
@@ -15,6 +15,8 @@
     <ClCompile Include="rx.c" />
     <ClCompile Include="tx.c" />
     <ClCompile Include="xsk.c" />
+    <ClCompile Include="cpumap.c" />
+    <ClCompile Include="ebpfcpumap.c" />
     <ClCompile Include="ebpfxskmap.c" />
     <ClCompile Include="map.c" />
     <ClCompile Include="xskmap.c" />
@@ -149,6 +151,21 @@
         %(AdditionalDependencies)
       </AdditionalDependencies>
     </Link>
+  </ItemDefinitionGroup>
+  <!--
+    BPF_MAP_TYPE_CPUMAP is an enumerator of ebpf_map_type_t, so no #ifndef in C
+    can detect whether the eBPF package declares it. The package version is the
+    only thing the build can test, so this guard is keyed to the exact legacy
+    version that lacks the type and stops applying automatically the moment
+    XdpEbpfVersion in src/xdp.props advances. See src/xdp/ebpfmap.h.
+  -->
+  <ItemDefinitionGroup Condition="'$(XdpEbpfVersion)' == '1.4.0'">
+    <ClCompile>
+      <PreprocessorDefinitions>
+        XDP_EBPF_LEGACY_NO_CPUMAP_TYPE=1;
+        %(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <Inf Include="xdp.inx">

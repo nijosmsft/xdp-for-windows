@@ -49,6 +49,7 @@
 #include <xdp/buffermdl.h>
 #include <xdp/buffervirtualaddress.h>
 #include <xdp/control.h>
+#include <xdp/cpumap.h>
 #include <xdp/datapath.h>
 #include <xdp/ebpfhook.h>
 #include <xdp/framechecksum.h>
@@ -65,6 +66,7 @@
 #include <xdpapi.h>
 #include <xdpapi_experimental.h>
 #include <xdpassert.h>
+#include <xdpcpumap.h>
 #include <xdpetw.h>
 #include <xdpif.h>
 #include <xdplwf.h>
@@ -98,6 +100,8 @@
 #include "tx.h"
 #include "xsk.h"
 #include "ebpfmap.h"
+#include "cpumap.h"
+#include "ebpfcpumap.h"
 #include "ebpfxskmap.h"
 #include "map.h"
 #include "xskmap.h"
