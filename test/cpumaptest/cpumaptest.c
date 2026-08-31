@@ -31,6 +31,9 @@
 //                                success and the failure path
 //   QuiesceEmpty                 quiesce over live maps must terminate, touch no
 //                                entry, and leave targets usable
+//   HelperTargetRundown          helper-time target rundown acquire/release must
+//                                be balanced on success and take no reference on
+//                                acquire failure
 //
 // Every case asserts the live allocation count returns to its starting value, so
 // any unwind path that forgets a free fails here rather than in a driver.
@@ -44,8 +47,22 @@ static const CHAR *XdpCpuMapTestCurrent = "<none>";
 
 LONG XdpCpuMapTestLiveAllocations;
 LONG XdpCpuMapTestFailAllocationsAfter = -1;
+ULONG XdpCpuMapTestCurrentProcessorIndex;
 BOOLEAN XdpCpuMapTestFailDpcTargeting;
 DRIVER_OBJECT *XdpDriverObject;
+
+typedef struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) _XDPCPUMAP_TEST_EPOCH_ALLOCATION {
+    struct _XDPCPUMAP_TEST_EPOCH_ALLOCATION *Next;
+    SIZE_T Size;
+    ULONG Magic;
+} XDPCPUMAP_TEST_EPOCH_ALLOCATION;
+
+#define XDPCPUMAP_TEST_EPOCH_ALLOCATION_MAGIC 'eCdX'
+
+C_ASSERT(sizeof(XDPCPUMAP_TEST_EPOCH_ALLOCATION) % MEMORY_ALLOCATION_ALIGNMENT == 0);
+
+static XDPCPUMAP_TEST_EPOCH_ALLOCATION *XdpCpuMapTestDeferredEpochFrees;
+static LONG XdpCpuMapTestDeferredEpochFreeCount;
 
 VOID
 XdpCpuMapTestAssert(
@@ -68,8 +85,12 @@ XdpCpuMapTestResetAllocator(
     VOID
     )
 {
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestDeferredEpochFrees == NULL);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestDeferredEpochFreeCount == 0);
+
     XdpCpuMapTestLiveAllocations = 0;
     XdpCpuMapTestFailAllocationsAfter = -1;
+    XdpCpuMapTestCurrentProcessorIndex = 0;
     XdpCpuMapTestFailDpcTargeting = FALSE;
 }
 
@@ -157,12 +178,23 @@ XdpCpuMapTestEpochAllocate(
     uint32_t Tag
     )
 {
+    XDPCPUMAP_TEST_EPOCH_ALLOCATION *Allocation;
+
     UNREFERENCED_PARAMETER(Tag);
 
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestEpochDepth > 0);
     XdpCpuMapTestEpochOperations++;
 
-    return XdpCpuMapTestAllocate(Size);
+    Allocation = XdpCpuMapTestAllocate(sizeof(*Allocation) + Size);
+    if (Allocation == NULL) {
+        return NULL;
+    }
+
+    Allocation->Next = NULL;
+    Allocation->Size = Size;
+    Allocation->Magic = XDPCPUMAP_TEST_EPOCH_ALLOCATION_MAGIC;
+
+    return Allocation + 1;
 }
 
 static
@@ -171,10 +203,41 @@ XdpCpuMapTestEpochFree(
     void *Memory
     )
 {
+    XDPCPUMAP_TEST_EPOCH_ALLOCATION *Allocation;
+
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestEpochDepth > 0);
     XdpCpuMapTestEpochOperations++;
 
-    XdpCpuMapTestFree(Memory);
+    if (Memory == NULL) {
+        return;
+    }
+
+    Allocation = ((XDPCPUMAP_TEST_EPOCH_ALLOCATION *)Memory) - 1;
+    XDPCPUMAP_TEST_ASSERT(Allocation->Magic == XDPCPUMAP_TEST_EPOCH_ALLOCATION_MAGIC);
+    Allocation->Next = XdpCpuMapTestDeferredEpochFrees;
+    XdpCpuMapTestDeferredEpochFrees = Allocation;
+    XdpCpuMapTestDeferredEpochFreeCount++;
+}
+
+static
+VOID
+XdpCpuMapTestDrainEpochFrees(
+    VOID
+    )
+{
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestEpochDepth == 0);
+
+    while (XdpCpuMapTestDeferredEpochFrees != NULL) {
+        XDPCPUMAP_TEST_EPOCH_ALLOCATION *Allocation = XdpCpuMapTestDeferredEpochFrees;
+
+        XdpCpuMapTestDeferredEpochFrees = Allocation->Next;
+        XDPCPUMAP_TEST_ASSERT(Allocation->Magic == XDPCPUMAP_TEST_EPOCH_ALLOCATION_MAGIC);
+        Allocation->Magic = 0;
+        XdpCpuMapTestDeferredEpochFreeCount--;
+        XdpCpuMapTestFree(Allocation);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestDeferredEpochFreeCount == 0);
 }
 
 ebpf_base_map_client_dispatch_table_t XdpCpuMapTestClientDispatch = {
@@ -187,6 +250,49 @@ ebpf_base_map_client_dispatch_table_t XdpCpuMapTestClientDispatch = {
     XdpCpuMapTestEpochFree,
     NULL,                           // epoch_free_cache_aligned
 };
+
+static const VOID *XdpCpuMapTestFindMap;
+static const VOID *XdpCpuMapTestFindKey;
+static XDP_CPUMAP_PROVIDER_VALUE *XdpCpuMapTestFindValue;
+static ebpf_result_t XdpCpuMapTestFindResult;
+static UINT32 XdpCpuMapTestFindCallCount;
+
+static
+ebpf_result_t
+XdpCpuMapTestFindElement(
+    _In_ const VOID *Map,
+    _In_ const VOID *Key,
+    _Outptr_result_maybenull_ uint8_t **Value
+    )
+{
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestEpochDepth > 0);
+
+    XdpCpuMapTestFindCallCount++;
+    XdpCpuMapTestFindMap = Map;
+    XdpCpuMapTestFindKey = Key;
+
+    if (XdpCpuMapTestFindResult != EBPF_SUCCESS) {
+        *Value = NULL;
+        return XdpCpuMapTestFindResult;
+    }
+
+    *Value = (uint8_t *)XdpCpuMapTestFindValue;
+    return EBPF_SUCCESS;
+}
+
+static
+VOID
+XdpCpuMapTestResetFindElement(
+    VOID
+    )
+{
+    XdpCpuMapTestFindMap = NULL;
+    XdpCpuMapTestFindKey = NULL;
+    XdpCpuMapTestFindValue = NULL;
+    XdpCpuMapTestFindResult = EBPF_SUCCESS;
+    XdpCpuMapTestFindCallCount = 0;
+    XdpCpuMapTestClientDispatch.find_element_function = XdpCpuMapTestFindElement;
+}
 
 VOID
 XdpCpuMapTestEnterCallbackEpoch(
@@ -301,6 +407,87 @@ XdpCpuMapTestReleaseAtTeardown(
     )
 {
     XdpCpuMapQueueValueRelease(CpuMap, Value);
+}
+
+static
+ebpf_result_t
+XdpCpuMapTestFindElementInEpoch(
+    _In_ const VOID *Map,
+    _In_ XDP_CPUMAP *CpuMap,
+    _In_ const VOID *Key,
+    _Outptr_result_maybenull_ XDP_CPUMAP_PROVIDER_VALUE **Value
+    )
+{
+    epoch_state_t EpochState;
+    ebpf_result_t Result;
+
+    XdpCpuMapTestEnterCallbackEpoch(&EpochState);
+    Result = XdpCpuMapFindElementFromBaseMap(Map, CpuMap, Key, Value);
+    XdpCpuMapTestExitCallbackEpoch(&EpochState);
+
+    return Result;
+}
+
+static
+intptr_t
+XdpCpuMapTestRedirectInEpoch(
+    _In_ const VOID *Map,
+    _In_ UINT64 Key,
+    _In_ intptr_t FallbackAction,
+    _In_ BOOLEAN IsProgTestRun,
+    _In_ XDP_INTERFACE_MODE InterfaceMode,
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _Inout_ XDP_CPUMAP_REDIRECT_CONTEXT *Redirect
+    )
+{
+    epoch_state_t EpochState;
+    intptr_t Result;
+
+    XdpCpuMapTestEnterCallbackEpoch(&EpochState);
+    Result =
+        XdpCpuMapRedirectMap(
+            Map, Key, FallbackAction, IsProgTestRun, InterfaceMode, CpuMap, Redirect);
+    XdpCpuMapTestExitCallbackEpoch(&EpochState);
+
+    return Result;
+}
+
+static
+XDP_CPUMAP_HELPER_STATS
+XdpCpuMapTestQueryHelperStats(
+    _In_ const XDP_CPUMAP *CpuMap
+    )
+{
+    XDP_CPUMAP_HELPER_STATS Stats;
+
+    XdpCpuMapQueryHelperStats(CpuMap, &Stats);
+    return Stats;
+}
+
+static
+SIZE_T
+XdpCpuMapTestGlobalNonPagedBytes(
+    VOID
+    )
+{
+    SIZE_T NonPagedBytes;
+
+    XdpCpuMapQueryGlobalStats(NULL, &NonPagedBytes);
+    return NonPagedBytes;
+}
+
+static
+SIZE_T
+XdpCpuMapTestTargetChargeBytes(
+    _In_ UINT32 RingDepth
+    )
+{
+    SIZE_T RingBytes =
+        sizeof(XDP_CPUMAP_RING) + ((SIZE_T)RingDepth * sizeof(XDP_CPUMAP_ENTRY));
+
+    return
+        (RingBytes + sizeof(KDPC) + MEMORY_ALLOCATION_ALIGNMENT - 1) &
+        ~((SIZE_T)MEMORY_ALLOCATION_ALIGNMENT - 1);
 }
 
 //
@@ -463,8 +650,10 @@ XdpCpuMapTestZeroSettingsInherit(
     XdpCpuMapTestDestroyMap(CpuMap);
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -579,8 +768,10 @@ XdpCpuMapTestInvalidCpuIndex(
     XdpCpuMapTestDestroyMap(CpuMap);
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -620,11 +811,16 @@ XdpCpuMapTestDpcTargetingFailure(
     XDPCPUMAP_TEST_ASSERT(Value.Target == NULL);
 
     //
-    // Nothing published, nothing charged, nothing leaked.
+    // Nothing published and the charged ring/DPC bytes were released. The
+    // target shell was allocated before DPC targeting failed, but it is
+    // epoch-freed and therefore remains queued until the explicit epoch drain.
     //
     XDPCPUMAP_TEST_ASSERT(CpuMap->TargetCount == 0);
     XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedRingEntries == 0);
-    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == CpuMap->HelperStatsBytes);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestDeferredEpochFreeCount == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == AfterCreate + 1);
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == AfterCreate);
 
     //
@@ -645,8 +841,10 @@ XdpCpuMapTestDpcTargetingFailure(
     XdpCpuMapTestDestroyMap(CpuMap);
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -738,7 +936,10 @@ XdpCpuMapTestSharedTargetAccounting(
     XDPCPUMAP_TEST_ASSERT(CpuMap->RetireWorkCount == 0);
     XDPCPUMAP_TEST_ASSERT(CpuMap->TargetCount == 0);
     XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedRingEntries == 0);
-    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == CpuMap->HelperStatsBytes);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestDeferredEpochFreeCount == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == AfterCreate + 1);
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == AfterCreate);
 
     //
@@ -753,8 +954,10 @@ XdpCpuMapTestSharedTargetAccounting(
     XdpCpuMapTestDestroyMap(CpuMap);
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -820,8 +1023,10 @@ XdpCpuMapTestSweepRearm(
     XdpCpuMapTestDestroyMap(CpuMap);
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -895,8 +1100,10 @@ XdpCpuMapTestCoalescedSweep(
     XdpCpuMapTestDestroyMap(CpuMapB);
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -917,24 +1124,38 @@ XdpCpuMapTestAllocationFailure(
     NTSTATUS Status;
     LONG Baseline;
     LONG AfterCreate;
+    SIZE_T GlobalBaseline;
+    SIZE_T GlobalAfterCreate;
 
     XDPCPUMAP_TEST_BEGIN("AllocationFailure");
 
     XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
     Baseline = XdpCpuMapTestLiveAllocations;
+    GlobalBaseline = XdpCpuMapTestGlobalNonPagedBytes();
 
     //
-    // Map creation itself must fail cleanly.
+    // Fail each allocation in map creation: the map shell, the target table,
+    // and the charged helper-stats shards. The third case is the one that
+    // proves a failed stats allocation releases its reservation; a leaked charge
+    // would leave GlobalNonPagedBytes above the starting value.
     //
-    XdpCpuMapTestFailAllocationsAfter = 0;
-    Status = XdpCpuMapTestCreateMap(16, &CpuMap);
-    XDPCPUMAP_TEST_ASSERT(!NT_SUCCESS(Status));
+    for (LONG Allow = 0; Allow < 3; Allow++) {
+        CpuMap = (XDP_CPUMAP *)(ULONG_PTR)MAXULONG_PTR;
+        XdpCpuMapTestFailAllocationsAfter = Allow;
+        Status = XdpCpuMapTestCreateMap(16, &CpuMap);
+        XDPCPUMAP_TEST_ASSERT(!NT_SUCCESS(Status));
+        XDPCPUMAP_TEST_ASSERT(CpuMap == NULL);
+        XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestGlobalNonPagedBytes() == GlobalBaseline);
+    }
 
     XdpCpuMapTestFailAllocationsAfter = -1;
     Status = XdpCpuMapTestCreateMap(16, &CpuMap);
     XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(Status));
     AfterCreate = XdpCpuMapTestLiveAllocations;
+    GlobalAfterCreate = XdpCpuMapTestGlobalNonPagedBytes();
+    XDPCPUMAP_TEST_ASSERT(GlobalAfterCreate == GlobalBaseline + CpuMap->HelperStatsBytes);
 
     //
     // Fail each of the three target allocations in turn: ring, DPC, shell. Every
@@ -952,8 +1173,9 @@ XdpCpuMapTestAllocationFailure(
         XDPCPUMAP_TEST_ASSERT(Value.Target == NULL);
         XDPCPUMAP_TEST_ASSERT(CpuMap->TargetCount == 0);
         XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedRingEntries == 0);
-        XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == 0);
+        XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == CpuMap->HelperStatsBytes);
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == AfterCreate);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestGlobalNonPagedBytes() == GlobalAfterCreate);
     }
 
     XdpCpuMapTestFailAllocationsAfter = -1;
@@ -967,8 +1189,10 @@ XdpCpuMapTestAllocationFailure(
     XdpCpuMapTestDestroyMap(CpuMap);
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -987,6 +1211,8 @@ XdpCpuMapTestCapAccounting(
     XDP_CPUMAP_PROVIDER_VALUE Values[4];
     XDP_CPUMAP_ENTRY_V1 Entry;
     UINT32 ExpectedEntries;
+    SIZE_T ExpectedTargetBytes;
+    SIZE_T ExpectedCharge;
     LONG Baseline;
 
     XDPCPUMAP_TEST_BEGIN("CapAccounting");
@@ -1003,10 +1229,19 @@ XdpCpuMapTestCapAccounting(
             NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Values[Cpu])));
     }
 
+    ExpectedTargetBytes =
+        XdpCpuMapTestTargetChargeBytes(XDP_CPUMAP_RING_DEPTH_MIN);
+    ExpectedCharge =
+        CpuMap->HelperStatsBytes +
+        (RTL_NUMBER_OF(Values) * ExpectedTargetBytes);
     ExpectedEntries = XDP_CPUMAP_RING_DEPTH_MIN * RTL_NUMBER_OF(Values);
     XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedRingEntries == ExpectedEntries);
-    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes > 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == ExpectedCharge);
     XDPCPUMAP_TEST_ASSERT(CpuMap->TargetCount == RTL_NUMBER_OF(Values));
+    for (UINT32 Cpu = 0; Cpu < RTL_NUMBER_OF(Values); Cpu++) {
+        XDPCPUMAP_TEST_ASSERT(
+            Values[Cpu].Target->ChargedNonPagedBytes == ExpectedTargetBytes);
+    }
 
     //
     // Retire half, and the charge must fall by exactly half.
@@ -1016,6 +1251,9 @@ XdpCpuMapTestCapAccounting(
     XdpCpuMapTestDrainSweeps();
 
     XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedRingEntries == ExpectedEntries / 2);
+    XDPCPUMAP_TEST_ASSERT(
+        CpuMap->ChargedNonPagedBytes ==
+        CpuMap->HelperStatsBytes + (ExpectedTargetBytes * 2));
     XDPCPUMAP_TEST_ASSERT(CpuMap->TargetCount == RTL_NUMBER_OF(Values) / 2);
 
     XdpCpuMapTestRelease(CpuMap, &Values[2]);
@@ -1023,7 +1261,7 @@ XdpCpuMapTestCapAccounting(
     XdpCpuMapTestDrainSweeps();
 
     XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedRingEntries == 0);
-    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->ChargedNonPagedBytes == CpuMap->HelperStatsBytes);
     XDPCPUMAP_TEST_ASSERT(CpuMap->RetireWorkCount == 0);
 
     XdpCpuMapTestDestroyMap(CpuMap);
@@ -1033,8 +1271,10 @@ XdpCpuMapTestCapAccounting(
     // Global charges are released too: a second module lifetime must start from
     // a clean slate, which it cannot if the global counters drifted.
     //
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 
     XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
@@ -1048,6 +1288,7 @@ XdpCpuMapTestCapAccounting(
     XdpCpuMapTestDestroyMap(CpuMap);
     XdpCpuMapTestDrainSweeps();
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -1117,8 +1358,10 @@ XdpCpuMapTestQuiesceEmpty(
     //
     XdpCpuMapQuiesceInterface(&Token);
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -1279,8 +1522,10 @@ XdpCpuMapTestQuiesceScanCost(
 
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -1358,8 +1603,453 @@ XdpCpuMapTestTeardownWithoutEpoch(
 
     XdpCpuMapTestDrainSweeps();
 
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
     XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
+}
+
+//
+// Helper target rundown acquire/release symmetry, driven through the production
+// helper body. A successful helper acquire is paired with exactly one release on
+// the non-handoff path used by increment 4. A failed acquire takes nothing, so
+// it has no release. The backing reference is deliberately separate and must
+// remain held until after the target rundown is released, so map destroy cannot
+// observe the data-path reference as gone while the target is still pinned.
+//
+static
+VOID
+XdpCpuMapTestHelperTargetRundown(
+    VOID
+    )
+{
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_REDIRECT_CONTEXT Redirect = {0};
+    XDP_CPUMAP_HELPER_STATS Stats;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    const UCHAR MapObject = 0;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("HelperTargetRundown");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+    XDPCPUMAP_TEST_ASSERT(Value.Target != NULL);
+
+    XdpCpuMapTestResetFindElement();
+    XdpCpuMapTestFindValue = &Value;
+
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestRedirectInEpoch(
+            &MapObject, 0, XDP_TX, FALSE, XDP_INTERFACE_MODE_GENERIC, CpuMap, &Redirect) ==
+        XDP_REDIRECT);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == Value.Target);
+
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 1);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 2);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.Calls == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.Success == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectSlotUnconfigured == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectModeUnsupported == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.HelperTargetInactive == 0);
+
+    XdpCpuMapClearRedirectContext(&Redirect);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    ExWaitForRundownProtectionRelease(&Value.Target->PacketRundown);
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestRedirectInEpoch(
+            &MapObject, 0, XDP_TX, FALSE, XDP_INTERFACE_MODE_GENERIC, CpuMap, &Redirect) ==
+        XDP_TX);
+
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.Calls == 2);
+    XDPCPUMAP_TEST_ASSERT(Stats.Success == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectSlotUnconfigured == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectModeUnsupported == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.HelperTargetInactive == 1);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
+}
+
+//
+// CPUMAP map-context offset publication guard. The first slot of the fake eBPF
+// map deliberately contains a valid-looking XDP header pointer. If the resolver
+// dereferences before publication, this case returns success instead of
+// EBPF_OPERATION_NOT_SUPPORTED. Publishing offset zero then proves zero is not
+// being treated as the unpublished sentinel.
+//
+static
+VOID
+XdpCpuMapTestHelperContextOffsetGuard(
+    VOID
+    )
+{
+    typedef struct _XDPCPUMAP_TEST_FAKE_MAP {
+        XDP_EBPF_MAP_HEADER *Context0;
+        UCHAR Padding[8];
+        XDP_EBPF_MAP_HEADER *Context16;
+    } XDPCPUMAP_TEST_FAKE_MAP;
+
+    XDP_EBPF_MAP_CONTEXT_OFFSET ContextOffset = {0};
+    XDPCPUMAP_TEST_FAKE_MAP FakeMap = {0};
+    XDP_CPUMAP CpuMapContext = {0};
+    XDP_EBPF_MAP_HEADER *Header = &CpuMapContext.Header;
+    XDP_EBPF_MAP_HEADER *ResolvedHeader = NULL;
+    XDP_CPUMAP *ResolvedCpuMap = NULL;
+    XDP_EBPF_MAP_TYPE ResolvedMapType = (XDP_EBPF_MAP_TYPE)0;
+
+    XDPCPUMAP_TEST_BEGIN("HelperContextOffsetGuard");
+
+    CpuMapContext.Header.Type = XdpEbpfMapTypeCpuMap;
+    FakeMap.Context0 = Header;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpEbpfMapContextResolve(&ContextOffset, &FakeMap, &ResolvedHeader) ==
+        EBPF_OPERATION_NOT_SUPPORTED);
+    XDPCPUMAP_TEST_ASSERT(ResolvedHeader == NULL);
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapGetMapFromContextOffset(
+            &ContextOffset, &FakeMap, &ResolvedMapType, &ResolvedCpuMap) ==
+        EBPF_OPERATION_NOT_SUPPORTED);
+    XDPCPUMAP_TEST_ASSERT(ResolvedCpuMap == NULL);
+
+    XdpEbpfMapContextOffsetPublish(&ContextOffset, 0);
+    XDPCPUMAP_TEST_ASSERT(
+        XdpEbpfMapContextResolve(&ContextOffset, &FakeMap, &ResolvedHeader) == EBPF_SUCCESS);
+    XDPCPUMAP_TEST_ASSERT(ResolvedHeader == Header);
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapGetMapFromContextOffset(
+            &ContextOffset, &FakeMap, &ResolvedMapType, &ResolvedCpuMap) == EBPF_SUCCESS);
+    XDPCPUMAP_TEST_ASSERT(ResolvedMapType == XdpEbpfMapTypeCpuMap);
+    XDPCPUMAP_TEST_ASSERT(ResolvedCpuMap == &CpuMapContext);
+
+    ContextOffset = (XDP_EBPF_MAP_CONTEXT_OFFSET){0};
+    FakeMap.Context0 = NULL;
+    FakeMap.Context16 = Header;
+    XdpEbpfMapContextOffsetPublish(
+        &ContextOffset, FIELD_OFFSET(XDPCPUMAP_TEST_FAKE_MAP, Context16));
+    XDPCPUMAP_TEST_ASSERT(
+        XdpEbpfMapContextResolve(&ContextOffset, &FakeMap, &ResolvedHeader) == EBPF_SUCCESS);
+    XDPCPUMAP_TEST_ASSERT(ResolvedHeader == Header);
+
+    FakeMap.Context16 = NULL;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpEbpfMapContextResolve(&ContextOffset, &FakeMap, &ResolvedHeader) ==
+        EBPF_OPERATION_NOT_SUPPORTED);
+    XDPCPUMAP_TEST_ASSERT(ResolvedHeader == NULL);
+}
+
+//
+// CPUMAP helper lookup must go through the base-map find callback. It must not
+// invent a private lookup path, and inactive maps must fail before the base-map
+// callback is reached.
+//
+static
+VOID
+XdpCpuMapTestHelperFindElement(
+    VOID
+    )
+{
+    XDP_CPUMAP CpuMap = {0};
+    XDP_CPUMAP_PROVIDER_VALUE Value = {0};
+    XDP_CPUMAP_PROVIDER_VALUE *FoundValue = NULL;
+    UINT64 Key = 7;
+    const UCHAR MapObject = 0;
+
+    XDPCPUMAP_TEST_BEGIN("HelperFindElement");
+
+    XdpCpuMapTestResetFindElement();
+    XdpCpuMapTestFindValue = &Value;
+    CpuMap.Active = TRUE;
+    CpuMap.ClientDispatch = &XdpCpuMapTestClientDispatch;
+
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestFindElementInEpoch(&MapObject, &CpuMap, &Key, &FoundValue) ==
+        EBPF_SUCCESS);
+    XDPCPUMAP_TEST_ASSERT(FoundValue == &Value);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindCallCount == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindMap == &MapObject);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindKey == &Key);
+
+    XdpCpuMapTestFindResult = EBPF_INVALID_ARGUMENT;
+    FoundValue = &Value;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestFindElementInEpoch(&MapObject, &CpuMap, &Key, &FoundValue) ==
+        EBPF_INVALID_ARGUMENT);
+    XDPCPUMAP_TEST_ASSERT(FoundValue == NULL);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindCallCount == 2);
+
+    CpuMap.Active = FALSE;
+    XdpCpuMapTestFindResult = EBPF_SUCCESS;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestFindElementInEpoch(&MapObject, &CpuMap, &Key, &FoundValue) ==
+        EBPF_INVALID_OBJECT);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindCallCount == 2);
+}
+
+//
+// Failure fallbacks must be produced by XdpCpuMapRedirectMap itself, not by a
+// lower-level primitive plus manual stats bookkeeping. These cases protect the
+// helper's null-provider-value guard and the "failed rundown acquired nothing"
+// path: both return the program's fallback action and take no references.
+//
+static
+VOID
+XdpCpuMapTestHelperFailureFallbacks(
+    VOID
+    )
+{
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_REDIRECT_CONTEXT Redirect = {0};
+    XDP_CPUMAP_HELPER_STATS Stats;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    const UCHAR MapObject = 0;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("HelperFailureFallbacks");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+    XDPCPUMAP_TEST_ASSERT(Value.Target != NULL);
+
+    //
+    // Lookup miss: the base map callback returns no value. The helper must not
+    // dereference it and must not acquire target or backing references.
+    //
+    XdpCpuMapTestResetFindElement();
+    XdpCpuMapTestFindResult = EBPF_INVALID_ARGUMENT;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestRedirectInEpoch(
+            &MapObject, 7, XDP_PASS, FALSE, XDP_INTERFACE_MODE_GENERIC, CpuMap, &Redirect) ==
+        XDP_PASS);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.Calls == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.Success == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectSlotUnconfigured == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectModeUnsupported == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.HelperTargetInactive == 0);
+
+    //
+    // Inactive map: XdpCpuMapFindElementFromBaseMap returns INVALID_OBJECT
+    // before calling the base-map finder. It is a helper fallback reason, not a
+    // target acquire, so it must still take zero references.
+    //
+    CpuMap->Active = FALSE;
+    XdpCpuMapTestFindResult = EBPF_SUCCESS;
+    XdpCpuMapTestFindValue = &Value;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestRedirectInEpoch(
+            &MapObject, 8, XDP_DROP, FALSE, XDP_INTERFACE_MODE_GENERIC, CpuMap, &Redirect) ==
+        XDP_DROP);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindCallCount == 1);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.Calls == 2);
+    XDPCPUMAP_TEST_ASSERT(Stats.Success == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectSlotUnconfigured == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectModeUnsupported == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.HelperTargetInactive == 1);
+
+    CpuMap->Active = TRUE;
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
+}
+
+//
+// A CPUMAP redirect in a non-generic interface mode takes the program fallback
+// action. Since no target is selected in that path, it must not acquire either
+// target rundown or a map backing reference.
+//
+static
+VOID
+XdpCpuMapTestHelperModeFallback(
+    VOID
+    )
+{
+    static const intptr_t FallbackActions[] = { XDP_PASS, XDP_DROP, XDP_TX };
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_REDIRECT_CONTEXT Redirect = {0};
+    XDP_CPUMAP_HELPER_STATS Stats;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    const UCHAR MapObject = 0;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("HelperModeFallback");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    XdpCpuMapTestResetFindElement();
+    XdpCpuMapTestFindValue = &Value;
+
+    for (UINT32 I = 0; I < RTL_NUMBER_OF(FallbackActions); I++) {
+        intptr_t Result;
+
+        XdpCpuMapTestCurrentProcessorIndex = I;
+        Result =
+            XdpCpuMapTestRedirectInEpoch(
+                &MapObject, I, FallbackActions[I], FALSE, XDP_INTERFACE_MODE_NATIVE, CpuMap,
+                &Redirect);
+
+        XDPCPUMAP_TEST_ASSERT(Result == FallbackActions[I]);
+        XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+        XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+        XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+        XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+        XDPCPUMAP_TEST_ASSERT(CpuMap->HelperStats[I].Calls == 1);
+        XDPCPUMAP_TEST_ASSERT(CpuMap->HelperStats[I].RedirectModeUnsupported == 1);
+    }
+
+    XdpCpuMapTestCurrentProcessorIndex = 0;
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindCallCount == 0);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.Calls == RTL_NUMBER_OF(FallbackActions));
+    XDPCPUMAP_TEST_ASSERT(Stats.RedirectModeUnsupported == RTL_NUMBER_OF(FallbackActions));
+    XDPCPUMAP_TEST_ASSERT(Stats.Success == 0);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
+}
+
+//
+// Multiple helper calls in one eBPF invocation replace the prior redirect
+// intent. The replacement path must release the first target rundown and backing
+// reference before storing the second one.
+//
+static
+VOID
+XdpCpuMapTestHelperReplacementRelease(
+    VOID
+    )
+{
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value0;
+    XDP_CPUMAP_PROVIDER_VALUE Value1;
+    XDP_CPUMAP_REDIRECT_CONTEXT Redirect = {0};
+    XDP_CPUMAP_HELPER_STATS Stats;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    const UCHAR MapObject = 0;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("HelperReplacementRelease");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value0)));
+    Entry = XdpCpuMapTestEntry(1, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value1)));
+
+    XdpCpuMapTestResetFindElement();
+    XdpCpuMapTestFindValue = &Value0;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestRedirectInEpoch(
+            &MapObject, 0, XDP_DROP, FALSE, XDP_INTERFACE_MODE_GENERIC, CpuMap, &Redirect) ==
+        XDP_REDIRECT);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == Value0.Target);
+    XDPCPUMAP_TEST_ASSERT(Value0.Target->PacketRundown.Count == 1);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 2);
+
+    XdpCpuMapClearRedirectContext(&Redirect);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Value0.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapTestFindValue = &Value1;
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestRedirectInEpoch(
+            &MapObject, 1, XDP_DROP, FALSE, XDP_INTERFACE_MODE_GENERIC, CpuMap, &Redirect) ==
+        XDP_REDIRECT);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == Value1.Target);
+    XDPCPUMAP_TEST_ASSERT(Value0.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(Value1.Target->PacketRundown.Count == 1);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 2);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindCallCount == 2);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.Calls == 2);
+    XDPCPUMAP_TEST_ASSERT(Stats.Success == 2);
+
+    XdpCpuMapClearRedirectContext(&Redirect);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Value1.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapTestRelease(CpuMap, &Value0);
+    XdpCpuMapTestRelease(CpuMap, &Value1);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
@@ -1384,6 +2074,12 @@ main(
     XdpCpuMapTestQuiesceEmpty();
     XdpCpuMapTestQuiesceScanCost();
     XdpCpuMapTestTeardownWithoutEpoch();
+    XdpCpuMapTestHelperTargetRundown();
+    XdpCpuMapTestHelperContextOffsetGuard();
+    XdpCpuMapTestHelperFindElement();
+    XdpCpuMapTestHelperFailureFallbacks();
+    XdpCpuMapTestHelperModeFallback();
+    XdpCpuMapTestHelperReplacementRelease();
 
     XdpCpuMapTestCurrent = "<summary>";
 
