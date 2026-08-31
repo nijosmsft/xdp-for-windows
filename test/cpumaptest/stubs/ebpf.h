@@ -34,9 +34,25 @@
 //
 typedef uint64_t epoch_state_t[4];
 
+typedef enum _ebpf_result {
+    EBPF_SUCCESS = 0,
+    EBPF_OPERATION_NOT_SUPPORTED = 1,
+    EBPF_INVALID_ARGUMENT = 2,
+    EBPF_NO_MEMORY = 3,
+    EBPF_INVALID_OBJECT = 4,
+} ebpf_result_t;
+
+typedef
+ebpf_result_t
+ebpf_map_find_element_function_t(
+    _In_ const void *map,
+    _In_ const void *key,
+    _Outptr_result_maybenull_ uint8_t **value
+    );
+
 typedef struct _ebpf_base_map_client_dispatch_table {
     void *header;
-    void *find_element_function;
+    ebpf_map_find_element_function_t *find_element_function;
     void (*epoch_enter)(void *epoch_state);
     void (*epoch_exit)(void *epoch_state);
     void *(*epoch_allocate_with_tag)(size_t size, uint32_t tag);

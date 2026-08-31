@@ -27,6 +27,7 @@ typedef struct _EBPF_XDP_MD {
     XDP_INSPECTION_CONTEXT *InspectionContext;
     VOID *RedirectTarget;
     XDP_REDIRECT_TARGET_TYPE RedirectTargetType;
+    XDP_CPUMAP_REDIRECT_CONTEXT CpuMapRedirect;
 } EBPF_XDP_MD;
 
 static __forceinline NTSTATUS EbpfResultToNtStatus(ebpf_result_t Result)
@@ -205,6 +206,12 @@ Exit:
 //
 
 static
+VOID
+EbpfXdpReleaseCpuMapIntent(
+    _Inout_ EBPF_XDP_MD *XdpMd
+    );
+
+static
 XDP_RX_ACTION
 XdpInvokeEbpf(
     _In_ HANDLE EbpfTarget,
@@ -257,6 +264,7 @@ XdpInvokeEbpf(
     XdpMd.InspectionContext = InspectionContext;
     XdpMd.RedirectTarget = NULL;
     XdpMd.ProgTestRunContext = NULL;
+    RtlZeroMemory(&XdpMd.CpuMapRedirect, sizeof(XdpMd.CpuMapRedirect));
 
     ebpf_program_batch_invoke_function_t EbpfInvokeProgram =
         EbpfExtensionClientGetProgramDispatch(Client)->ebpf_program_batch_invoke_function;
@@ -287,6 +295,14 @@ XdpInvokeEbpf(
                 XdpMd.RedirectTargetType, XdpMd.RedirectTarget);
             RxAction = XDP_RX_ACTION_DROP;
             STAT_INC(RxQueueStats, InspectFramesRedirected);
+        } else if (XdpMd.CpuMapRedirect.CpuMapTarget != NULL) {
+            //
+            // Increment 4 resolves and pins the CPUMAP target but deliberately
+            // does not transfer packet ownership or enqueue anything. Later
+            // increments replace this with the private frame-metadata handoff.
+            //
+            RxAction = XDP_RX_ACTION_DROP;
+            STAT_INC(RxQueueStats, InspectFramesDropped);
         } else {
             RxAction = XDP_RX_ACTION_DROP;
             STAT_INC(RxQueueStats, InspectFramesDropped);
@@ -302,6 +318,8 @@ XdpInvokeEbpf(
     }
 
 Exit:
+
+    EbpfXdpReleaseCpuMapIntent(&XdpMd);
 
     return RxAction;
 }
@@ -701,6 +719,25 @@ EbpfXdpAdjustHead(
 }
 
 static
+VOID
+EbpfXdpReleaseCpuMapIntent(
+    _Inout_ EBPF_XDP_MD *XdpMd
+    )
+{
+    XdpCpuMapClearRedirectContext(&XdpMd->CpuMapRedirect);
+}
+
+static
+VOID
+EbpfXdpClearRedirectIntent(
+    _Inout_ EBPF_XDP_MD *XdpMd
+    )
+{
+    EbpfXdpReleaseCpuMapIntent(XdpMd);
+    XdpMd->RedirectTarget = NULL;
+}
+
+static
 intptr_t
 EbpfXdpRedirectMap(
     _In_ const void *Map,
@@ -716,6 +753,10 @@ EbpfXdpRedirectMap(
     EBPF_XDP_MD *XdpMd = CONTAINING_RECORD(ProgramContext, EBPF_XDP_MD, Base);
     BOOLEAN IsProgTestRun = XdpMd->ProgTestRunContext != NULL;
     XDP_RX_QUEUE *RxQueue;
+    XDP_INTERFACE_MODE InterfaceMode;
+    XDP_EBPF_MAP_TYPE MapType;
+    ebpf_result_t MapTypeResult;
+    XDP_CPUMAP *CpuMap = NULL;
     VOID *Value = NULL;
     HANDLE Xsk;
 
@@ -728,18 +769,48 @@ EbpfXdpRedirectMap(
         // prog_test_run callbacks.
         //
         RxQueue = NULL;
+        InterfaceMode = XDP_INTERFACE_MODE_NATIVE;
     } else {
         ASSERT(XdpMd->InspectionContext != NULL);
         RxQueue =
             XdpRxQueueFromRedirectContext(&XdpMd->InspectionContext->RedirectContext);
         ASSERT(RxQueue != NULL);
+        InterfaceMode = XdpMd->InspectionContext->InterfaceMode;
     }
+
+    EbpfXdpClearRedirectIntent(XdpMd);
+    MapTypeResult = XdpCpuMapGetMap(Map, &MapType, &CpuMap);
 
     if (Flags & ~REDIRECT_VALID_FLAGS_MASK) {
         //
         // Unsupported flags are set.
         //
+        if (MapTypeResult == EBPF_SUCCESS &&
+            MapType == XdpEbpfMapTypeCpuMap &&
+            CpuMap != NULL) {
+            XdpCpuMapRecordHelperCall(CpuMap);
+            XdpCpuMapRecordHelperFallback(CpuMap, XdpCpuMapHelperFallbackBadFlags);
+        }
         goto Exit;
+    }
+
+    if (MapTypeResult == EBPF_SUCCESS) {
+        if (MapType == XdpEbpfMapTypeCpuMap) {
+            ASSERT(CpuMap != NULL);
+            if (CpuMap == NULL) {
+                goto Exit;
+            }
+
+            ReturnAction =
+                XdpCpuMapRedirectMap(
+                    Map, Key, FallbackAction, IsProgTestRun || RxQueue == NULL, InterfaceMode,
+                    CpuMap, &XdpMd->CpuMapRedirect);
+            goto Exit;
+        }
+
+        if (MapType != XdpEbpfMapTypeXsk) {
+            goto Exit;
+        }
     }
 
     //

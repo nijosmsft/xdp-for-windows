@@ -27,6 +27,9 @@
 #include <stubs/ebpf.h>
 #include <stubs/xdpworkqueue.h>
 
+#include <xdp/ebpfhook.h>
+#include <xdpifmode.h>
+
 #define XDP_POOLTAG_CPUMAP 'mCdX'
 
 //
@@ -56,8 +59,13 @@ typedef struct _XDP_EBPF_MAP_HEADER {
     XDP_EBPF_MAP_TYPE Type;
 } XDP_EBPF_MAP_HEADER;
 
+#ifndef MAP_CONTEXT
+#define MAP_CONTEXT(Map, Offset) ((UCHAR *)(Map) + (Offset))
+#endif
+
 #include <xdpcpumap.h>
 #include "cpumap.h"
+#include "ebpfcpumap.h"
 
 //
 // Harness-only entry points implemented in cpumaptest.c and the stubs.

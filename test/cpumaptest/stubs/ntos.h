@@ -107,6 +107,7 @@ XdpCpuMapTestAssert(
 
 extern LONG XdpCpuMapTestLiveAllocations;
 extern LONG XdpCpuMapTestFailAllocationsAfter;
+extern ULONG XdpCpuMapTestCurrentProcessorIndex;
 
 VOID
 XdpCpuMapTestResetAllocator(
@@ -149,6 +150,15 @@ XdpCpuMapTestFree(
 #ifndef ALL_PROCESSOR_GROUPS
 #define ALL_PROCESSOR_GROUPS 0xffff
 #endif
+
+FORCEINLINE
+ULONG
+KeGetCurrentProcessorIndex(
+    VOID
+    )
+{
+    return XdpCpuMapTestCurrentProcessorIndex;
+}
 
 FORCEINLINE
 ULONG

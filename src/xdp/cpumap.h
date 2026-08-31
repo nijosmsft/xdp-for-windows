@@ -127,6 +127,22 @@ typedef enum _XDP_CPUMAP_SWEEP_STATE {
     XdpCpuMapSweepRunning = 2,
 } XDP_CPUMAP_SWEEP_STATE;
 
+typedef enum _XDP_CPUMAP_HELPER_FALLBACK_REASON {
+    XdpCpuMapHelperFallbackBadFlags,
+    XdpCpuMapHelperFallbackRedirectSlotUnconfigured,
+    XdpCpuMapHelperFallbackRedirectModeUnsupported,
+    XdpCpuMapHelperFallbackTargetInactive,
+} XDP_CPUMAP_HELPER_FALLBACK_REASON;
+
+typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_HELPER_STATS {
+    volatile ULONG64 Calls;
+    volatile ULONG64 Success;
+    volatile ULONG64 HelperBadFlags;
+    volatile ULONG64 RedirectSlotUnconfigured;
+    volatile ULONG64 RedirectModeUnsupported;
+    volatile ULONG64 HelperTargetInactive;
+} XDP_CPUMAP_HELPER_STATS;
+
 //
 // One per CPUMAP. The eBPF map context; Header must be first so a raw map
 // pointer resolves through MAP_CONTEXT exactly as XSKMAP's does.
@@ -137,6 +153,9 @@ typedef struct _XDP_CPUMAP {
 
     UINT32 CpuMapId;
     UINT32 MaxEntries;
+    XDP_CPUMAP_HELPER_STATS *HelperStats;
+    UINT32 HelperStatsCount;
+    SIZE_T HelperStatsBytes;
 
     EX_PUSH_LOCK ConfigLock;
 
@@ -241,4 +260,51 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 XdpCpuMapReleaseBacking(
     _Inout_ XDP_CPUMAP *CpuMap
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordHelperCall(
+    _Inout_ XDP_CPUMAP *CpuMap
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordHelperSuccess(
+    _Inout_ XDP_CPUMAP *CpuMap
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordHelperFallback(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _In_ XDP_CPUMAP_HELPER_FALLBACK_REASON Reason
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapQueryHelperStats(
+    _In_ const XDP_CPUMAP *CpuMap,
+    _Out_ XDP_CPUMAP_HELPER_STATS *Stats
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+XdpCpuMapQueryGlobalStats(
+    _Out_opt_ UINT32 *RingEntries,
+    _Out_opt_ SIZE_T *NonPagedBytes
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+BOOLEAN
+XdpCpuMapTryAcquireTargetReference(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _Inout_ XDP_CPUMAP_TARGET *Target
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapReleaseTargetReference(
+    _Inout_ XDP_CPUMAP_TARGET *Target
     );

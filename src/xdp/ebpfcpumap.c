@@ -22,8 +22,10 @@
 // state to race. The runtime copies only the public value_size to user mode, so
 // the target pointer is never surfaced.
 //
-// Increment scope: control plane only. There is no bpf_redirect_map dispatch and
-// no find-element fast path here yet; the data path is a later increment.
+// Increment scope: control plane plus helper lookup/reference acquisition only.
+// bpf_redirect_map can resolve a target and take the producer-side rundown
+// reference, but the packet data path is a later increment: nothing is enqueued
+// and no NBL ownership changes here.
 //
 
 #include "precomp.h"
@@ -52,12 +54,14 @@ static EBPF_EXTENSION_PROVIDER *EbpfCpuMapProvider;
 
 //
 // Offset within the eBPF map structure where the provider context is stored.
-// Set during client attach; the data path will use it to resolve a raw map
-// pointer to its XDP_EBPF_MAP_HEADER, exactly as XSKMAP does.
+// Published during client attach; the data path will use it to resolve a raw
+// map pointer to its XDP_EBPF_MAP_HEADER, exactly as XSKMAP does.
 //
-// N.B. The eBPF contract guarantees all maps share the same context offset.
+// The explicit Published flag is separate from the offset value. Offset zero is
+// a valid structure offset in general, so zero must not be overloaded to mean
+// "the CPUMAP map-provider client never attached successfully".
 //
-static ULONG64 XdpCpuMapContextOffset;
+static XDP_EBPF_MAP_CONTEXT_OFFSET XdpCpuMapContextOffset;
 
 static
 XDP_CPUMAP_BINDING_CONTEXT *
@@ -448,7 +452,7 @@ XdpCpuMapOnClientAttach(
         &Binding->ClientDispatch, ClientData->base_client_table,
         min(sizeof(Binding->ClientDispatch), ClientData->base_client_table->header.total_size));
 
-    WriteULong64NoFence(&XdpCpuMapContextOffset, ClientData->map_context_offset);
+    XdpEbpfMapContextOffsetPublish(&XdpCpuMapContextOffset, ClientData->map_context_offset);
 
     EbpfExtensionClientSetProviderData(AttachingClient, Binding);
 
@@ -472,6 +476,22 @@ XdpCpuMapOnClientDetach(
 
     TraceExitSuccess(TRACE_CORE);
     return STATUS_SUCCESS;
+}
+
+ebpf_result_t
+XdpCpuMapGetMap(
+    _In_ const VOID *Map,
+    _Out_ XDP_EBPF_MAP_TYPE *MapType,
+    _Outptr_result_maybenull_ XDP_CPUMAP **CpuMap
+    )
+{
+    //
+    // Resolve the provider context stored at the published map-context offset,
+    // exactly as XSKMAP does after its attach. If the CPUMAP provider client
+    // never attached successfully, do not touch the map object at all; report
+    // the same "no XDP map provider" result as the NULL-context path.
+    //
+    return XdpCpuMapGetMapFromContextOffset(&XdpCpuMapContextOffset, Map, MapType, CpuMap);
 }
 
 NTSTATUS

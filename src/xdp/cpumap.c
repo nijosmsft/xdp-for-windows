@@ -10,12 +10,13 @@
 // This module owns everything about a CPUMAP that is not the eBPF provider
 // surface. The provider callbacks live in ebpfcpumap.c and call in here.
 //
-// Increment scope: this is the CONTROL PLANE ONLY. Rings and DPCs are allocated,
-// charged, targeted, retired and quiesced. Nothing enqueues to a ring yet, so
-// XdpCpuMapDrainDpc is a stub and every ring is empty. The quiesce scan is fully
-// implemented regardless, because its cost is one pointer comparison per ring
-// entry across every live map -- a property of the SCAN, not of occupancy -- and
-// is therefore measurable with empty rings.
+// Increment scope: control plane plus helper target-reference acquire/release.
+// Rings and DPCs are allocated, charged, targeted, retired and quiesced. The
+// helper may pin a target with PacketRundown, but nothing enqueues to a ring
+// yet, so XdpCpuMapDrainDpc is a stub and every production ring is empty. The
+// quiesce scan is fully implemented regardless, because its cost is one pointer
+// comparison per ring entry across every live map -- a property of the SCAN, not
+// of occupancy -- and is therefore measurable with empty rings.
 //
 // Lock ordering (design section 8.3). Two disjoint chains sharing Ring->Lock as
 // a common leaf; they are never both held:
@@ -55,6 +56,17 @@ static EX_PUSH_LOCK XdpCpuMapRegistryLock;
 static XDP_CPUMAP *XdpCpuMapRegistry[XDP_CPUMAP_MAX_LIVE_MAPS];
 static UINT32 XdpCpuMapRegistryCount;
 static UINT32 XdpCpuMapNextId;
+
+static
+SIZE_T
+XdpCpuMapGetPoolChargeSize(
+    _In_ SIZE_T Size
+    )
+{
+    return
+        (Size + MEMORY_ALLOCATION_ALIGNMENT - 1) &
+        ~((SIZE_T)MEMORY_ALLOCATION_ALIGNMENT - 1);
+}
 
 //
 // One retire work queue for every map, owned by this module rather than by any
@@ -103,6 +115,157 @@ typedef struct _XDP_CPUMAP_SWEEP_STATS {
 } XDP_CPUMAP_SWEEP_STATS;
 
 static XDP_CPUMAP_SWEEP_STATS XdpCpuMapSweepStats;
+
+//
+// Helper fallback diagnostics. These per-map counters are fallback reasons:
+// they record why bpf_redirect_map declined to set a CPUMAP redirect intent.
+// They are not enqueue/drop counters, because the packet's outcome is the
+// program-selected fallback action (PASS, DROP, or TX).
+//
+// The helper packet path updates exactly one shard: the current processor's
+// cache-aligned slot. At DISPATCH_LEVEL that shard has one running writer, so
+// these are ordinary writes rather than locked RMWs. Readers aggregate all
+// shards with aligned 64-bit loads; the result is a coherent monotonic total,
+// not a stop-the-world snapshot.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+XDP_CPUMAP_HELPER_STATS *
+XdpCpuMapGetCurrentHelperStats(
+    _Inout_ XDP_CPUMAP *CpuMap
+    )
+{
+    ULONG ProcessorIndex = KeGetCurrentProcessorIndex();
+
+    ASSERT(CpuMap->HelperStats != NULL);
+    ASSERT(CpuMap->HelperStatsCount > 0);
+    ASSERT(ProcessorIndex < CpuMap->HelperStatsCount);
+
+    if (ProcessorIndex >= CpuMap->HelperStatsCount) {
+        ProcessorIndex = 0;
+    }
+
+    return &CpuMap->HelperStats[ProcessorIndex];
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordHelperCall(
+    _Inout_ XDP_CPUMAP *CpuMap
+    )
+{
+    XdpCpuMapGetCurrentHelperStats(CpuMap)->Calls++;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordHelperSuccess(
+    _Inout_ XDP_CPUMAP *CpuMap
+    )
+{
+    XdpCpuMapGetCurrentHelperStats(CpuMap)->Success++;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordHelperFallback(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _In_ XDP_CPUMAP_HELPER_FALLBACK_REASON Reason
+    )
+{
+    XDP_CPUMAP_HELPER_STATS *Stats = XdpCpuMapGetCurrentHelperStats(CpuMap);
+    volatile ULONG64 *Counter = NULL;
+
+    switch (Reason) {
+    case XdpCpuMapHelperFallbackBadFlags:
+        Counter = &Stats->HelperBadFlags;
+        break;
+    case XdpCpuMapHelperFallbackRedirectSlotUnconfigured:
+        Counter = &Stats->RedirectSlotUnconfigured;
+        break;
+    case XdpCpuMapHelperFallbackRedirectModeUnsupported:
+        Counter = &Stats->RedirectModeUnsupported;
+        break;
+    case XdpCpuMapHelperFallbackTargetInactive:
+        Counter = &Stats->HelperTargetInactive;
+        break;
+    default:
+        ASSERT(FALSE);
+        return;
+    }
+
+    (*Counter)++;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapQueryHelperStats(
+    _In_ const XDP_CPUMAP *CpuMap,
+    _Out_ XDP_CPUMAP_HELPER_STATS *Stats
+    )
+{
+    RtlZeroMemory(Stats, sizeof(*Stats));
+
+    for (UINT32 Index = 0; Index < CpuMap->HelperStatsCount; Index++) {
+        const XDP_CPUMAP_HELPER_STATS *Current = &CpuMap->HelperStats[Index];
+
+        Stats->Calls += ReadULong64NoFence(&Current->Calls);
+        Stats->Success += ReadULong64NoFence(&Current->Success);
+        Stats->HelperBadFlags += ReadULong64NoFence(&Current->HelperBadFlags);
+        Stats->RedirectSlotUnconfigured +=
+            ReadULong64NoFence(&Current->RedirectSlotUnconfigured);
+        Stats->RedirectModeUnsupported +=
+            ReadULong64NoFence(&Current->RedirectModeUnsupported);
+        Stats->HelperTargetInactive += ReadULong64NoFence(&Current->HelperTargetInactive);
+    }
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+XdpCpuMapQueryGlobalStats(
+    _Out_opt_ UINT32 *RingEntries,
+    _Out_opt_ SIZE_T *NonPagedBytes
+    )
+{
+    RtlAcquirePushLockShared(&XdpCpuMapGlobalLock);
+    if (RingEntries != NULL) {
+        *RingEntries = XdpCpuMapGlobalRingEntries;
+    }
+    if (NonPagedBytes != NULL) {
+        *NonPagedBytes = XdpCpuMapGlobalNonPagedBytes;
+    }
+    RtlReleasePushLockShared(&XdpCpuMapGlobalLock);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+BOOLEAN
+XdpCpuMapTryAcquireTargetReference(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _Inout_ XDP_CPUMAP_TARGET *Target
+    )
+{
+    //
+    // This function is called only from the eBPF helper path while the eBPF
+    // runtime still holds the program epoch. Target is reached through a base
+    // map value, so the target shell is epoch-safe here. Ring and DPC are not:
+    // the caller may read them only after this acquire succeeds.
+    //
+    if (!CpuMap->Active) {
+        return FALSE;
+    }
+
+    return ExAcquireRundownProtection(&Target->PacketRundown);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapReleaseTargetReference(
+    _Inout_ XDP_CPUMAP_TARGET *Target
+    )
+{
+    ExReleaseRundownProtection(&Target->PacketRundown);
+}
 
 _Function_class_(KDEFERRED_ROUTINE)
 _IRQL_requires_(DISPATCH_LEVEL)
@@ -235,7 +398,8 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 XdpCpuMapReleaseCharges(
     _Inout_ XDP_CPUMAP *CpuMap,
-    _Inout_ XDP_CPUMAP_TARGET *Target
+    _In_ UINT32 RingEntries,
+    _In_ SIZE_T NonPagedBytes
     )
 {
     RtlAcquirePushLockExclusive(&XdpCpuMapGlobalLock);
@@ -244,15 +408,15 @@ XdpCpuMapReleaseCharges(
     //
     // Per-map first, then global: the exact reverse of the charge order.
     //
-    ASSERT(CpuMap->ChargedRingEntries >= Target->ChargedRingEntries);
-    ASSERT(CpuMap->ChargedNonPagedBytes >= Target->ChargedNonPagedBytes);
-    CpuMap->ChargedRingEntries -= Target->ChargedRingEntries;
-    CpuMap->ChargedNonPagedBytes -= Target->ChargedNonPagedBytes;
+    ASSERT(CpuMap->ChargedRingEntries >= RingEntries);
+    ASSERT(CpuMap->ChargedNonPagedBytes >= NonPagedBytes);
+    CpuMap->ChargedRingEntries -= RingEntries;
+    CpuMap->ChargedNonPagedBytes -= NonPagedBytes;
 
-    ASSERT(XdpCpuMapGlobalRingEntries >= Target->ChargedRingEntries);
-    ASSERT(XdpCpuMapGlobalNonPagedBytes >= Target->ChargedNonPagedBytes);
-    XdpCpuMapGlobalRingEntries -= Target->ChargedRingEntries;
-    XdpCpuMapGlobalNonPagedBytes -= Target->ChargedNonPagedBytes;
+    ASSERT(XdpCpuMapGlobalRingEntries >= RingEntries);
+    ASSERT(XdpCpuMapGlobalNonPagedBytes >= NonPagedBytes);
+    XdpCpuMapGlobalRingEntries -= RingEntries;
+    XdpCpuMapGlobalNonPagedBytes -= NonPagedBytes;
 
     ASSERT(CpuMap->OutstandingRetires > 0);
     CpuMap->OutstandingRetires--;
@@ -356,6 +520,8 @@ XdpCpuMapRetireTarget(
     )
 {
     XDP_CPUMAP *CpuMap = Target->OwnerMap;
+    UINT32 ChargedRingEntries = Target->ChargedRingEntries;
+    SIZE_T ChargedNonPagedBytes = Target->ChargedNonPagedBytes;
 
     TraceVerbose(
         TRACE_CORE, "CpuMapId=%u Cpu=%u Retiring target",
@@ -380,8 +546,6 @@ XdpCpuMapRetireTarget(
         Target->Ring = NULL;
     }
 
-    XdpCpuMapReleaseCharges(CpuMap, Target);
-
     //
     // RetireWorkCount is NOT decremented here. It counts released VALUES, not
     // retired TARGETS, and with targets shared across keys the two differ: two
@@ -389,10 +553,14 @@ XdpCpuMapRetireTarget(
     // subtracts exactly what it consumed, which is the only balanced accounting.
     //
 
+    XdpCpuMapReleaseCharges(CpuMap, ChargedRingEntries, ChargedNonPagedBytes);
+
     //
-    // The shell is epoch-freed last, so a caller that reached this target
-    // through a provider value inside its epoch may still touch PacketRundown
-    // and PendingValueReleases safely.
+    // The shell is not part of the nonpaged cap charge above, because
+    // epoch_free only queues it for later reclamation. It is still epoch-freed
+    // last, so a caller that reached this target through a provider value
+    // inside its epoch may still touch PacketRundown and PendingValueReleases
+    // safely.
     //
     // This is the ONE epoch memory operation in CPUMAP that is not already
     // inside a provider dispatch callback: the sweep runs on XDP's own work
@@ -612,7 +780,9 @@ XdpCpuMapCreate(
 {
     XDP_CPUMAP *Map = NULL;
     UINT32 TableSize;
+    SIZE_T HelperStatsBytes = 0;
     NTSTATUS Status;
+    BOOLEAN HelperStatsCharged = FALSE;
 
     *CpuMap = NULL;
 
@@ -625,6 +795,12 @@ XdpCpuMapCreate(
     TableSize = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
     if (TableSize == 0) {
         Status = STATUS_INTERNAL_ERROR;
+        goto Exit;
+    }
+
+    HelperStatsBytes = (SIZE_T)TableSize * sizeof(XDP_CPUMAP_HELPER_STATS);
+    if (HelperStatsBytes > XDP_CPUMAP_MAX_NONPAGED_BYTES) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
         goto Exit;
     }
 
@@ -644,10 +820,32 @@ XdpCpuMapCreate(
         goto Exit;
     }
 
+    RtlAcquirePushLockExclusive(&XdpCpuMapGlobalLock);
+    if (XdpCpuMapGlobalNonPagedBytes >
+            XDP_CPUMAP_GLOBAL_MAX_NONPAGED_BYTES - HelperStatsBytes) {
+        RtlReleasePushLockExclusive(&XdpCpuMapGlobalLock);
+        TraceError(TRACE_CORE, "CPUMAP helper stats global cap exhausted");
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+    XdpCpuMapGlobalNonPagedBytes += HelperStatsBytes;
+    RtlReleasePushLockExclusive(&XdpCpuMapGlobalLock);
+    HelperStatsCharged = TRUE;
+
+    Map->HelperStats =
+        ExAllocatePoolZero(NonPagedPoolNxCacheAligned, HelperStatsBytes, XDP_POOLTAG_CPUMAP);
+    if (Map->HelperStats == NULL) {
+        Status = STATUS_NO_MEMORY;
+        goto Exit;
+    }
+
     Map->Header.Type = XdpEbpfMapTypeCpuMap;
     Map->ClientDispatch = ClientDispatch;
     Map->MaxEntries = MaxEntries;
     Map->TargetTableSize = TableSize;
+    Map->HelperStatsCount = TableSize;
+    Map->HelperStatsBytes = HelperStatsBytes;
+    Map->ChargedNonPagedBytes = HelperStatsBytes;
     Map->SweepState = XdpCpuMapSweepIdle;
 
     ExInitializePushLock(&Map->ConfigLock);
@@ -695,6 +893,22 @@ XdpCpuMapCreate(
 Exit:
 
     if (Map != NULL) {
+        if (Map->HelperStats != NULL) {
+            //
+            // The helper stats reservation is a hard nonpaged cap, so the
+            // actual allocation must be freed before its charge is released.
+            // If the allocation itself failed, HelperStats is NULL and the
+            // reservation is released below with nothing to free.
+            //
+            ExFreePoolWithTag(Map->HelperStats, XDP_POOLTAG_CPUMAP);
+            Map->HelperStats = NULL;
+        }
+        if (HelperStatsCharged) {
+            RtlAcquirePushLockExclusive(&XdpCpuMapGlobalLock);
+            ASSERT(XdpCpuMapGlobalNonPagedBytes >= HelperStatsBytes);
+            XdpCpuMapGlobalNonPagedBytes -= HelperStatsBytes;
+            RtlReleasePushLockExclusive(&XdpCpuMapGlobalLock);
+        }
         if (Map->TargetTable != NULL) {
             ExFreePoolWithTag(Map->TargetTable, XDP_POOLTAG_CPUMAP);
         }
@@ -755,6 +969,22 @@ XdpCpuMapDestroy(
     ASSERT(CpuMap->OutstandingRetires == 0);
     ASSERT(CpuMap->TargetCount == 0);
     ASSERT(CpuMap->ChargedRingEntries == 0);
+    ASSERT(CpuMap->ChargedNonPagedBytes == CpuMap->HelperStatsBytes);
+
+    if (CpuMap->HelperStats != NULL) {
+        ExFreePoolWithTag(CpuMap->HelperStats, XDP_POOLTAG_CPUMAP);
+        CpuMap->HelperStats = NULL;
+    }
+
+    RtlAcquirePushLockExclusive(&XdpCpuMapGlobalLock);
+    RtlAcquirePushLockExclusive(&CpuMap->ConfigLock);
+    ASSERT(XdpCpuMapGlobalNonPagedBytes >= CpuMap->HelperStatsBytes);
+    ASSERT(CpuMap->ChargedNonPagedBytes >= CpuMap->HelperStatsBytes);
+    XdpCpuMapGlobalNonPagedBytes -= CpuMap->HelperStatsBytes;
+    CpuMap->ChargedNonPagedBytes -= CpuMap->HelperStatsBytes;
+    RtlReleasePushLockExclusive(&CpuMap->ConfigLock);
+    RtlReleasePushLockExclusive(&XdpCpuMapGlobalLock);
+
     ASSERT(CpuMap->ChargedNonPagedBytes == 0);
 
     if (CpuMap->TargetTable != NULL) {
@@ -825,7 +1055,7 @@ XdpCpuMapCreateTarget(
 
     RingBytes =
         sizeof(XDP_CPUMAP_RING) + ((SIZE_T)RingDepth * sizeof(XDP_CPUMAP_ENTRY));
-    ChargeBytes = RingBytes + sizeof(KDPC) + sizeof(XDP_CPUMAP_TARGET);
+    ChargeBytes = XdpCpuMapGetPoolChargeSize(RingBytes + sizeof(KDPC));
 
     //
     // Cap admission. Order is global reservation, then per-map reservation, then
@@ -922,6 +1152,22 @@ XdpCpuMapCreateTarget(
 
 ExitReleasePerMap:
 
+    //
+    // Keep the hard-cap invariant conservative on failure: any charged
+    // allocation that exists is synchronously freed while its charge is still
+    // accounted, then the charge is released below. Target is deliberately not
+    // part of ChargeBytes because epoch_free only queues it for later
+    // reclamation, so it is released after the charge.
+    //
+    if (Dpc != NULL) {
+        ExFreePoolWithTag(Dpc, XDP_POOLTAG_CPUMAP);
+        Dpc = NULL;
+    }
+    if (Ring != NULL) {
+        ExFreePoolWithTag(Ring, XDP_POOLTAG_CPUMAP);
+        Ring = NULL;
+    }
+
     CpuMap->ChargedRingEntries -= RingDepth;
     CpuMap->ChargedNonPagedBytes -= ChargeBytes;
 
@@ -932,18 +1178,8 @@ ExitReleaseGlobal:
 
 Exit:
 
-    //
-    // Target is epoch-allocated and is never published before the last
-    // failure point, so an unpublished shell is freed here with the rest.
-    //
     if (Target != NULL) {
         CpuMap->ClientDispatch->epoch_free(Target);
-    }
-    if (Dpc != NULL) {
-        ExFreePoolWithTag(Dpc, XDP_POOLTAG_CPUMAP);
-    }
-    if (Ring != NULL) {
-        ExFreePoolWithTag(Ring, XDP_POOLTAG_CPUMAP);
     }
 
     return Status;
