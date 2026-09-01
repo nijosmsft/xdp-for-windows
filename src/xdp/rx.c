@@ -34,6 +34,8 @@ typedef struct _XDP_RX_QUEUE {
     XDP_EXTENSION VirtualAddressExtension;
     XDP_EXTENSION FragmentExtension;
     XDP_EXTENSION RxActionExtension;
+    XDP_EXTENSION CpuMapRedirectExtension;
+    BOOLEAN CpuMapRedirectEnabled;
 
 #if DBG
     //
@@ -241,7 +243,60 @@ XdppReceiveBatch(
             InspectRoutine(
                 RxQueue->Program, &RxQueue->InspectionContext, RxQueue->FrameRing, FrameIndex,
                 RxQueue->FragmentRing, &RxQueue->FragmentExtension, FragmentIndex,
-                &RxQueue->VirtualAddressExtension);
+                &RxQueue->VirtualAddressExtension, NULL);
+
+        ActionExtension = XdpGetRxActionExtension(Frame, &RxQueue->RxActionExtension);
+        ActionExtension->RxAction = Action;
+
+        FrameRing->ConsumerIndex++;
+
+        if (RxQueue->FragmentRing != NULL) {
+            RxQueue->FragmentRing->ConsumerIndex += Fragment->FragmentBufferCount;
+        }
+
+#if DBG
+        RxQueue->FrameConsumerIndex = FrameRing->ConsumerIndex;
+#endif
+    }
+}
+
+static
+FORCEINLINE
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdppReceiveBatchCpuMap(
+    _In_ XDP_RX_QUEUE *RxQueue,
+    _In_ XDP_RX_INSPECT_ROUTINE *InspectRoutine
+    )
+{
+    XDP_RING *FrameRing = RxQueue->FrameRing;
+
+    ASSERT(RxQueue->CpuMapRedirectEnabled);
+
+    while (XdpRingCount(FrameRing) > 0) {
+        UINT32 FrameIndex = FrameRing->ConsumerIndex & FrameRing->Mask;
+        UINT32 FragmentIndex = 0;
+        XDP_FRAME *Frame;
+        XDP_RX_ACTION Action;
+        XDP_FRAME_FRAGMENT *Fragment = NULL;
+        XDP_FRAME_RX_ACTION *ActionExtension;
+
+        Frame = XdpRingGetElement(FrameRing, FrameIndex);
+
+        if (RxQueue->FragmentRing != NULL) {
+            FragmentIndex = RxQueue->FragmentRing->ConsumerIndex & RxQueue->FragmentRing->Mask;
+            Fragment = XdpGetFragmentExtension(Frame, &RxQueue->FragmentExtension);
+        }
+
+        RtlZeroMemory(
+            XdpGetCpuMapRedirectExtension(Frame, &RxQueue->CpuMapRedirectExtension),
+            sizeof(XDP_FRAME_CPUMAP_REDIRECT_V1));
+
+        Action =
+            InspectRoutine(
+                RxQueue->Program, &RxQueue->InspectionContext, RxQueue->FrameRing, FrameIndex,
+                RxQueue->FragmentRing, &RxQueue->FragmentExtension, FragmentIndex,
+                &RxQueue->VirtualAddressExtension, &RxQueue->CpuMapRedirectExtension);
 
         ActionExtension = XdpGetRxActionExtension(Frame, &RxQueue->RxActionExtension);
         ActionExtension->RxAction = Action;
@@ -268,6 +323,7 @@ XdpReceive(
 
     XdpReceiveBatchStart(RxQueue);
 
+    ASSERT(!RxQueue->CpuMapRedirectEnabled);
     XdppReceiveBatch(RxQueue, XdpInspect);
     XdppFlushReceive(RxQueue);
 
@@ -286,10 +342,10 @@ XdpReceiveEbpf(
     XdpReceiveBatchStart(RxQueue);
 
     if (XdpInspectEbpfStartBatch(RxQueue->Program, &RxQueue->InspectionContext)) {
-        XdppReceiveBatch(RxQueue, XdpInspectEbpf);
+        XdppReceiveBatchCpuMap(RxQueue, XdpInspectEbpf);
         XdpInspectEbpfEndBatch(RxQueue->Program, &RxQueue->InspectionContext);
     } else {
-        XdppReceiveBatch(RxQueue, XdpInspect);
+        XdppReceiveBatchCpuMap(RxQueue, XdpInspect);
     }
 
     XdppFlushReceive(RxQueue);
@@ -342,6 +398,7 @@ XdpReceiveXskExclusiveBatch(
         //
         // XSK could not process the batch, so fall back to the common code path.
         //
+        ASSERT(!RxQueue->CpuMapRedirectEnabled);
         XdppReceiveBatch(RxQueue, XdpInspect);
         XdppFlushReceive(RxQueue);
     }
@@ -399,6 +456,14 @@ static const XDP_EXTENSION_REGISTRATION XdpRxFrameExtensions[] = {
         .Info.ExtensionType     = XDP_EXTENSION_TYPE_FRAME,
         .Size                   = sizeof(XDP_FRAME_RX_ACTION),
         .Alignment              = __alignof(XDP_FRAME_RX_ACTION),
+    },
+    {
+        .Info.ExtensionName     = XDP_FRAME_EXTENSION_CPUMAP_REDIRECT_NAME,
+        .Info.ExtensionVersion  = XDP_FRAME_EXTENSION_CPUMAP_REDIRECT_VERSION_1,
+        .Info.ExtensionType     = XDP_EXTENSION_TYPE_FRAME,
+        .Size                   = sizeof(XDP_FRAME_CPUMAP_REDIRECT_V1),
+        .Alignment              = __alignof(XDP_FRAME_CPUMAP_REDIRECT_V1),
+        .InternalExtension      = TRUE,
     },
     {
         .Info.ExtensionName     = XDP_FRAME_EXTENSION_INTERFACE_CONTEXT_NAME,
@@ -520,6 +585,10 @@ XdpRxQueueSetCapabilities(
     XdpExtensionSetEnableEntry(RxQueue->BufferExtensionSet, XDP_BUFFER_EXTENSION_VIRTUAL_ADDRESS_NAME);
 
     XdpExtensionSetEnableEntry(RxQueue->FrameExtensionSet, XDP_FRAME_EXTENSION_RX_ACTION_NAME);
+    if (RxQueue->CpuMapRedirectEnabled) {
+        XdpExtensionSetEnableEntry(
+            RxQueue->FrameExtensionSet, XDP_FRAME_EXTENSION_CPUMAP_REDIRECT_NAME);
+    }
 
     if (Capabilities->MaximumFragments > 0) {
         XdpExtensionSetEnableEntry(RxQueue->FrameExtensionSet, XDP_FRAME_EXTENSION_FRAGMENT_NAME);
@@ -698,6 +767,17 @@ XdpRxQueueIsLayoutExtensionEnabled(
     return
         XdpExtensionSetIsExtensionEnabled(
             RxQueue->FrameExtensionSet, XDP_FRAME_EXTENSION_LAYOUT_NAME);
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+BOOLEAN
+XdpRxQueueIsCpuMapRedirectEnabled(
+    _In_ XDP_RX_QUEUE_CONFIG_ACTIVATE RxQueueConfig
+    )
+{
+    XDP_RX_QUEUE *RxQueue = XdpRxQueueFromConfigActivate(RxQueueConfig);
+
+    return RxQueue->CpuMapRedirectEnabled;
 }
 
 static
@@ -927,6 +1007,8 @@ XdpRxQueueDetachInterface(
     RtlZeroMemory(&RxQueue->FragmentExtension, sizeof(RxQueue->FragmentExtension));
     RtlZeroMemory(&RxQueue->VirtualAddressExtension, sizeof(RxQueue->VirtualAddressExtension));
     RtlZeroMemory(&RxQueue->RxActionExtension, sizeof(RxQueue->RxActionExtension));
+    RtlZeroMemory(&RxQueue->CpuMapRedirectExtension, sizeof(RxQueue->CpuMapRedirectExtension));
+    RxQueue->CpuMapRedirectEnabled = FALSE;
 
 #if DBG
     RxQueue->FrameConsumerIndex = 0;
@@ -990,6 +1072,8 @@ XdpRxQueueAttachInterface(
     ASSERT(RxQueue->InterfaceRxQueue == NULL);
 
     TraceEnter(TRACE_CORE, "RxQueue=%p", RxQueue);
+
+    RxQueue->CpuMapRedirectEnabled = XdpProgramCanCpuMapRedirect(RxQueue->Program);
 
     if (RxQueue->IsChecksumOffloadEnabled) {
         XdpExtensionSetEnableEntry(
@@ -1059,6 +1143,13 @@ XdpRxQueueAttachInterface(
         &ExtensionInfo, XDP_FRAME_EXTENSION_RX_ACTION_NAME,
         XDP_FRAME_EXTENSION_RX_ACTION_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
     XdpRxQueueGetExtension(ConfigActivate, &ExtensionInfo, &RxQueue->RxActionExtension);
+
+    if (RxQueue->CpuMapRedirectEnabled) {
+        XdpInitializeExtensionInfo(
+            &ExtensionInfo, XDP_FRAME_EXTENSION_CPUMAP_REDIRECT_NAME,
+            XDP_FRAME_EXTENSION_CPUMAP_REDIRECT_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
+        XdpRxQueueGetExtension(ConfigActivate, &ExtensionInfo, &RxQueue->CpuMapRedirectExtension);
+    }
 
     if (XdpRxQueueIsVirtualAddressEnabled(ConfigActivate)) {
         XdpInitializeExtensionInfo(

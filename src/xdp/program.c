@@ -25,9 +25,18 @@ typedef struct _EBPF_XDP_MD {
     xdp_md_t Base;
     EBPF_PROG_TEST_RUN_CONTEXT* ProgTestRunContext;
     XDP_INSPECTION_CONTEXT *InspectionContext;
-    VOID *RedirectTarget;
-    XDP_REDIRECT_TARGET_TYPE RedirectTargetType;
-    XDP_CPUMAP_REDIRECT_CONTEXT CpuMapRedirect;
+    enum {
+        EbpfXdpRedirectIntentNone,
+        EbpfXdpRedirectIntentXsk,
+        EbpfXdpRedirectIntentCpuMap,
+    } RedirectIntent;
+    union {
+        struct {
+            VOID *Target;
+            XDP_REDIRECT_TARGET_TYPE TargetType;
+        } Xsk;
+        XDP_CPUMAP_REDIRECT_CONTEXT CpuMap;
+    } Redirect;
 } EBPF_XDP_MD;
 
 static __forceinline NTSTATUS EbpfResultToNtStatus(ebpf_result_t Result)
@@ -221,7 +230,8 @@ XdpInvokeEbpf(
     _In_opt_ XDP_EXTENSION *FragmentExtension,
     _In_ UINT32 FrameIndex,
     _In_ UINT32 FragmentIndex,
-    _In_ XDP_EXTENSION *VirtualAddressExtension
+    _In_ XDP_EXTENSION *VirtualAddressExtension,
+    _In_opt_ XDP_EXTENSION *CpuMapRedirectExtension
     )
 {
     const EBPF_EXTENSION_CLIENT *Client = (const EBPF_EXTENSION_CLIENT *)EbpfTarget;
@@ -262,9 +272,9 @@ XdpInvokeEbpf(
     XdpMd.Base.ingress_ifindex = InspectionContext->IfIndex;
     XdpMd.Base.rx_queue_index = InspectionContext->QueueId;
     XdpMd.InspectionContext = InspectionContext;
-    XdpMd.RedirectTarget = NULL;
+    XdpMd.RedirectIntent = EbpfXdpRedirectIntentNone;
     XdpMd.ProgTestRunContext = NULL;
-    RtlZeroMemory(&XdpMd.CpuMapRedirect, sizeof(XdpMd.CpuMapRedirect));
+    RtlZeroMemory(&XdpMd.Redirect, sizeof(XdpMd.Redirect));
 
     ebpf_program_batch_invoke_function_t EbpfInvokeProgram =
         EbpfExtensionClientGetProgramDispatch(Client)->ebpf_program_batch_invoke_function;
@@ -289,20 +299,36 @@ XdpInvokeEbpf(
         break;
 
     case XDP_REDIRECT:
-        if (XdpMd.RedirectTarget != NULL) {
+        if (XdpMd.RedirectIntent == EbpfXdpRedirectIntentXsk) {
             XdpRedirect(
                 &InspectionContext->RedirectContext, FrameIndex, FragmentIndex,
-                XdpMd.RedirectTargetType, XdpMd.RedirectTarget);
+                XdpMd.Redirect.Xsk.TargetType, XdpMd.Redirect.Xsk.Target);
             RxAction = XDP_RX_ACTION_DROP;
             STAT_INC(RxQueueStats, InspectFramesRedirected);
-        } else if (XdpMd.CpuMapRedirect.CpuMapTarget != NULL) {
-            //
-            // Increment 4 resolves and pins the CPUMAP target but deliberately
-            // does not transfer packet ownership or enqueue anything. Later
-            // increments replace this with the private frame-metadata handoff.
-            //
+        } else if (XdpMd.RedirectIntent == EbpfXdpRedirectIntentCpuMap) {
+            XDP_FRAME_CPUMAP_REDIRECT_V1 *CpuMapRedirect;
+
+            ASSERT(CpuMapRedirectExtension != NULL);
+            if (CpuMapRedirectExtension == NULL) {
+                RxAction = XDP_RX_ACTION_DROP;
+                STAT_INC(RxQueueStats, InspectFramesDropped);
+                break;
+            }
+
+            CpuMapRedirect = XdpGetCpuMapRedirectExtension(Frame, CpuMapRedirectExtension);
+
+            CpuMapRedirect->Size = sizeof(*CpuMapRedirect);
+            CpuMapRedirect->Version = XDP_FRAME_CPUMAP_REDIRECT_VERSION_1;
+            CpuMapRedirect->Flags = XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_PENDING;
+            CpuMapRedirect->CpuMap = XdpMd.Redirect.CpuMap.CpuMap;
+            CpuMapRedirect->Target = XdpMd.Redirect.CpuMap.CpuMapTarget;
+            CpuMapRedirect->TargetKey = XdpMd.Redirect.CpuMap.TargetKey;
+            CpuMapRedirect->TargetCpu = XdpMd.Redirect.CpuMap.TargetCpu;
+
+            RtlZeroMemory(&XdpMd.Redirect.CpuMap, sizeof(XdpMd.Redirect.CpuMap));
+            XdpMd.RedirectIntent = EbpfXdpRedirectIntentNone;
             RxAction = XDP_RX_ACTION_DROP;
-            STAT_INC(RxQueueStats, InspectFramesDropped);
+            STAT_INC(RxQueueStats, InspectFramesRedirected);
         } else {
             RxAction = XDP_RX_ACTION_DROP;
             STAT_INC(RxQueueStats, InspectFramesDropped);
@@ -334,7 +360,8 @@ XdpInspectEbpf(
     _In_opt_ XDP_RING *FragmentRing,
     _In_opt_ XDP_EXTENSION *FragmentExtension,
     _In_ UINT32 FragmentIndex,
-    _In_ XDP_EXTENSION *VirtualAddressExtension
+    _In_ XDP_EXTENSION *VirtualAddressExtension,
+    _In_opt_ XDP_EXTENSION *CpuMapRedirectExtension
     )
 {
     XDP_FRAME *Frame;
@@ -350,7 +377,8 @@ XdpInspectEbpf(
     return
         XdpInvokeEbpf(
             Program->Rules[0].Ebpf.Target, InspectionContext, Frame, FragmentRing,
-            FragmentExtension, FrameIndex, FragmentIndex, VirtualAddressExtension);
+            FragmentExtension, FrameIndex, FragmentIndex, VirtualAddressExtension,
+            CpuMapRedirectExtension);
 }
 
 static
@@ -724,7 +752,10 @@ EbpfXdpReleaseCpuMapIntent(
     _Inout_ EBPF_XDP_MD *XdpMd
     )
 {
-    XdpCpuMapClearRedirectContext(&XdpMd->CpuMapRedirect);
+    if (XdpMd->RedirectIntent == EbpfXdpRedirectIntentCpuMap) {
+        XdpCpuMapClearRedirectContext(&XdpMd->Redirect.CpuMap);
+        XdpMd->RedirectIntent = EbpfXdpRedirectIntentNone;
+    }
 }
 
 static
@@ -734,7 +765,8 @@ EbpfXdpClearRedirectIntent(
     )
 {
     EbpfXdpReleaseCpuMapIntent(XdpMd);
-    XdpMd->RedirectTarget = NULL;
+    RtlZeroMemory(&XdpMd->Redirect, sizeof(XdpMd->Redirect));
+    XdpMd->RedirectIntent = EbpfXdpRedirectIntentNone;
 }
 
 static
@@ -804,7 +836,10 @@ EbpfXdpRedirectMap(
             ReturnAction =
                 XdpCpuMapRedirectMap(
                     Map, Key, FallbackAction, IsProgTestRun || RxQueue == NULL, InterfaceMode,
-                    CpuMap, &XdpMd->CpuMapRedirect);
+                    CpuMap, &XdpMd->Redirect.CpuMap);
+            if (ReturnAction == XDP_REDIRECT && XdpMd->Redirect.CpuMap.CpuMapTarget != NULL) {
+                XdpMd->RedirectIntent = EbpfXdpRedirectIntentCpuMap;
+            }
             goto Exit;
         }
 
@@ -839,8 +874,9 @@ EbpfXdpRedirectMap(
         goto Exit;
     }
 
-    XdpMd->RedirectTarget = Xsk;
-    XdpMd->RedirectTargetType = XDP_REDIRECT_TARGET_TYPE_XSK;
+    XdpMd->Redirect.Xsk.Target = Xsk;
+    XdpMd->Redirect.Xsk.TargetType = XDP_REDIRECT_TARGET_TYPE_XSK;
+    XdpMd->RedirectIntent = EbpfXdpRedirectIntentXsk;
     ReturnAction = XDP_REDIRECT;
     EventWriteEbpfRedirectMapSuccess(&MICROSOFT_XDP_PROVIDER, RxQueue, Key, Xsk);
 
@@ -1238,6 +1274,19 @@ XdpProgramCanXskBypass(
         Program->Rules[0].Action == XDP_PROGRAM_ACTION_REDIRECT &&
         Program->Rules[0].Redirect.TargetType == XDP_REDIRECT_TARGET_TYPE_XSK &&
         XskCanBypass(Program->Rules[0].Redirect.Target, RxQueue);
+}
+
+BOOLEAN
+XdpProgramCanCpuMapRedirect(
+    _In_ XDP_PROGRAM *Program
+    )
+{
+    //
+    // CPUMAP redirect is currently exposed only through the eBPF redirect_map
+    // helper. Native XDP redirect targets do not include CPUMAP, so non-eBPF
+    // programs must not pay for the private CPUMAP frame metadata.
+    //
+    return XdpProgramIsEbpf(Program);
 }
 
 static

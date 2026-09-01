@@ -64,6 +64,12 @@ CONST XDP_VERSION XdpDriverApiVersion = {
 // Define custom OIDs in the vendor-private range [0xFF00000, 0xFFFFFFFF].
 //
 #define OID_XDPMP_RATE_SIM 0xFF00000
+#define OID_XDPMP_XDP_RX_QUEUE_INFO 0xFF00001
+
+typedef struct _XDPMP_XDP_RX_QUEUE_INFO {
+    UINT32 QueueCount;
+    UINT32 FrameRingStride[MAX_RSS_QUEUES];
+} XDPMP_XDP_RX_QUEUE_INFO;
 
 GLOBAL_CONTEXT MpGlobalContext = {0};
 
@@ -110,6 +116,7 @@ NDIS_OID MpSupportedOidArray[] =
     OID_GEN_RECEIVE_SCALE_PARAMETERS,
 
     OID_XDPMP_RATE_SIM,
+    OID_XDPMP_XDP_RX_QUEUE_INFO,
 
     OID_XDP_QUERY_CAPABILITIES,
 };
@@ -1132,6 +1139,7 @@ MpQueryInformationHandler(
     NDIS_LINK_SPEED LinkSpeed;
     NDIS_LINK_STATE LinkState;
     NDIS_STATISTICS_INFO StatisticsInfo;
+    XDPMP_XDP_RX_QUEUE_INFO XdpRxQueueInfo;
 
     *BytesWritten = 0;
 
@@ -1321,6 +1329,21 @@ MpQueryInformationHandler(
         case OID_XDPMP_RATE_SIM:
             DataPointer = &Adapter->RateSim;
             DataLength = sizeof(Adapter->RateSim);
+            break;
+
+        case OID_XDPMP_XDP_RX_QUEUE_INFO:
+            RtlZeroMemory(&XdpRxQueueInfo, sizeof(XdpRxQueueInfo));
+            XdpRxQueueInfo.QueueCount = Adapter->NumRssQueues;
+            for (UINT32 Index = 0; Index < Adapter->NumRssQueues; Index++) {
+                const ADAPTER_RX_QUEUE *Rq = &Adapter->RssQueues[Index].Rq;
+
+                if (Rq->FrameRing != NULL) {
+                    XdpRxQueueInfo.FrameRingStride[Index] = Rq->FrameRing->ElementStride;
+                }
+            }
+
+            DataPointer = &XdpRxQueueInfo;
+            DataLength = sizeof(XdpRxQueueInfo);
             break;
 
         case OID_XDP_QUERY_CAPABILITIES:

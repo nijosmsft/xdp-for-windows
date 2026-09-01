@@ -42,6 +42,9 @@
 #include <fntrace.h>
 #include <qeo_ndis.h>
 #include <xdp/ebpfhook.h>
+#include <xdp/buffervirtualaddress.h>
+#include <xdp/framefragment.h>
+#include <xdp/framerxaction.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -71,6 +74,24 @@
 #define DEFAULT_RING_SIZE (DEFAULT_UMEM_SIZE / DEFAULT_UMEM_CHUNK_SIZE)
 
 #define DEFAULT_XDP_SDDL "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+#define OID_XDPMP_XDP_RX_QUEUE_INFO 0xFF00001
+#define XDPMP_MAX_RSS_QUEUES 64
+
+typedef struct _XDPMP_XDP_RX_QUEUE_INFO {
+    UINT32 QueueCount;
+    UINT32 FrameRingStride[XDPMP_MAX_RSS_QUEUES];
+} XDPMP_XDP_RX_QUEUE_INFO;
+
+static
+UINT32
+TestAlignUpBy(
+    _In_ UINT32 Value,
+    _In_ UINT32 Alignment
+    )
+{
+    return (Value + Alignment - 1) & ~(Alignment - 1);
+}
 
 static const XDP_HOOK_ID XdpInspectRxL2 =
 {
@@ -8539,6 +8560,42 @@ TxIndicate(
     XSK_NOTIFY_RESULT_FLAGS PokeResult;
     NotifySocket(Xsk->Handle.get(), XSK_NOTIFY_FLAG_POKE_TX, 0, &PokeResult);
     TEST_EQUAL(0, PokeResult);
+}
+
+VOID
+NativeRxXskNoCpuMapFrameLayout()
+{
+    auto If = FnMpIf;
+    const UINT32 QueueId = If.GetQueueId();
+    auto Xsk = CreateAndActivateSocket(If.GetIfIndex(), QueueId, TRUE, FALSE, XDP_NATIVE);
+    auto Program =
+        SocketAttachRxProgram(
+            If.GetIfIndex(), &XdpInspectRxL2, QueueId, XDP_NATIVE, Xsk.Handle.get());
+    TEST_NOT_NULL(Program.get());
+    auto DefaultLwf = LwfOpenDefault(If.GetIfIndex());
+    OID_KEY Key;
+    XDPMP_XDP_RX_QUEUE_INFO Info = {0};
+    UINT32 InfoSize = sizeof(Info);
+
+    //
+    // A native XSK redirect program cannot redirect to CPUMAP, so increment 5
+    // must not enable its private frame extension on this queue. The fake
+    // miniport reports the internal XDP RX frame-ring stride so this catches an
+    // accidental unconditional extension layout change.
+    //
+    InitializeOidKey(&Key, OID_XDPMP_XDP_RX_QUEUE_INFO, NdisRequestQueryInformation);
+    TEST_HRESULT(LwfOidSubmitRequest(DefaultLwf, Key, &InfoSize, &Info));
+    TEST_EQUAL(sizeof(Info), InfoSize);
+    TEST_TRUE(QueueId < Info.QueueCount);
+
+    const UINT32 ExpectedStride =
+        TestAlignUpBy(
+            (UINT32)(
+                sizeof(XDP_BUFFER) +
+                sizeof(XDP_BUFFER_VIRTUAL_ADDRESS) +
+                sizeof(XDP_FRAME_RX_ACTION)),
+            (UINT32)__alignof(XDP_BUFFER_VIRTUAL_ADDRESS));
+    TEST_EQUAL(ExpectedStride, Info.FrameRingStride[QueueId]);
 }
 
 VOID

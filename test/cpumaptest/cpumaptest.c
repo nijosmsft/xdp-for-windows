@@ -34,6 +34,8 @@
 //   HelperTargetRundown          helper-time target rundown acquire/release must
 //                                be balanced on success and take no reference on
 //                                acquire failure
+//   CommitInvalidMetadata        stale or aliased frame metadata must not be
+//                                treated as owning CPUMAP references
 //
 // Every case asserts the live allocation count returns to its starting value, so
 // any unwind path that forgets a free fails here rather than in a driver.
@@ -138,6 +140,10 @@ XdpCpuMapTestFree(
 //
 
 LONG XdpCpuMapTestEpochDepth;
+ULONG XdpCpuMapTestRundownAcquireCalls;
+ULONG XdpCpuMapTestRundownReleaseCalls;
+ULONG XdpCpuMapTestExpectAssert;
+ULONG XdpCpuMapTestAssertsObserved;
 LONG XdpCpuMapTestEpochOperations;
 
 static
@@ -1652,6 +1658,8 @@ XdpCpuMapTestHelperTargetRundown(
         XDP_REDIRECT);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == CpuMap);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == Value.Target);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetKey == 0);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetCpu == Entry.TargetCpu);
 
     XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 1);
     XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 2);
@@ -1665,6 +1673,8 @@ XdpCpuMapTestHelperTargetRundown(
     XdpCpuMapClearRedirectContext(&Redirect);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetKey == 0);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetCpu == 0);
     XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
     XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
 
@@ -2010,6 +2020,8 @@ XdpCpuMapTestHelperReplacementRelease(
         XDP_REDIRECT);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == CpuMap);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == Value0.Target);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetKey == 0);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetCpu == Value0.Target->AbsoluteCpu);
     XDPCPUMAP_TEST_ASSERT(Value0.Target->PacketRundown.Count == 1);
     XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 2);
 
@@ -2026,6 +2038,8 @@ XdpCpuMapTestHelperReplacementRelease(
         XDP_REDIRECT);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == CpuMap);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == Value1.Target);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetKey == 1);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetCpu == Value1.Target->AbsoluteCpu);
     XDPCPUMAP_TEST_ASSERT(Value0.Target->PacketRundown.Count == 0);
     XDPCPUMAP_TEST_ASSERT(Value1.Target->PacketRundown.Count == 1);
     XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 2);
@@ -2037,6 +2051,8 @@ XdpCpuMapTestHelperReplacementRelease(
     XdpCpuMapClearRedirectContext(&Redirect);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
     XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetKey == 0);
+    XDPCPUMAP_TEST_ASSERT(Redirect.TargetCpu == 0);
     XDPCPUMAP_TEST_ASSERT(Value1.Target->PacketRundown.Count == 0);
     XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
 
@@ -2053,7 +2069,506 @@ XdpCpuMapTestHelperReplacementRelease(
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
 }
 
-int
+static
+XDP_FRAME_CPUMAP_REDIRECT_V1
+XdpCpuMapTestFrameRedirect(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _Inout_ XDP_CPUMAP_TARGET *Target,
+    _In_ UINT32 TargetKey
+    )
+{
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect = {0};
+
+    Redirect.Size = sizeof(Redirect);
+    Redirect.Version = XDP_FRAME_CPUMAP_REDIRECT_VERSION_1;
+    Redirect.Flags = XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_PENDING;
+    Redirect.CpuMap = CpuMap;
+    Redirect.Target = Target;
+    Redirect.TargetKey = TargetKey;
+    Redirect.TargetCpu = Target->AbsoluteCpu;
+    return Redirect;
+}
+
+static
+VOID
+XdpCpuMapTestCommitInvalidMetadata(
+    VOID
+    )
+{
+    static const NET_BUFFER_LIST *ActionNbl = (NET_BUFFER_LIST *)(ULONG_PTR)1;
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("CommitInvalidMetadata");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    //
+    // This models the smallest faithful form of the VM hang class: the caller
+    // observed OWNERSHIP_PENDING in stale/aliased frame bytes, but the metadata
+    // did not come from the CPUMAP helper and therefore owns no target rundown
+    // or map backing reference. Validation must reject it without releasing
+    // either object and without acquiring the queue NBL rundown.
+    //
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+    Redirect.Size = sizeof(Redirect) - 1;
+
+    //
+    // Invalid metadata is a broken invariant, so checked builds now assert on
+    // it. The behaviour under test is the RETAIL path: reject safely, release
+    // nothing, and leave the queue rundown untouched. Count the assertion
+    // instead of failing on it so that path stays reachable in the harness.
+    //
+    XdpCpuMapTestExpectAssert = 1;
+    XdpCpuMapTestAssertsObserved = 0;
+    XDPCPUMAP_TEST_ASSERT(
+        !XdpCpuMapCommitRedirect(&Redirect, ActionNbl, FALSE, &CommitGroup));
+    XdpCpuMapTestExpectAssert = 0;
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestAssertsObserved > 0);
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+
+    //
+    // If this test is run against the defective branch for deletion-criterion
+    // validation, keep the deliberately corrupted accounting from cascading
+    // into unrelated cleanup failures.
+    //
+    Value.Target->PacketRundown.Count = 0;
+    CpuMap->RefCount = 1;
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
+}
+
+static
+VOID
+XdpCpuMapTestCommitRejectPaths(
+    VOID
+    )
+{
+    static const NET_BUFFER_LIST *ActionNbl = (NET_BUFFER_LIST *)(ULONG_PTR)1;
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    XDP_CPUMAP_HELPER_STATS Stats;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("CommitRejectPaths");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    //
+    // Step 2 reject: the pause gate rejects before NblRundown is acquired, so
+    // the reject path must release only the helper-held target rundown and
+    // backing reference.
+    //
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+    XDPCPUMAP_TEST_ASSERT(
+        !XdpCpuMapCommitRedirect(&Redirect, ActionNbl, TRUE, &CommitGroup));
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseRejected == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownRejected == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitBatchInsertFailed == 0);
+
+    //
+    // Step 3 reject: failed ExAcquireRundownProtectionEx does not take a
+    // reference, so the shared reject path must again leave NblRundown alone.
+    //
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+    ExWaitForRundownProtectionRelease(&NblRundown);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+    XDPCPUMAP_TEST_ASSERT(
+        !XdpCpuMapCommitRedirect(&Redirect, ActionNbl, FALSE, &CommitGroup));
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseRejected == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownRejected == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitBatchInsertFailed == 0);
+
+    //
+    // Step 4 reject: increment 5 has no batch object, so insertion cannot
+    // succeed. This path runs after NblRundown was acquired and must release it
+    // exactly once at the shared step-5 reject site.
+    //
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+    XDPCPUMAP_TEST_ASSERT(
+        !XdpCpuMapCommitRedirect(&Redirect, ActionNbl, FALSE, &CommitGroup));
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseRejected == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownRejected == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitBatchInsertFailed == 1);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == 0);
+}
+
+//
+// The eBPF program supplies an unconstrained 64-bit key, but a CPUMAP key is
+// UINT32 and the base-map lookup reads only that many bytes. A key with nonzero
+// upper bits must therefore be rejected BEFORE the lookup, or it would alias
+// onto a configured low-32 slot.
+//
+// This must be a defined fallback, never an assertion: program input is
+// untrusted, and a checked xdp.sys with no kernel debugger attached fail-fasts
+// the machine on a failed ASSERT.
+//
+static
+VOID
+XdpCpuMapTestHelperHighKeyRejected(
+    VOID
+    )
+{
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_REDIRECT_CONTEXT Redirect = {0};
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    const UCHAR MapObject = 0;
+    LONG Baseline;
+    intptr_t Result;
+
+    XDPCPUMAP_TEST_BEGIN("HelperHighKeyRejected");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    XdpCpuMapTestResetFindElement();
+    XdpCpuMapTestFindValue = &Value;
+
+    //
+    // Upper bits set, low 32 bits naming slot 0 which IS configured. Without the
+    // range check this aliases onto that slot and redirects.
+    //
+    Result =
+        XdpCpuMapTestRedirectInEpoch(
+            &MapObject, 0x0000000100000000ull, XDP_PASS, FALSE,
+            XDP_INTERFACE_MODE_GENERIC, CpuMap, &Redirect);
+
+    XDPCPUMAP_TEST_ASSERT(Result == XDP_PASS);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMap == NULL);
+    XDPCPUMAP_TEST_ASSERT(Redirect.CpuMapTarget == NULL);
+
+    //
+    // Rejected before the lookup, so the find callback must not have run and no
+    // reference may have been taken.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFindCallCount == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Section 6.3 requires NblRundown acquisition once per flush group, not per
+// packet. Reference totals alone cannot prove that — a per-packet implementation
+// moves the same totals. This test counts CALLS into the rundown API, which is
+// the thing that actually costs an interlocked operation on a shared line.
+
+//
+// Valid helper metadata arriving with a NULL ActionNbl. Checked builds must
+// assert -- it is a broken invariant -- and retail must still release the target
+// rundown and backing reference the metadata genuinely owns, rather than zeroing
+// over them. Leaking a rundown reference here is what deadlocks queue teardown.
+//
+static
+VOID
+XdpCpuMapTestCommitNullActionNbl(
+    VOID
+    )
+{
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("CommitNullActionNbl");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+
+    XdpCpuMapTestExpectAssert = 1;
+    XdpCpuMapTestAssertsObserved = 0;
+    XDPCPUMAP_TEST_ASSERT(
+        !XdpCpuMapCommitRedirect(&Redirect, NULL, FALSE, &CommitGroup));
+    XdpCpuMapTestExpectAssert = 0;
+
+    //
+    // Exactly one assertion: the ActionNbl invariant. The metadata itself was
+    // valid, so none of the metadata assertions may have fired.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestAssertsObserved == 1);
+
+    //
+    // And the references it owned must have been released, not leaked.
+    //
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
+
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Section 6.3 requires NblRundown acquisition to be batched once per flush
+// group. Every other commit test uses one packet per fresh group, which CANNOT
+// distinguish a credit pool from per-packet acquisition: both end with the same
+// reference totals and the same net-zero rundown. The only observable that
+// separates them is how many times the code goes to the shared rundown, so this
+// test asserts CALL COUNTS.
+//
+// Deletion criterion: replace XdpCpuMapCommitGroupTakeCredit's pooling with a
+// plain per-packet ExAcquireRundownProtectionEx/ExReleaseRundownProtectionEx
+// pair and phase 1 fails on its first loop iteration.
+//
+#define XDPCPUMAP_TEST_BATCH_COMMITS 8u
+
+//
+// Must stay under a chunk. A group that commits more than
+// XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK entries legitimately acquires more than once,
+// so exceeding it here would assert the wrong invariant.
+//
+C_ASSERT(XDPCPUMAP_TEST_BATCH_COMMITS < XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK);
+
+static
+VOID
+XdpCpuMapTestCommitGroupBatching(
+    VOID
+    )
+{
+    static const NET_BUFFER_LIST *ActionNbl = (NET_BUFFER_LIST *)(ULONG_PTR)1;
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    XDP_CPUMAP_HELPER_STATS Stats;
+    LONG Baseline;
+    UINT32 Index;
+
+    XDPCPUMAP_TEST_BEGIN("CommitGroupBatching");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    //
+    // Phase 1: many commits, one group, one acquire.
+    //
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+    XdpCpuMapTestRundownAcquireCalls = 0;
+    XdpCpuMapTestRundownReleaseCalls = 0;
+
+    for (Index = 0; Index < XDPCPUMAP_TEST_BATCH_COMMITS; Index++) {
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+        XdpCpuMapReferenceBacking(CpuMap);
+        Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+        XDPCPUMAP_TEST_ASSERT(
+            !XdpCpuMapCommitRedirect(&Redirect, ActionNbl, FALSE, &CommitGroup));
+        XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
+
+        //
+        // The assertion that carries the whole claim. Per-packet acquisition
+        // would make this Index + 1.
+        //
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownAcquireCalls == 1);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownReleaseCalls == 0);
+    }
+
+    //
+    // The whole chunk is still held mid-group: increment 5 has no batch object,
+    // so every commit returned its credit, and a returned credit is group-local
+    // state that must not touch the shared rundown.
+    //
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == (LONG)XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK);
+    XDPCPUMAP_TEST_ASSERT(CommitGroup.Credits == XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownAcquireCalls == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownReleaseCalls == 1);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitBatchInsertFailed == XDPCPUMAP_TEST_BATCH_COMMITS);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownRejected == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseRejected == 0);
+
+    //
+    // Phase 2: a group that commits nothing must not touch the rundown at all.
+    // Acquiring in Init would charge every flush that carries no CPUMAP traffic,
+    // which is the overwhelmingly common case.
+    //
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapTestRundownAcquireCalls = 0;
+    XdpCpuMapTestRundownReleaseCalls = 0;
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownAcquireCalls == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownReleaseCalls == 0);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+
+    //
+    // Phase 3: once the queue is running down the failure latches for the rest
+    // of the group. Retrying per packet would reintroduce exactly the
+    // per-packet interlocked cost the pool exists to remove, and it would do so
+    // on the pause path, where every packet in the flush takes the same failing
+    // trip to the same contended line.
+    //
+    ExInitializeRundownProtection(&NblRundown);
+    ExWaitForRundownProtectionRelease(&NblRundown);
+    XdpCpuMapCommitGroupInit(&CommitGroup, &NblRundown);
+    XdpCpuMapTestRundownAcquireCalls = 0;
+    XdpCpuMapTestRundownReleaseCalls = 0;
+
+    for (Index = 0; Index < XDPCPUMAP_TEST_BATCH_COMMITS; Index++) {
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+        XdpCpuMapReferenceBacking(CpuMap);
+        Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+        XDPCPUMAP_TEST_ASSERT(
+            !XdpCpuMapCommitRedirect(&Redirect, ActionNbl, FALSE, &CommitGroup));
+
+        //
+        // Exactly one failed attempt for the whole group, not one per packet.
+        //
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownAcquireCalls == 1);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownReleaseCalls == 0);
+
+        //
+        // A rejected commit still owes the references the helper took.
+        //
+        XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
+        XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+        XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    }
+
+    //
+    // Nothing was acquired, so Finish has nothing to release and must not make a
+    // pointless call against a rundown that is already down.
+    //
+    XdpCpuMapCommitGroupFinish(&CommitGroup);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownAcquireCalls == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestRundownReleaseCalls == 0);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownRejected == XDPCPUMAP_TEST_BATCH_COMMITS);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitBatchInsertFailed == XDPCPUMAP_TEST_BATCH_COMMITS);
+    XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseRejected == 0);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+INT
 __cdecl
 main(
     int argc,
@@ -2077,9 +2592,14 @@ main(
     XdpCpuMapTestHelperTargetRundown();
     XdpCpuMapTestHelperContextOffsetGuard();
     XdpCpuMapTestHelperFindElement();
+    XdpCpuMapTestHelperHighKeyRejected();
     XdpCpuMapTestHelperFailureFallbacks();
     XdpCpuMapTestHelperModeFallback();
     XdpCpuMapTestHelperReplacementRelease();
+    XdpCpuMapTestCommitInvalidMetadata();
+    XdpCpuMapTestCommitRejectPaths();
+    XdpCpuMapTestCommitNullActionNbl();
+    XdpCpuMapTestCommitGroupBatching();
 
     XdpCpuMapTestCurrent = "<summary>";
 

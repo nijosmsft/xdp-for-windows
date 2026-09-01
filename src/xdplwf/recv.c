@@ -1668,11 +1668,20 @@ XdpGenericReceivePostInspectNbs(
 
     NET_BUFFER_LIST *CachedNextNbl = NULL;
 
+    //
+    // Rundown credits for this flush group. Section 6.3 requires NblRundown
+    // acquisition to be batched per group rather than taken per packet; the
+    // group is finished once, below, releasing whatever went unconsumed.
+    //
+    XDP_CPUMAP_COMMIT_GROUP CpuMapCommitGroup;
+    XdpCpuMapCommitGroupInit(&CpuMapCommitGroup, &RxQueue->NblRundown);
+
     while (NbHead != NbTail) {
         XDP_FRAME *Frame;
         XDP_RX_ACTION XdpRxAction;
         XDP_LWF_GENERIC_RX_FRAME_CONTEXT *InterfaceExtension;
         NET_BUFFER_LIST *ActionNbl = NULL;
+        BOOLEAN FrameInspected = FALSE;
 
         ASSERT(NblHead != NULL);
         ASSERT(NbHead != NULL);
@@ -1684,6 +1693,7 @@ XdpGenericReceivePostInspectNbs(
             NbHead == InterfaceExtension->Nb) {
             XdpRxAction = XdpGetRxActionExtension(Frame, &RxQueue->RxActionExtension)->RxAction;
             FrameRing->InterfaceReserved++;
+            FrameInspected = TRUE;
         } else {
             //
             // This NB's action was decided prior to XDP inspection.
@@ -1741,6 +1751,22 @@ XdpGenericReceivePostInspectNbs(
         //
         // Now that we've finished dereferencing ActionNbl, apply the RX action.
         //
+        if (RxQueue->Flags.CpuMapRedirectEnabled && FrameInspected) {
+            XDP_FRAME_CPUMAP_REDIRECT_V1 *CpuMapRedirect =
+                XdpGetCpuMapRedirectExtension(Frame, &RxQueue->CpuMapRedirectExtension);
+
+            if ((CpuMapRedirect->Flags &
+                    XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_PENDING) != 0) {
+                BOOLEAN RxQueuePaused =
+                    ReadBooleanAcquire(&RxQueue->Flags.Paused) != FALSE;
+
+                if (XdpCpuMapCommitRedirect(
+                        CpuMapRedirect, ActionNbl, RxQueuePaused, &CpuMapCommitGroup)) {
+                    ActionNbl = NULL;
+                }
+            }
+        }
+
         if (ActionNbl != NULL) {
             //
             // Note: Invoking these functions could disconnect the NBL chain we are currently traversing.
@@ -1791,6 +1817,13 @@ XdpGenericReceivePostInspectNbs(
                 LowResourcesList, PortNumber, (NbHead == NULL));
         }
     }
+
+    //
+    // End of the flush group: release any rundown credits acquired above but
+    // not consumed by a committing packet. One interlocked operation for the
+    // whole group.
+    //
+    XdpCpuMapCommitGroupFinish(&CpuMapCommitGroup);
 
     ASSERT(FrameRing->InterfaceReserved == FrameRing->ProducerIndex);
 }
@@ -2439,6 +2472,7 @@ XdpGenericRxActivateQueue(
 
     RxQueue->FrameRing = XdpRxQueueGetFrameRing(Config);
     RxQueue->FragmentRing = XdpRxQueueGetFragmentRing(Config);
+    RxQueue->Flags.CpuMapRedirectEnabled = XdpRxQueueIsCpuMapRedirectEnabled(Config);
     RxQueue->Flags.ChecksumOffloadEnabled = XdpRxQueueIsChecksumOffloadEnabled(Config);
     RxQueue->Flags.TimestampOffloadEnabled = XdpRxQueueIsTimestampOffloadEnabled(Config);
 
@@ -2454,6 +2488,13 @@ XdpGenericRxActivateQueue(
         &ExtensionInfo, XDP_FRAME_EXTENSION_RX_ACTION_NAME,
         XDP_FRAME_EXTENSION_RX_ACTION_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
     XdpRxQueueGetExtension(Config, &ExtensionInfo, &RxQueue->RxActionExtension);
+
+    if (RxQueue->Flags.CpuMapRedirectEnabled) {
+        XdpInitializeExtensionInfo(
+            &ExtensionInfo, XDP_FRAME_EXTENSION_CPUMAP_REDIRECT_NAME,
+            XDP_FRAME_EXTENSION_CPUMAP_REDIRECT_VERSION_1, XDP_EXTENSION_TYPE_FRAME);
+        XdpRxQueueGetExtension(Config, &ExtensionInfo, &RxQueue->CpuMapRedirectExtension);
+    }
 
     XdpInitializeExtensionInfo(
         &ExtensionInfo, XDP_FRAME_EXTENSION_FRAGMENT_NAME,

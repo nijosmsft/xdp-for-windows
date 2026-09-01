@@ -1007,7 +1007,8 @@ XdpInspect(
     _In_opt_ XDP_RING *FragmentRing,
     _In_opt_ XDP_EXTENSION *FragmentExtension,
     _In_ UINT32 FragmentIndex,
-    _In_ XDP_EXTENSION *VirtualAddressExtension
+    _In_ XDP_EXTENSION *VirtualAddressExtension,
+    _In_opt_ XDP_EXTENSION *CpuMapRedirectExtension
     )
 {
     XDP_RX_ACTION Action = XDP_RX_ACTION_PASS;
@@ -1015,6 +1016,8 @@ XdpInspect(
     XDP_FRAME *Frame;
     BOOLEAN Matched = FALSE;
     XDP_PCW_RX_QUEUE *RxQueueStats = XdpRxQueueGetStatsFromInspectionContext(InspectionContext);
+
+    UNREFERENCED_PARAMETER(CpuMapRedirectExtension);
 
     ASSERT(FrameIndex <= FrameRing->Mask);
     ASSERT(

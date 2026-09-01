@@ -338,6 +338,9 @@ VOID
 GenericXskQueryAffinity();
 
 VOID
+NativeRxXskNoCpuMapFrameLayout();
+
+VOID
 OffloadQeoConnection();
 
 typedef enum _REVERT_REASON {
