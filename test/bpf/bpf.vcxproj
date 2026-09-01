@@ -7,6 +7,16 @@
     <ImportEbpf>true</ImportEbpf>
   </PropertyGroup>
   <Import Project="$(SolutionDir)src\xdp.cpp.props" />
+  <!--
+    BPF_MAP_TYPE_CPUMAP is an enumerator of ebpf_map_type_t, so no #ifndef in C
+    can detect whether the eBPF package declares it. This is the SAME guard,
+    keyed to the SAME condition, as the driver's in src/xdp/xdp.vcxproj: one
+    story about the value, and both unwind together the moment XdpEbpfVersion in
+    src/xdp.props advances. See src/xdp/ebpfmap.h and test/bpf/cpumap_redirect.c.
+  -->
+  <PropertyGroup Condition="'$(XdpEbpfVersion)' == '1.4.0'">
+    <ClangCpuMapDefines>-D XDP_EBPF_LEGACY_NO_CPUMAP_TYPE=1</ClangCpuMapDefines>
+  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="$(SolutionDir)src\bpfexport\bpfexport.vcxproj">
       <Project>{8f8830ff-1648-4772-87ed-f5da091fc931}</Project>
@@ -23,7 +33,7 @@
       <FileType>CppCode</FileType>
       <Outputs>$(OutDir)%(Filename).sys</Outputs>
       <Command>
-        clang -g -target bpf -O2 -Werror $(ClangIncludes) -I $(SolutionDir)published\external -c %(Filename).c -o $(OutDir)%(Filename).o
+        clang -g -target bpf -O2 -Werror $(ClangIncludes) $(ClangCpuMapDefines) -I $(SolutionDir)published\external -c %(Filename).c -o $(OutDir)%(Filename).o
         pushd $(OutDir)
         powershell -NonInteractive -ExecutionPolicy Unrestricted $(EbpfHostBinPath)\Convert-BpfToNative.ps1 -FileName %(Filename) -IncludeDir $(EbpfIncludePath) -Platform $(Platform) -Configuration $(Configuration) -KernelMode $true
         rmdir /s /q $(OutDir)\%(Filename)_km
