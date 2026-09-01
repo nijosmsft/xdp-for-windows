@@ -217,7 +217,140 @@ XdpCpuMapQueryHelperStats(
         Stats->RedirectModeUnsupported +=
             ReadULong64NoFence(&Current->RedirectModeUnsupported);
         Stats->HelperTargetInactive += ReadULong64NoFence(&Current->HelperTargetInactive);
+        Stats->CommitPauseRejected += ReadULong64NoFence(&Current->CommitPauseRejected);
+        Stats->CommitRundownRejected += ReadULong64NoFence(&Current->CommitRundownRejected);
+        Stats->CommitBatchInsertFailed += ReadULong64NoFence(&Current->CommitBatchInsertFailed);
     }
+}
+
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordCommitReject(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _In_ XDP_CPUMAP_COMMIT_REJECT_REASON Reason
+    )
+{
+    XDP_CPUMAP_HELPER_STATS *Stats = XdpCpuMapGetCurrentHelperStats(CpuMap);
+    volatile ULONG64 *Counter = NULL;
+
+    switch (Reason) {
+    case XdpCpuMapCommitRejectPause:
+        Counter = &Stats->CommitPauseRejected;
+        break;
+    case XdpCpuMapCommitRejectRundown:
+        Counter = &Stats->CommitRundownRejected;
+        break;
+    case XdpCpuMapCommitRejectBatchInsertFailed:
+        Counter = &Stats->CommitBatchInsertFailed;
+        break;
+    default:
+        ASSERT(FALSE);
+        return;
+    }
+
+    (*Counter)++;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+BOOLEAN
+XdpCpuMapCommitRedirect(
+    _Inout_ XDP_FRAME_CPUMAP_REDIRECT_V1 *Redirect,
+    _In_opt_ const NET_BUFFER_LIST *ActionNbl,
+    _In_ BOOLEAN RxQueuePaused,
+    _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
+    )
+{
+    XDP_CPUMAP *CpuMap = Redirect->CpuMap;
+    XDP_CPUMAP_TARGET *Target = Redirect->Target;
+    BOOLEAN RedirectReferencesHeld;
+    BOOLEAN NblRundownCreditHeld = FALSE;
+
+    //
+    // Two independent questions, deliberately not conflated.
+    //
+    // First: does this metadata own helper references? That is decided purely by
+    // the metadata, never by the caller's NBL state. An earlier revision folded
+    // the ActionNbl check into this test, so a frame with valid metadata but a
+    // NULL ActionNbl was zeroed WITHOUT releasing the target rundown and backing
+    // reference it genuinely held. A leaked rundown reference is exactly what
+    // deadlocks ExWaitForRundownProtectionRelease at queue teardown.
+    //
+    RedirectReferencesHeld =
+        Redirect->Size == sizeof(*Redirect) &&
+        Redirect->Version == XDP_FRAME_CPUMAP_REDIRECT_VERSION_1 &&
+        (Redirect->Flags & XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_PENDING) != 0 &&
+        (Redirect->Flags & XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_COMMITTED) == 0 &&
+        CpuMap != NULL &&
+        Target != NULL;
+
+    //
+    // Section 6.3 step 1: every one of these is guaranteed by the helper, so
+    // each is a broken invariant rather than a runtime condition, and each
+    // asserts independently in checked builds. Retail still falls through to
+    // Reject and releases whatever the metadata legitimately owns.
+    //
+    // Asserting the conjunction alone is not sufficient: it cannot distinguish
+    // "metadata never came from the helper" from "helper metadata arrived with a
+    // NULL ActionNbl", which are different defects with different causes.
+    //
+    ASSERT(Redirect->Size == sizeof(*Redirect));
+    ASSERT(Redirect->Version == XDP_FRAME_CPUMAP_REDIRECT_VERSION_1);
+    ASSERT((Redirect->Flags & XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_PENDING) != 0);
+    ASSERT((Redirect->Flags & XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_COMMITTED) == 0);
+    ASSERT(CpuMap != NULL);
+    ASSERT(Target != NULL);
+    ASSERT(ActionNbl != NULL);
+
+    if (!RedirectReferencesHeld || ActionNbl == NULL) {
+        goto Reject;
+    }
+
+    if (RxQueuePaused) {
+        XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectPause);
+        goto Reject;
+    }
+
+    //
+    // Section 6.3 requires rundown acquisition to be batched once per flush
+    // group, not taken per packet. The group hands out pre-acquired credits, so
+    // the common case costs no interlocked operation at all; only an exhausted
+    // group touches the shared rundown.
+    //
+    if (!XdpCpuMapCommitGroupTakeCredit(Group)) {
+        XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectRundown);
+        goto Reject;
+    }
+    NblRundownCreditHeld = TRUE;
+
+    //
+    // Increment 5 has no CPUMAP batch object yet, so the section 6.3 step-4
+    // insert cannot succeed. That is a legitimate batch-add failure and is
+    // routed through the step-5 reject path, which keeps all three reject paths
+    // reachable and the exactly-once release discipline testable now. Increment
+    // 6 replaces only this failed insert with the real batch add.
+    //
+    XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectBatchInsertFailed);
+
+Reject:
+
+    //
+    // Returning the credit is a plain decrement against group-local state. The
+    // group releases whatever remains unconsumed in a single interlocked
+    // operation when the flush group ends.
+    //
+    if (NblRundownCreditHeld) {
+        XdpCpuMapCommitGroupReturnCredit(Group);
+    }
+
+    if (RedirectReferencesHeld) {
+        XdpCpuMapReleaseTargetReference(Target);
+        XdpCpuMapReleaseBacking(CpuMap);
+    }
+
+    RtlZeroMemory(Redirect, sizeof(*Redirect));
+    return FALSE;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)

@@ -384,6 +384,20 @@ RtlReleasePushLockShared(
 // single-threaded harness a nonzero count at wait time is a guaranteed deadlock
 // in the kernel, so asserting is strictly better than hanging.
 //
+// The Ex variants additionally count CALLS, not just references. Reference
+// totals cannot distinguish a batched flush group from per-packet acquisition --
+// both end at the same count -- so the number of trips to the shared rundown is
+// the only observable that proves batching. Only the Ex variants are counted:
+// within this harness they are reached exclusively from
+// XdpCpuMapCommitGroupTakeCredit and XdpCpuMapCommitGroupFinish, whereas the
+// non-Ex variants serve per-target PacketRundown references and would pollute
+// the signal. XdpCpuMapTestRundownAcquireCalls counts ATTEMPTS, so a failed
+// acquire against an active rundown still increments it. Neither counter resets
+// itself; a test that reads them zeroes them first.
+//
+
+extern ULONG XdpCpuMapTestRundownAcquireCalls;
+extern ULONG XdpCpuMapTestRundownReleaseCalls;
 
 typedef struct _EX_RUNDOWN_REF {
     LONG Count;
@@ -415,6 +429,23 @@ ExAcquireRundownProtection(
 }
 
 FORCEINLINE
+BOOLEAN
+ExAcquireRundownProtectionEx(
+    _Inout_ EX_RUNDOWN_REF *RunRef,
+    _In_ ULONG Count
+    )
+{
+    XdpCpuMapTestRundownAcquireCalls++;
+
+    if (RunRef->RundownActive) {
+        return FALSE;
+    }
+
+    RunRef->Count += Count;
+    return TRUE;
+}
+
+FORCEINLINE
 VOID
 ExReleaseRundownProtection(
     _Inout_ EX_RUNDOWN_REF *RunRef
@@ -422,6 +453,19 @@ ExReleaseRundownProtection(
 {
     XDPCPUMAP_TEST_ASSERT(RunRef->Count > 0);
     RunRef->Count--;
+}
+
+FORCEINLINE
+VOID
+ExReleaseRundownProtectionEx(
+    _Inout_ EX_RUNDOWN_REF *RunRef,
+    _In_ ULONG Count
+    )
+{
+    XdpCpuMapTestRundownReleaseCalls++;
+
+    XDPCPUMAP_TEST_ASSERT(RunRef->Count >= (LONG)Count);
+    RunRef->Count -= Count;
 }
 
 FORCEINLINE

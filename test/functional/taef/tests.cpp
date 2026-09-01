@@ -417,6 +417,10 @@ public:
         GenericXskWaitAsync(TRUE, TRUE);
     }
 
+    TEST_METHOD(NativeRxXskNoCpuMapFrameLayout) {
+        ::NativeRxXskNoCpuMapFrameLayout();
+    }
+
     TEST_METHOD(GenericLwfDelayDetachRx) {
         GenericLwfDelayDetach(TRUE, FALSE);
     }

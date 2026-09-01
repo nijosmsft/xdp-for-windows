@@ -13,6 +13,8 @@ typedef struct _XDP_EBPF_MAP_CONTEXT_OFFSET {
 typedef struct _XDP_CPUMAP_REDIRECT_CONTEXT {
     XDP_CPUMAP *CpuMap;
     XDP_CPUMAP_TARGET *CpuMapTarget;
+    UINT32 TargetKey;
+    UINT32 TargetCpu;
 } XDP_CPUMAP_REDIRECT_CONTEXT;
 
 static
@@ -149,6 +151,9 @@ XdpCpuMapClearRedirectContext(
         XdpCpuMapReleaseBacking(Redirect->CpuMap);
         Redirect->CpuMap = NULL;
     }
+
+    Redirect->TargetKey = 0;
+    Redirect->TargetCpu = 0;
 }
 
 static
@@ -175,6 +180,23 @@ XdpCpuMapRedirectMap(
         return FallbackAction;
     }
 
+    //
+    // Key comes straight from the eBPF program and is unconstrained. A CPUMAP
+    // key is XDP_CPUMAP_KEY (UINT32), and the base-map lookup below reads only
+    // that many bytes, so a key with nonzero upper bits would silently alias the
+    // low 32 bits onto a configured slot. Reject it here, BEFORE the lookup and
+    // before any reference is acquired.
+    //
+    // This must not be an assertion. Program input is untrusted: a checked
+    // xdp.sys with no kernel debugger attached fail-fasts the machine, which a
+    // loaded BPF program could then trigger at will.
+    //
+    if (Key > MAXUINT32) {
+        XdpCpuMapRecordHelperFallback(
+            CpuMap, XdpCpuMapHelperFallbackRedirectSlotUnconfigured);
+        return FallbackAction;
+    }
+
     FindResult = XdpCpuMapFindElementFromBaseMap(Map, CpuMap, &Key, &CpuMapValue);
     if (FindResult != EBPF_SUCCESS ||
         CpuMapValue == NULL ||
@@ -196,6 +218,8 @@ XdpCpuMapRedirectMap(
     XdpCpuMapRecordHelperSuccess(CpuMap);
     Redirect->CpuMap = CpuMap;
     Redirect->CpuMapTarget = CpuMapValue->Target;
+    Redirect->TargetKey = (UINT32)Key;
+    Redirect->TargetCpu = CpuMapValue->Target->AbsoluteCpu;
     return XDP_REDIRECT;
 }
 

@@ -70,6 +70,8 @@ XDP_EXTENSION VirtualAddressExtension = {
     .Reserved = FIELD_OFFSET(XDP_BUFFER_WITH_EXTENSIONS, BufferVirtualAddress)
 };
 
+XDP_EXTENSION CpuMapRedirectExtension = {0};
+
 #pragma warning(suppress:6262) // Using a LOT of stack space
 int
 LLVMFuzzerTestOneInput(
@@ -190,7 +192,8 @@ LLVMFuzzerTestOneInput(
 
     XdpInspect(
         Program, &InspectionContext, &FrameRing.Ring, FrameRingIndex, FragmentRingOption,
-        &FragmentExtension, FragmentRingIndex, &VirtualAddressExtension);
+        &FragmentExtension, FragmentRingIndex, &VirtualAddressExtension,
+        &CpuMapRedirectExtension);
 
     Result = 0;
 

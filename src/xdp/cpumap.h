@@ -134,6 +134,12 @@ typedef enum _XDP_CPUMAP_HELPER_FALLBACK_REASON {
     XdpCpuMapHelperFallbackTargetInactive,
 } XDP_CPUMAP_HELPER_FALLBACK_REASON;
 
+typedef enum _XDP_CPUMAP_COMMIT_REJECT_REASON {
+    XdpCpuMapCommitRejectPause,
+    XdpCpuMapCommitRejectRundown,
+    XdpCpuMapCommitRejectBatchInsertFailed,
+} XDP_CPUMAP_COMMIT_REJECT_REASON;
+
 typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_HELPER_STATS {
     volatile ULONG64 Calls;
     volatile ULONG64 Success;
@@ -141,6 +147,9 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_HELPER_STATS {
     volatile ULONG64 RedirectSlotUnconfigured;
     volatile ULONG64 RedirectModeUnsupported;
     volatile ULONG64 HelperTargetInactive;
+    volatile ULONG64 CommitPauseRejected;
+    volatile ULONG64 CommitRundownRejected;
+    volatile ULONG64 CommitBatchInsertFailed;
 } XDP_CPUMAP_HELPER_STATS;
 
 //

@@ -37,7 +37,8 @@ XDP_RX_INSPECT_ROUTINE(
     _In_opt_ XDP_RING *FragmentRing,
     _In_opt_ XDP_EXTENSION *FragmentExtension,
     _In_ UINT32 FragmentIndex,
-    _In_ XDP_EXTENSION *VirtualAddressExtension
+    _In_ XDP_EXTENSION *VirtualAddressExtension,
+    _In_opt_ XDP_EXTENSION *CpuMapRedirectExtension
     );
 
 XDP_RX_INSPECT_ROUTINE XdpInspect;
@@ -78,6 +79,11 @@ BOOLEAN
 XdpProgramCanXskBypass(
     _In_ XDP_PROGRAM *Program,
     _In_ XDP_RX_QUEUE *RxQueue
+    );
+
+BOOLEAN
+XdpProgramCanCpuMapRedirect(
+    _In_ XDP_PROGRAM *Program
     );
 
 XDP_FILE_CREATE_ROUTINE XdpIrpCreateProgram;

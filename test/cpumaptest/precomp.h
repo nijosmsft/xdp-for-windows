@@ -42,8 +42,29 @@ extern DRIVER_OBJECT *XdpDriverObject;
 // ASSERT in the driver is XDP's own; here it must fail the harness rather than
 // break into a debugger that is not attached.
 //
-#define ASSERT(expr) XDPCPUMAP_TEST_ASSERT(expr)
-#define FRE_ASSERT(expr) XDPCPUMAP_TEST_ASSERT(expr)
+// Some tests deliberately drive paths whose checked-build assertions are the
+// behaviour under test — a poisoned frame with invalid metadata, for example,
+// must assert in checked builds AND still clean up safely in retail. Those
+// tests set XdpCpuMapTestExpectAssert to count the assertion instead of failing
+// on it, so the retail cleanup path stays reachable in the harness.
+//
+extern ULONG XdpCpuMapTestExpectAssert;
+extern ULONG XdpCpuMapTestAssertsObserved;
+
+#define XDPCPUMAP_DRIVER_ASSERT(expr) \
+    do { \
+        if (!(expr)) { \
+            if (XdpCpuMapTestExpectAssert) { \
+                XdpCpuMapTestAssertsObserved++; \
+            } else { \
+                XDPCPUMAP_TEST_ASSERT(expr); \
+            } \
+        } \
+        _Analysis_assume_(expr); \
+    } while (0)
+
+#define ASSERT(expr) XDPCPUMAP_DRIVER_ASSERT(expr)
+#define FRE_ASSERT(expr) XDPCPUMAP_DRIVER_ASSERT(expr)
 
 //
 // XDP_EBPF_MAP_HEADER, copied rather than included: src/xdp/ebpfmap.h pulls the

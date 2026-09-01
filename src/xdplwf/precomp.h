@@ -45,6 +45,7 @@
 #include <xdpchecksum.h>
 #include <xdpetw.h>
 #include <xdpif.h>
+#include <xdpcpumap.h>
 #include <xdplifetime.h>
 #include <xdplwf.h>
 #include <xdppcw.h>

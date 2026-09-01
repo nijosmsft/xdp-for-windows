@@ -7,12 +7,43 @@
 
 #include "ec.h"
 
+//
+// Paused is a dedicated first byte, not a bitfield, because the CPUMAP commit
+// path is the first receive-path reader and it needs an acquire load of the
+// published pause state. The remaining flags stay bitfields because they do not
+// have cross-thread acquire/release semantics here.
+//
+// Keep the offset assert adjacent to the definition. If a later refactor inserts
+// anything before Paused, the build must fail rather than silently moving the
+// pause gate to a different byte.
+//
+#define XDP_LWF_GENERIC_RX_QUEUE_FLAG_PAUSED_OFFSET 0u
+
+typedef struct _XDP_LWF_GENERIC_RX_QUEUE_FLAGS {
+    volatile BOOLEAN Paused;
+    struct {
+        BOOLEAN TxInspect : 1;
+        BOOLEAN TxInspectInline: 1;
+        BOOLEAN TxInspectWorker : 1;
+        BOOLEAN TxInspectNeedFlush : 1;
+        BOOLEAN ChecksumOffloadEnabled : 1;
+        BOOLEAN TimestampOffloadEnabled : 1;
+        BOOLEAN CpuMapRedirectEnabled : 1;
+    };
+} XDP_LWF_GENERIC_RX_QUEUE_FLAGS;
+
+C_ASSERT(
+    FIELD_OFFSET(XDP_LWF_GENERIC_RX_QUEUE_FLAGS, Paused) ==
+    XDP_LWF_GENERIC_RX_QUEUE_FLAG_PAUSED_OFFSET);
+C_ASSERT(sizeof(XDP_LWF_GENERIC_RX_QUEUE_FLAGS) == 2);
+
 typedef struct _XDP_LWF_GENERIC_RX_QUEUE {
     XDP_RX_QUEUE_HANDLE XdpRxQueue;
     XDP_RING *FrameRing;
     XDP_RING *FragmentRing;
     XDP_EXTENSION BufferVaExtension;
     XDP_EXTENSION RxActionExtension;
+    XDP_EXTENSION CpuMapRedirectExtension;
     XDP_EXTENSION FragmentExtension;
     XDP_EXTENSION FrameInterfaceContextExtension;
     XDP_EXTENSION FrameLayoutExtension;
@@ -64,15 +95,7 @@ typedef struct _XDP_LWF_GENERIC_RX_QUEUE {
     NBL_QUEUE TxInspectPollNblQueue;
 
     XDP_LWF_GENERIC *Generic;
-    struct {
-        BOOLEAN Paused : 1;
-        BOOLEAN TxInspect : 1;
-        BOOLEAN TxInspectInline: 1;
-        BOOLEAN TxInspectWorker : 1;
-        BOOLEAN TxInspectNeedFlush : 1;
-        BOOLEAN ChecksumOffloadEnabled : 1;
-        BOOLEAN TimestampOffloadEnabled : 1;
-    } Flags;
+    XDP_LWF_GENERIC_RX_QUEUE_FLAGS Flags;
     UINT32 QueueId;
     LIST_ENTRY Link;
     PCW_INSTANCE *PcwInstance;
