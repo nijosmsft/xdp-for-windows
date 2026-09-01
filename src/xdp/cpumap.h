@@ -38,14 +38,15 @@
 typedef struct _XDP_CPUMAP XDP_CPUMAP;
 
 //
-// One ring entry. Nothing writes these yet: the data path is a later increment.
-// The layout is fixed now because the cap accounting charges sizeof() at map
-// update time and must not change once maps can be created.
+// One ring entry.
+//
+// The layout is charged by sizeof() at map update time, so it must not change
+// once maps can be created in a shipped build.
 //
 // A slot owns exactly three things: the NBL, the CPUMAP backing reference, and
-// the receive queue's NBL rundown reference. It owns NO target rundown
-// reference; the producer's single per-packet reference stays with the flush
-// group. An entry with Nbl == NULL is a tombstone and owns NOTHING.
+// one receive-queue NBL rundown reference. It owns NO target rundown reference;
+// the producer's single per-packet reference stays with the flush group. An
+// entry with Nbl == NULL is a tombstone and owns NOTHING.
 //
 typedef struct _XDP_CPUMAP_ENTRY {
     NET_BUFFER_LIST *Nbl;
@@ -59,6 +60,15 @@ typedef struct _XDP_CPUMAP_ENTRY {
     const VOID *GenericOwner;
 
     XDP_CPUMAP *BackingRef;
+
+    //
+    // The receive queue's NBL rundown, carried explicitly because the queue
+    // itself is only an opaque token here. The slot owns exactly one reference
+    // on it, and the object stays alive precisely because the slot owns it:
+    // XdpGenericRxDeleteQueueEntry runs only after the rundown wait completes.
+    //
+    EX_RUNDOWN_REF *NblRundown;
+
     NDIS_PORT_NUMBER PortNumber;
     BOOLEAN IsDeepCopy;
 } XDP_CPUMAP_ENTRY;
@@ -69,6 +79,17 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_RING {
     UINT32 Tail;
     UINT32 Capacity;
     UINT32 Mask;
+
+    //
+    // High-water occupancy. Read and written ONLY under Lock, which the
+    // producer and the consumer both already hold when they touch Head or Tail,
+    // so it costs no atomic and shares no discipline with anything else. This
+    // is deliberately the only counter in the hot ring structure; POC A's
+    // sixteen inline counters with mixed update discipline are not copied
+    // (design section 7.1).
+    //
+    UINT32 MaxDepth;
+
     XDP_CPUMAP_ENTRY Entries[ANYSIZE_ARRAY];
 } XDP_CPUMAP_RING;
 
@@ -134,22 +155,131 @@ typedef enum _XDP_CPUMAP_HELPER_FALLBACK_REASON {
     XdpCpuMapHelperFallbackTargetInactive,
 } XDP_CPUMAP_HELPER_FALLBACK_REASON;
 
+//
+// Quiesce instrumentation. The open architectural risk in this design is pause
+// latency, and the bound claimed is one pointer comparison per ring entry
+// bounded by XDP_CPUMAP_GLOBAL_MAX_RING_ENTRIES and XDP_CPUMAP_MAX_LIVE_MAPS.
+// These counters exist so that bound can be MEASURED rather than asserted, and
+// so that a test can assert the scan's SHAPE deterministically rather than
+// through a wall-clock threshold. They are traced at the end of every quiesce.
+//
+typedef struct _XDP_CPUMAP_QUIESCE_STATS {
+    volatile LONG64 Count;
+    volatile LONG64 MapsVisited;
+    volatile LONG64 TargetsVisited;
+    volatile LONG64 EntriesScanned;
+    volatile LONG64 Tombstoned;
+    volatile LONG64 PassesTotal;
+    volatile LONG64 MaxPassesExhausted;
+    volatile LONG64 LastDurationUs;
+    volatile LONG64 MaxDurationUs;
+} XDP_CPUMAP_QUIESCE_STATS;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapQueryQuiesceStats(
+    _Out_ XDP_CPUMAP_QUIESCE_STATS *Stats
+    );
+
+//
+// CPUMAP is RECEIVE-SIDE ONLY, and this is the single predicate that says so.
+//
+// Its drain indicates through NdisFIndicateReceiveNetBufferLists, so a send NBL
+// redirected to another CPU would be injected into the receive path, and the
+// teardown paths would return it to the miniport instead of completing the send.
+// The generic LWF runs outbound sends through the same post-inspection path as
+// receives, and an XDP program may attach to XDP_HOOK_L2/XDP_HOOK_TX, so the
+// exclusion has to be real rather than assumed.
+//
+// It lives here, inline, so that the unit test can evaluate it against a real
+// XDP_HOOK_ID rather than hand-supplying the answer. A test that supplies its
+// own admission value proves nothing about the queue this decision is actually
+// made for.
+//
+FORCEINLINE
+BOOLEAN
+XdpCpuMapIsHookSupported(
+    _In_ CONST XDP_HOOK_ID *HookId
+    )
+{
+    return HookId->Direction == XDP_HOOK_RX;
+}
+
 typedef enum _XDP_CPUMAP_COMMIT_REJECT_REASON {
     XdpCpuMapCommitRejectPause,
     XdpCpuMapCommitRejectRundown,
-    XdpCpuMapCommitRejectBatchInsertFailed,
+    XdpCpuMapCommitRejectDeepCopyUnsupported,
 } XDP_CPUMAP_COMMIT_REJECT_REASON;
 
+//
+// Flush and drain outcomes that are NOT commit rejections: by the time they are
+// reached, ownership has been committed and ActionNbl cleared, so the packet is
+// unconditionally lost rather than falling back to an RX action (section 12).
+//
+typedef enum _XDP_CPUMAP_ENQUEUE_DROP_REASON {
+    XdpCpuMapEnqueueDropTargetInactive,
+    XdpCpuMapEnqueueDropRingFull,
+} XDP_CPUMAP_ENQUEUE_DROP_REASON;
+
+//
+// Per-map, per-processor data-path counter shard: helper, ownership commit,
+// ring enqueue, and DPC drain.
+//
+// Every field here is written by the DISPATCH_LEVEL data path on the shard
+// belonging to the CURRENT processor, which has exactly one running writer, so
+// they are ordinary increments rather than locked read-modify-writes. Readers
+// aggregate all shards with aligned 64-bit loads; the result is a coherent
+// monotonic total, not a stop-the-world snapshot. Teardown counters, whose
+// writers run at PASSIVE_LEVEL and can be preempted, do NOT live here -- see
+// XDP_CPUMAP_QUIESCE_STATS and XDP_CPUMAP_SWEEP_STATS in cpumap.c.
+//
 typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_HELPER_STATS {
+    //
+    // Helper FALLBACK REASONS. These record why bpf_redirect_map declined to set
+    // a redirect intent, and the packet's outcome is the program's DECLARED
+    // fallback action -- XDP_PASS, XDP_DROP or XDP_TX. They are the only
+    // counters in this block that are not loss counters.
+    //
     volatile ULONG64 Calls;
     volatile ULONG64 Success;
     volatile ULONG64 HelperBadFlags;
     volatile ULONG64 RedirectSlotUnconfigured;
     volatile ULONG64 RedirectModeUnsupported;
     volatile ULONG64 HelperTargetInactive;
-    volatile ULONG64 CommitPauseRejected;
-    volatile ULONG64 CommitRundownRejected;
-    volatile ULONG64 CommitBatchInsertFailed;
+
+    //
+    // Commit-time outcomes. Every one of these is a DROP, not a fallback.
+    // XdpInvokeEbpf converts a successful XDP_REDIRECT into XDP_RX_ACTION_DROP
+    // before post-inspection runs, so by commit time "the normal RX action" for
+    // such a frame IS drop and the program's declared fallback is no longer
+    // reachable. None of these may be presented as a fallback counter.
+    //
+    volatile ULONG64 CommitPauseDrop;
+    volatile ULONG64 CommitRundownDrop;
+
+    //
+    // Low-resource indication with no deep-copy pool. Its own counter because,
+    // unlike the two above, it is a CAPABILITY gap rather than a transient
+    // state, and increment 8 removes it entirely by adding the pool.
+    //
+    volatile ULONG64 DeepCopyUnsupportedDrop;
+
+    //
+    // Enqueue. Also drops, for the same reason.
+    //
+    volatile ULONG64 EnqueueCount;
+    volatile ULONG64 EnqueueTargetInactive;
+    volatile ULONG64 RingFullCount;
+
+    //
+    // Drain.
+    //
+    volatile ULONG64 DrainCount;
+    volatile ULONG64 DrainTombstoneCount;
+    volatile ULONG64 IndicateChainCount;
+    volatile ULONG64 DpcInvokeCount;
+    volatile ULONG64 DpcRequeueCount;
+    volatile ULONG64 DpcEmptyCount;
 } XDP_CPUMAP_HELPER_STATS;
 
 //

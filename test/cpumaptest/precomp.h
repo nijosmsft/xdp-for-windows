@@ -28,6 +28,7 @@
 #include <stubs/xdpworkqueue.h>
 
 #include <xdp/ebpfhook.h>
+#include <xdp/hookid.h>
 #include <xdpifmode.h>
 
 #define XDP_POOLTAG_CPUMAP 'mCdX'

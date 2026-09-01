@@ -5,18 +5,20 @@
 
 //
 // CPUMAP engine: target lifetime, resource accounting, the retire sweep, the
-// live-map registry, and quiesce.
+// live-map registry, quiesce, and the packet data path.
 //
 // This module owns everything about a CPUMAP that is not the eBPF provider
 // surface. The provider callbacks live in ebpfcpumap.c and call in here.
 //
-// Increment scope: control plane plus helper target-reference acquire/release.
-// Rings and DPCs are allocated, charged, targeted, retired and quiesced. The
-// helper may pin a target with PacketRundown, but nothing enqueues to a ring
-// yet, so XdpCpuMapDrainDpc is a stub and every production ring is empty. The
-// quiesce scan is fully implemented regardless, because its cost is one pointer
-// comparison per ring entry across every live map -- a property of the SCAN, not
-// of occupancy -- and is therefore measurable with empty rings.
+// Increment scope: the generic data path. The helper pins a target, the
+// ownership commit accumulates the packet into a per-flush batch, the flush
+// performs the six-step enqueue of design section 7, and the target CPU's DPC
+// drains the ring and indicates. Deep copy is not implemented: a low-resource
+// indication makes the commit decline ownership, counted, and the packet is
+// dropped by the caller's already-decided RX action until the per-receive-queue
+// pool lands. Like every commit-time outcome that is a drop, not a fallback --
+// XdpInvokeEbpf converts XDP_REDIRECT to XDP_RX_ACTION_DROP before
+// post-inspection runs, so no declared fallback action remains.
 //
 // Lock ordering (design section 8.3). Two disjoint chains sharing Ring->Lock as
 // a common leaf; they are never both held:
@@ -68,6 +70,14 @@ XdpCpuMapGetPoolChargeSize(
         ~((SIZE_T)MEMORY_ALLOCATION_ALIGNMENT - 1);
 }
 
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapReleaseBackingRefs(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _In_ LONG Count
+    );
+
 //
 // One retire work queue for every map, owned by this module rather than by any
 // map, so a map being destroyed never has to tear down the queue that is
@@ -89,19 +99,21 @@ static XDP_WORK_QUEUE *XdpCpuMapRetireQueue;
 // These counters exist so that bound can be MEASURED rather than asserted; they
 // are traced at the end of every quiesce.
 //
-typedef struct _XDP_CPUMAP_QUIESCE_STATS {
-    volatile LONG64 Count;
-    volatile LONG64 MapsVisited;
-    volatile LONG64 TargetsVisited;
-    volatile LONG64 EntriesScanned;
-    volatile LONG64 Tombstoned;
-    volatile LONG64 PassesTotal;
-    volatile LONG64 MaxPassesExhausted;
-    volatile LONG64 LastDurationUs;
-    volatile LONG64 MaxDurationUs;
-} XDP_CPUMAP_QUIESCE_STATS;
 
+//
+// Quiesce instrumentation; the counter block is declared in cpumap.h so tests
+// and diagnostics can read it.
+//
 static XDP_CPUMAP_QUIESCE_STATS XdpCpuMapQuiesceStats;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapQueryQuiesceStats(
+    _Out_ XDP_CPUMAP_QUIESCE_STATS *Stats
+    )
+{
+    *Stats = XdpCpuMapQuiesceStats;
+}
 
 //
 // Sweep instrumentation. EmptySweepCount and RetireCheckNoOp are DIFFERENT
@@ -112,6 +124,16 @@ static XDP_CPUMAP_QUIESCE_STATS XdpCpuMapQuiesceStats;
 typedef struct _XDP_CPUMAP_SWEEP_STATS {
     volatile LONG64 EmptySweepCount;
     volatile LONG64 RetireCheckNoOp;
+
+    //
+    // Packets returned to the miniport WITHOUT indication because their target
+    // retired while its ring still held them (section 8.3, "Delivery on
+    // retire"). Interlocked rather than sharded: the retire worker runs at
+    // PASSIVE_LEVEL, where it can be preempted and migrated, so the
+    // one-writer-per-shard property the data-path counters rely on does not
+    // hold here.
+    //
+    volatile LONG64 RetireDropCount;
 } XDP_CPUMAP_SWEEP_STATS;
 
 static XDP_CPUMAP_SWEEP_STATS XdpCpuMapSweepStats;
@@ -217,9 +239,19 @@ XdpCpuMapQueryHelperStats(
         Stats->RedirectModeUnsupported +=
             ReadULong64NoFence(&Current->RedirectModeUnsupported);
         Stats->HelperTargetInactive += ReadULong64NoFence(&Current->HelperTargetInactive);
-        Stats->CommitPauseRejected += ReadULong64NoFence(&Current->CommitPauseRejected);
-        Stats->CommitRundownRejected += ReadULong64NoFence(&Current->CommitRundownRejected);
-        Stats->CommitBatchInsertFailed += ReadULong64NoFence(&Current->CommitBatchInsertFailed);
+        Stats->CommitPauseDrop += ReadULong64NoFence(&Current->CommitPauseDrop);
+        Stats->CommitRundownDrop += ReadULong64NoFence(&Current->CommitRundownDrop);
+        Stats->DeepCopyUnsupportedDrop +=
+            ReadULong64NoFence(&Current->DeepCopyUnsupportedDrop);
+        Stats->EnqueueCount += ReadULong64NoFence(&Current->EnqueueCount);
+        Stats->EnqueueTargetInactive += ReadULong64NoFence(&Current->EnqueueTargetInactive);
+        Stats->RingFullCount += ReadULong64NoFence(&Current->RingFullCount);
+        Stats->DrainCount += ReadULong64NoFence(&Current->DrainCount);
+        Stats->DrainTombstoneCount += ReadULong64NoFence(&Current->DrainTombstoneCount);
+        Stats->IndicateChainCount += ReadULong64NoFence(&Current->IndicateChainCount);
+        Stats->DpcInvokeCount += ReadULong64NoFence(&Current->DpcInvokeCount);
+        Stats->DpcRequeueCount += ReadULong64NoFence(&Current->DpcRequeueCount);
+        Stats->DpcEmptyCount += ReadULong64NoFence(&Current->DpcEmptyCount);
     }
 }
 
@@ -236,13 +268,13 @@ XdpCpuMapRecordCommitReject(
 
     switch (Reason) {
     case XdpCpuMapCommitRejectPause:
-        Counter = &Stats->CommitPauseRejected;
+        Counter = &Stats->CommitPauseDrop;
         break;
     case XdpCpuMapCommitRejectRundown:
-        Counter = &Stats->CommitRundownRejected;
+        Counter = &Stats->CommitRundownDrop;
         break;
-    case XdpCpuMapCommitRejectBatchInsertFailed:
-        Counter = &Stats->CommitBatchInsertFailed;
+    case XdpCpuMapCommitRejectDeepCopyUnsupported:
+        Counter = &Stats->DeepCopyUnsupportedDrop;
         break;
     default:
         ASSERT(FALSE);
@@ -252,18 +284,202 @@ XdpCpuMapRecordCommitReject(
     (*Counter)++;
 }
 
+//
+// Flush the batch. Design section 7, "Batch enqueue": six steps, in this order,
+// once per unique target in the batch.
+//
+// Every entry in the batch already carries ONE helper-acquired
+// Target->PacketRundown reference, and the group holds them all until step 6.
+// That ordering is precisely what makes the KeInsertQueueDpc in step 5 safe
+// without a separate producer reference: while the group still holds a
+// reference, the retire path's ExWaitForRundownProtectionRelease cannot have
+// completed, so Dpc cannot have been freed. An earlier design revision
+// introduced a distinct producer reference and could not say when it was
+// released; ordering step 6 after step 5 makes it unnecessary.
+//
+// The ring lock is taken ONCE PER TARGET, not once per packet (section 7.1),
+// and it is an in-stack queued lock so that many contending source CPUs are
+// served FIFO without bouncing one cache line.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapFlushBatch(
+    _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
+    )
+{
+    for (UINT32 First = 0; First < Group->Count; First++) {
+        XDP_CPUMAP_TARGET *Target = Group->Entries[First].Target;
+        XDP_CPUMAP *CpuMap;
+        XDP_CPUMAP_HELPER_STATS *Stats;
+        XDP_CPUMAP_RING *Ring;
+        KLOCK_QUEUE_HANDLE LockHandle;
+        UINT32 Held = 0;
+        UINT32 Enqueued = 0;
+        UINT32 RingFull = 0;
+        UINT32 Inactive = 0;
+        BOOLEAN Active;
+
+        //
+        // A NULL target marks an entry that an earlier target group in this
+        // same flush has already consumed.
+        //
+        if (Target == NULL) {
+            continue;
+        }
+
+        CpuMap = Group->Entries[First].CpuMap;
+        Ring = Target->Ring;
+        Stats = XdpCpuMapGetCurrentHelperStats(CpuMap);
+
+        //
+        // Step 1.
+        //
+        KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+
+        //
+        // Step 2. The re-check is against the TARGET, not the selector key. A
+        // key-scoped check is insufficient: an in-place replacement can repoint
+        // a key at a new target while the old one retires, so a still-live key
+        // says nothing about the ring this packet resolved to. The sweep
+        // publishes Target->Active = FALSE under ConfigLock and only then waits
+        // on the rundown, so a producer that acquired before the publish is
+        // forced through the reject path here.
+        //
+        Active = CpuMap->Active && Target->Active;
+
+        //
+        // Step 3. Write the ring slots, transferring the NBL, the CPUMAP
+        // backing reference and the receive queue's NblRundown reference into
+        // each. The target rundown reference is deliberately NOT transferred
+        // (section 8.1a).
+        //
+        for (UINT32 Index = First; Index < Group->Count; Index++) {
+            XDP_CPUMAP_BATCH_ENTRY *BatchEntry = &Group->Entries[Index];
+            XDP_CPUMAP_ENTRY *Slot;
+
+            if (BatchEntry->Target != Target) {
+                continue;
+            }
+
+            ASSERT(BatchEntry->CpuMap == CpuMap);
+            ASSERT(BatchEntry->Nbl != NULL);
+            Held++;
+            BatchEntry->Target = NULL;
+
+            if (!Active || Ring->Tail - Ring->Head >= Ring->Capacity) {
+                //
+                // Ownership was committed and ActionNbl cleared, so there is no
+                // RX action left to fall back to: the original is chained for
+                // return to the miniport and the packet is counted as a drop.
+                // Only pointer stores happen under the lock; the reference
+                // releases are batched below it.
+                //
+                NET_BUFFER_LIST_NEXT_NBL(BatchEntry->Nbl) = Group->RejectedNbls;
+                Group->RejectedNbls = BatchEntry->Nbl;
+                BatchEntry->Nbl = NULL;
+
+                if (!Active) {
+                    Inactive++;
+                } else {
+                    RingFull++;
+                }
+
+                continue;
+            }
+
+            Slot = &Ring->Entries[Ring->Tail & Ring->Mask];
+            Slot->Nbl = BatchEntry->Nbl;
+            Slot->FilterHandle = Group->FilterHandle;
+            Slot->RxQueueOwner = Group->RxQueueOwner;
+            Slot->GenericOwner = Group->GenericOwner;
+            Slot->BackingRef = BatchEntry->CpuMap;
+            Slot->NblRundown = Group->NblRundown;
+            Slot->PortNumber = Group->PortNumber;
+            Slot->IsDeepCopy = FALSE;
+
+            BatchEntry->Nbl = NULL;
+            BatchEntry->CpuMap = NULL;
+
+            Ring->Tail++;
+            Enqueued++;
+        }
+
+        if (Ring->Tail - Ring->Head > Ring->MaxDepth) {
+            Ring->MaxDepth = Ring->Tail - Ring->Head;
+        }
+
+        //
+        // Step 4.
+        //
+        KeReleaseInStackQueuedSpinLock(&LockHandle);
+
+        //
+        // Counters are written HERE, before step 6, while the group still holds
+        // every target rundown reference. That is what keeps Stats -- which
+        // points into CpuMap->HelperStats -- alive: a held target rundown
+        // reference blocks XdpCpuMapRetireTarget's wait, which blocks the sweep
+        // from completing, which keeps the sweep's backing reference held, which
+        // keeps RefCount above zero and HelperStats unfreed.
+        //
+        // Writing them after step 6 is NOT safe, even before the backing release
+        // below. Step 6 unblocks the retire wait; the target can then retire,
+        // the sweep can complete and drop its reference, and if this group's
+        // entries were all enqueued -- so it holds no backing reference of its
+        // own -- the drained ring slots can release the last ones. An earlier
+        // revision of this fix placed the writes between step 6 and the backing
+        // release and left exactly that window open.
+        //
+        Stats->EnqueueCount += Enqueued;
+        Stats->EnqueueTargetInactive += Inactive;
+        Stats->RingFullCount += RingFull;
+
+        //
+        // Step 5. Safe without a producer reference because step 6 has not run.
+        //
+        if (Enqueued > 0) {
+            KeInsertQueueDpc(Target->Dpc, NULL, NULL);
+        }
+
+        //
+        // Step 6. One interlocked operation for the whole target group rather
+        // than one per packet (section 11). Every entry, enqueued or rejected,
+        // released here and only here; section 6.3 step 6 deliberately does not
+        // release it, because that would be a double release.
+        //
+        ASSERT(Held > 0);
+        ExReleaseRundownProtectionEx(&Target->PacketRundown, Held);
+
+        //
+        // The rejected entries' other two references, also batched. A rejected
+        // entry's NblRundown credit returns to the group's pool as plain
+        // group-local state.
+        //
+        // N.B. this is the LAST access to CpuMap in this iteration.
+        //
+        if (Inactive + RingFull > 0) {
+            Group->Credits += Inactive + RingFull;
+            XdpCpuMapReleaseBackingRefs(CpuMap, (LONG)(Inactive + RingFull));
+        }
+    }
+
+    Group->Count = 0;
+}
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 BOOLEAN
 XdpCpuMapCommitRedirect(
     _Inout_ XDP_FRAME_CPUMAP_REDIRECT_V1 *Redirect,
-    _In_opt_ const NET_BUFFER_LIST *ActionNbl,
+    _In_opt_ NET_BUFFER_LIST *ActionNbl,
     _In_ BOOLEAN RxQueuePaused,
+    _In_ BOOLEAN CanPend,
     _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
     )
 {
     XDP_CPUMAP *CpuMap = Redirect->CpuMap;
     XDP_CPUMAP_TARGET *Target = Redirect->Target;
+    XDP_CPUMAP_BATCH_ENTRY *BatchEntry;
     BOOLEAN RedirectReferencesHeld;
     BOOLEAN NblRundownCreditHeld = FALSE;
 
@@ -303,12 +519,43 @@ XdpCpuMapCommitRedirect(
     ASSERT(Target != NULL);
     ASSERT(ActionNbl != NULL);
 
-    if (!RedirectReferencesHeld || ActionNbl == NULL) {
+    //
+    // CPUMAP is receive-side only and the exclusion is structural: a TX-inspect
+    // queue never has CpuMapRedirectEnabled set, so it never registers the frame
+    // extension and no send NBL can reach here. This is therefore a broken
+    // invariant, not a runtime state, and it gets an assertion rather than a
+    // counter -- the same treatment XdpReceive gives CpuMapRedirectEnabled.
+    // Retail falls through to Reject and fails closed.
+    //
+    ASSERT(!Group->TxInspect);
+
+    if (!RedirectReferencesHeld || ActionNbl == NULL || Group->TxInspect) {
         goto Reject;
     }
 
     if (RxQueuePaused) {
         XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectPause);
+        goto Reject;
+    }
+
+    //
+    // Increment 6 carries ORIGINALS ONLY. A low-resource indication cannot lend
+    // its NBL out, and the per-receive-queue deep-copy pool that would replace
+    // it does not exist until increment 8.
+    //
+    // Like every other commit-time outcome this is a DROP, not a fallback:
+    // XdpInvokeEbpf converted the program's XDP_REDIRECT into XDP_RX_ACTION_DROP
+    // before post-inspection ran, so the action this packet falls back to is
+    // already drop and the program's declared fallback is unreachable. What the
+    // commit does is decline ownership -- it releases the metadata's references
+    // and leaves the original with the caller, whose DROP action then returns it
+    // to the miniport exactly once. Counted DeepCopyUnsupportedDrop.
+    //
+    // Decided BEFORE the rundown credit, so a declined packet never touches the
+    // shared rundown.
+    //
+    if (!CanPend) {
+        XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectDeepCopyUnsupported);
         goto Reject;
     }
 
@@ -325,13 +572,42 @@ XdpCpuMapCommitRedirect(
     NblRundownCreditHeld = TRUE;
 
     //
-    // Increment 5 has no CPUMAP batch object yet, so the section 6.3 step-4
-    // insert cannot succeed. That is a legitimate batch-add failure and is
-    // routed through the step-5 reject path, which keeps all three reject paths
-    // reachable and the exactly-once release discipline testable now. Increment
-    // 6 replaces only this failed insert with the real batch add.
+    // Section 6.3 step 4. Flushing a full batch first is what makes the insert
+    // infallible: there is no batch-add failure to unwind, and nothing before
+    // this point has mutated the batch, so steps 2 and 3 have nothing to undo
+    // either.
     //
-    XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectBatchInsertFailed);
+    if (Group->Count == RTL_NUMBER_OF(Group->Entries)) {
+        XdpCpuMapFlushBatch(Group);
+    }
+    ASSERT(Group->Count < RTL_NUMBER_OF(Group->Entries));
+
+    BatchEntry = &Group->Entries[Group->Count++];
+    BatchEntry->Nbl = ActionNbl;
+    BatchEntry->CpuMap = CpuMap;
+    BatchEntry->Target = Target;
+
+    //
+    // The batch now owns all three references. In particular the NblRundown
+    // credit is KEPT rather than returned: it is exactly the reference the ring
+    // slot goes on to own.
+    //
+    // The metadata is then cleared, exactly as the reject path clears it. The
+    // design says to set OWNERSHIP_COMMITTED; leaving OWNERSHIP_PENDING set
+    // alongside it would leave a frame-ring slot advertising a pending redirect
+    // AND holding CpuMap/Target pointers this frame no longer has references on.
+    // Frame ring slots are reused constantly, and stale frame metadata is the
+    // mechanism that hung the test machine twice in increment 5, so the
+    // post-transfer state must own nothing and claim nothing. Clearing makes the
+    // caller's OWNERSHIP_PENDING gate refuse a second visit outright rather than
+    // re-entering this function to assert.
+    //
+    // No counter fires here. Stats.Success is the HELPER's counter -- it records
+    // that bpf_redirect_map set an intent -- and the enqueue outcome is counted
+    // by the flush, which is the first point at which it is known.
+    //
+    RtlZeroMemory(Redirect, sizeof(*Redirect));
+    return TRUE;
 
 Reject:
 
@@ -351,6 +627,24 @@ Reject:
 
     RtlZeroMemory(Redirect, sizeof(*Redirect));
     return FALSE;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapCommitGroupFinish(
+    _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group,
+    _Outptr_result_maybenull_ NET_BUFFER_LIST **RejectedNbls
+    )
+{
+    XdpCpuMapFlushBatch(Group);
+
+    if (Group->Credits > 0) {
+        ExReleaseRundownProtectionEx(Group->NblRundown, Group->Credits);
+        Group->Credits = 0;
+    }
+
+    *RejectedNbls = Group->RejectedNbls;
+    Group->RejectedNbls = NULL;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -400,6 +694,216 @@ XdpCpuMapReleaseTargetReference(
     ExReleaseRundownProtection(&Target->PacketRundown);
 }
 
+//
+// Indication partitioning.
+//
+// A single ring holds packets from every source CPU that redirects to this
+// target, so one drain batch can legitimately carry packets captured on
+// different NDIS ports and -- since v1 does not stop a map being used by two
+// interfaces -- on different filters. Design section 7 requires the drain to
+// partition by (FilterHandle, PortNumber, indication flags) and to indicate each
+// partition with its OWN captured handle and port. Both POCs instead capture the
+// handle and port of whichever entry they visited last and indicate the whole
+// chain with those, which is latent only because their maps were bound to one
+// filter and their port was almost always zero.
+//
+// The key here additionally includes the backing map and the receive queue's
+// rundown. That can only ever SPLIT a chain further, never merge two that the
+// design would keep apart, and it is what lets the post-indication reference
+// releases be one interlocked operation per chain instead of one per packet
+// (section 11). In practice both are functions of the filter handle and the
+// receive queue, so no real chain is fragmented by their presence.
+//
+#define XDP_CPUMAP_INDICATION_CHAINS 8u
+
+typedef struct _XDP_CPUMAP_NBL_CHAIN {
+    NDIS_HANDLE FilterHandle;
+    NDIS_PORT_NUMBER PortNumber;
+    BOOLEAN IsDeepCopy;
+    XDP_CPUMAP *BackingRef;
+    EX_RUNDOWN_REF *NblRundown;
+    NET_BUFFER_LIST *Head;
+    NET_BUFFER_LIST *Tail;
+    ULONG Count;
+} XDP_CPUMAP_NBL_CHAIN;
+
+typedef struct _XDP_CPUMAP_NBL_CHAIN_SET {
+    UINT32 Used;
+    XDP_CPUMAP_NBL_CHAIN Chains[XDP_CPUMAP_INDICATION_CHAINS];
+} XDP_CPUMAP_NBL_CHAIN_SET;
+
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapChainSetInit(
+    _Out_ XDP_CPUMAP_NBL_CHAIN_SET *Set
+    )
+{
+    Set->Used = 0;
+}
+
+//
+// Move one occupied slot into its chain. The NBL and every reference the slot
+// owned leave in the SAME critical section that clears the slot, so what is left
+// behind is a slot that owns NOTHING. Ownership transfers exactly once.
+//
+// Returns FALSE when the batch needs more distinct chains than the set holds, in
+// which case the caller must stop, flush, and revisit this slot. Merging is not
+// an option: that is precisely the POC defect above.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+BOOLEAN
+XdpCpuMapChainSetTake(
+    _Inout_ XDP_CPUMAP_NBL_CHAIN_SET *Set,
+    _Inout_ XDP_CPUMAP_ENTRY *Entry
+    )
+{
+    XDP_CPUMAP_NBL_CHAIN *Chain = NULL;
+
+    ASSERT(Entry->Nbl != NULL);
+    ASSERT(Entry->BackingRef != NULL);
+    ASSERT(Entry->NblRundown != NULL);
+
+    for (UINT32 Index = 0; Index < Set->Used; Index++) {
+        XDP_CPUMAP_NBL_CHAIN *Candidate = &Set->Chains[Index];
+
+        if (Candidate->FilterHandle == Entry->FilterHandle &&
+            Candidate->PortNumber == Entry->PortNumber &&
+            Candidate->IsDeepCopy == Entry->IsDeepCopy &&
+            Candidate->BackingRef == Entry->BackingRef &&
+            Candidate->NblRundown == Entry->NblRundown) {
+            Chain = Candidate;
+            break;
+        }
+    }
+
+    if (Chain == NULL) {
+        if (Set->Used == RTL_NUMBER_OF(Set->Chains)) {
+            return FALSE;
+        }
+
+        Chain = &Set->Chains[Set->Used++];
+        Chain->FilterHandle = Entry->FilterHandle;
+        Chain->PortNumber = Entry->PortNumber;
+        Chain->IsDeepCopy = Entry->IsDeepCopy;
+        Chain->BackingRef = Entry->BackingRef;
+        Chain->NblRundown = Entry->NblRundown;
+        Chain->Head = NULL;
+        Chain->Tail = NULL;
+        Chain->Count = 0;
+    }
+
+    NET_BUFFER_LIST_NEXT_NBL(Entry->Nbl) = NULL;
+    if (Chain->Tail != NULL) {
+        NET_BUFFER_LIST_NEXT_NBL(Chain->Tail) = Entry->Nbl;
+    } else {
+        Chain->Head = Entry->Nbl;
+    }
+    Chain->Tail = Entry->Nbl;
+    Chain->Count++;
+
+    RtlZeroMemory(Entry, sizeof(*Entry));
+    return TRUE;
+}
+
+//
+// Release what the chain's slots owned, AFTER the NBLs have been disposed of.
+// Both releases are batched: one interlocked operation each, for the whole
+// chain.
+//
+// N.B. NblRundown is released last-touch: once it is dropped the receive queue's
+// pause may complete and the queue may be freed, so nothing may read the pointer
+// afterwards.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapChainRelease(
+    _Inout_ XDP_CPUMAP_NBL_CHAIN *Chain
+    )
+{
+    ASSERT(Chain->Count > 0);
+
+    XdpCpuMapReleaseBackingRefs(Chain->BackingRef, (LONG)Chain->Count);
+    ExReleaseRundownProtectionEx(Chain->NblRundown, Chain->Count);
+
+    Chain->BackingRef = NULL;
+    Chain->NblRundown = NULL;
+    Chain->Head = NULL;
+    Chain->Tail = NULL;
+    Chain->Count = 0;
+}
+
+//
+// Data-path disposal: indicate each partition up the stack with its own captured
+// handle, port and flags. Originals go without RESOURCES; deep copies (increment
+// 8) go with it and return synchronously.
+//
+static
+_IRQL_requires_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapChainSetIndicate(
+    _Inout_ XDP_CPUMAP_NBL_CHAIN_SET *Set
+    )
+{
+    for (UINT32 Index = 0; Index < Set->Used; Index++) {
+        XDP_CPUMAP_NBL_CHAIN *Chain = &Set->Chains[Index];
+        ULONG ReceiveFlags = NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL;
+
+        ASSERT(Chain->Count > 0);
+
+        //
+        // IsDeepCopy is always FALSE in this increment -- the flush enqueues
+        // originals only -- but the flag is part of the partition key, so the
+        // RESOURCES bit is derived from it rather than hard-coded.
+        //
+        if (Chain->IsDeepCopy) {
+            ReceiveFlags |= NDIS_RECEIVE_FLAGS_RESOURCES;
+        }
+
+        NdisFIndicateReceiveNetBufferLists(
+            Chain->FilterHandle, Chain->Head, Chain->PortNumber, Chain->Count,
+            ReceiveFlags);
+
+        XdpCpuMapChainRelease(Chain);
+    }
+
+    Set->Used = 0;
+}
+
+//
+// Teardown disposal: return each partition to the miniport WITHOUT indicating
+// it. Retire and quiesce both reach here, and in both cases the packet is lost
+// by design (sections 8.3 and 8.4).
+//
+static
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+XdpCpuMapChainSetReturn(
+    _Inout_ XDP_CPUMAP_NBL_CHAIN_SET *Set
+    )
+{
+    for (UINT32 Index = 0; Index < Set->Used; Index++) {
+        XDP_CPUMAP_NBL_CHAIN *Chain = &Set->Chains[Index];
+
+        ASSERT(Chain->Count > 0);
+
+        //
+        // A deep copy is never returned to the miniport, which never owned it;
+        // increment 8 recycles it into the receive queue's pool here instead.
+        //
+        ASSERT(!Chain->IsDeepCopy);
+
+        NdisFReturnNetBufferLists(Chain->FilterHandle, Chain->Head, 0);
+
+        XdpCpuMapChainRelease(Chain);
+    }
+
+    Set->Used = 0;
+}
+
 _Function_class_(KDEFERRED_ROUTINE)
 _IRQL_requires_(DISPATCH_LEVEL)
 _IRQL_requires_same_
@@ -412,25 +916,147 @@ XdpCpuMapDrainDpc(
     _In_opt_ VOID *SystemArgument2
     )
 {
-    UNREFERENCED_PARAMETER(Dpc);
+    XDP_CPUMAP_TARGET *Target = (XDP_CPUMAP_TARGET *)DeferredContext;
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_HELPER_STATS *Stats;
+    XDP_CPUMAP_RING *Ring;
+    UINT32 Batch;
+    ULONG64 Drained = 0;
+    ULONG64 Tombstones = 0;
+    BOOLEAN MoreWork;
+    BOOLEAN Yield = FALSE;
+
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
     //
-    // STUB. The data path is a later increment: nothing enqueues to a ring yet,
-    // so no producer ever queues this DPC. It is allocated and targeted here
-    // only so that target allocation, cap accounting, KeRemoveQueueDpc during
-    // retire, and DPC affinity are all exercised by this increment.
+    // Target, its ring and its DPC are all still live here: the retire path
+    // cancels and flushes this DPC only after ExWaitForRundownProtectionRelease
+    // has completed, and every producer holds a rundown reference across its
+    // KeInsertQueueDpc (section 7 steps 5 and 6).
     //
-    // When the drain body lands it must, per design section 7: drain bounded
-    // batches under Ring->Lock, skip tombstones (Nbl == NULL) WITHOUT releasing
-    // anything from them, partition indications by (FilterHandle, PortNumber,
-    // flags), release each entry's backing reference and NblRundown reference
-    // after indication, and acquire Target->PacketRundown around its own
-    // self-requeue.
+    ASSERT(Target != NULL);
+    if (Target == NULL) {
+        return;
+    }
+
+    CpuMap = Target->OwnerMap;
+    Ring = Target->Ring;
+
+    ASSERT(Ring != NULL);
+    if (Ring == NULL) {
+        return;
+    }
+
+    Stats = XdpCpuMapGetCurrentHelperStats(CpuMap);
+    Stats->DpcInvokeCount++;
+
     //
-    ASSERT(DeferredContext != NULL);
-    UNREFERENCED_PARAMETER(DeferredContext);
+    // The sweep zeroes EffectiveDrainBatchSize in the same critical section that
+    // takes TargetCount to zero, so this unlocked read can legitimately observe
+    // zero, and a zero batch would make the loop below spin without draining.
+    //
+    Batch = CpuMap->EffectiveDrainBatchSize;
+    if (Batch == 0 || Batch > XDP_CPUMAP_DRAIN_BATCH_MAX) {
+        Batch = XDP_CPUMAP_DRAIN_BATCH_DEFAULT;
+    }
+
+    do {
+        XDP_CPUMAP_NBL_CHAIN_SET ChainSet;
+        KLOCK_QUEUE_HANDLE LockHandle;
+        UINT32 Scanned = 0;
+        ULONG64 IterationDrained = 0;
+        ULONG64 IterationTombstones = 0;
+
+        XdpCpuMapChainSetInit(&ChainSet);
+
+        KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
+
+        while (Ring->Head != Ring->Tail && Scanned < Batch) {
+            XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
+
+            //
+            // A tombstone owns nothing: quiesce took its NBL and all of its
+            // references out under this same lock in one step. Advance past it
+            // and release NOTHING (sections 7.1 and 8.4).
+            //
+            if (Entry->Nbl == NULL) {
+                Ring->Head++;
+                Scanned++;
+                IterationTombstones++;
+                continue;
+            }
+
+            if (!XdpCpuMapChainSetTake(&ChainSet, Entry)) {
+                break;
+            }
+
+            Ring->Head++;
+            Scanned++;
+            IterationDrained++;
+        }
+
+        MoreWork = (Ring->Head != Ring->Tail);
+
+        KeReleaseInStackQueuedSpinLock(&LockHandle);
+
+        //
+        // Counters are written here rather than after the indication. The DPC's
+        // access to Stats is already covered by the owner/sweep reference
+        // argument at the end of this routine, so this ordering is defensive
+        // rather than load-bearing -- unlike the flush, where the equivalent
+        // ordering fixes a real window.
+        //
+        Drained += IterationDrained;
+        Tombstones += IterationTombstones;
+        Stats->DrainCount += IterationDrained;
+        Stats->DrainTombstoneCount += IterationTombstones;
+        Stats->IndicateChainCount += ChainSet.Used;
+
+        if (Scanned == 0) {
+            ASSERT(!MoreWork);
+            Stats->DpcEmptyCount++;
+            break;
+        }
+
+        //
+        // Indication happens with no CPUMAP lock held (section 9).
+        //
+        XdpCpuMapChainSetIndicate(&ChainSet);
+
+        if (MoreWork && KeShouldYieldProcessor()) {
+            Yield = TRUE;
+        }
+    } while (MoreWork && !Yield);
+
+    if (Yield) {
+        //
+        // Section 7, "DPC self-requeue is gated by the same rundown". Without
+        // this gate a DPC can re-queue itself after the retire path's
+        // KeRemoveQueueDpc has already cancelled it, defeating the cancel. A
+        // failed acquire means the target is retiring, and the retire path
+        // drains the remainder synchronously, so simply return.
+        //
+        // Stats points into CpuMap->HelperStats and is safe to touch anywhere in
+        // this routine, for a reason that has nothing to do with ring
+        // occupancy: a live map holds its own owner reference until
+        // XdpCpuMapDestroy drops it, and a map being destroyed has already
+        // armed a sweep that holds a backing reference until it completes --
+        // and the sweep cannot complete this target without KeRemoveQueueDpc
+        // and KeFlushQueuedDpcs, which cannot finish while this routine is
+        // executing. So RefCount cannot reach zero, and HelperStats cannot be
+        // freed, while a drain DPC is running.
+        //
+        // N.B. an earlier revision justified this with "Yield implies MoreWork,
+        // so ring entries still hold backing references". That is FALSE:
+        // MoreWork can consist solely of tombstones, which own nothing.
+        //
+        if (ExAcquireRundownProtection(&Target->PacketRundown)) {
+            KeInsertQueueDpc(Dpc, NULL, NULL);
+            ExReleaseRundownProtection(&Target->PacketRundown);
+            Stats->DpcRequeueCount++;
+        }
+    }
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -448,6 +1074,25 @@ XdpCpuMapReferenceBacking(
     //
     ASSERT(NewCount > 1);
     UNREFERENCED_PARAMETER(NewCount);
+}
+
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapReleaseBackingRefs(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _In_ LONG Count
+    )
+{
+    ASSERT(Count > 0);
+
+    //
+    // InterlockedExchangeAdd returns the PREVIOUS value, so the count reached
+    // zero exactly when the previous value was the number released.
+    //
+    if (InterlockedExchangeAdd(&CpuMap->RefCount, -Count) == Count) {
+        KeSetEvent(&CpuMap->RefCountZero, IO_NO_INCREMENT, FALSE);
+    }
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -562,11 +1207,10 @@ XdpCpuMapReleaseCharges(
 // Drain a ring under its lock, in bounded chunks, releasing everything each
 // entry owns.
 //
-// With no data path every ring is empty, so this loop does nothing today. It is
-// implemented now because retire and quiesce both need it and because getting
-// the tombstone rule wrong is exactly the class of defect this design has
-// already paid for: a tombstone (Nbl == NULL) owns NOTHING and the consumer must
-// release nothing from it.
+// Retire RETURNS rather than indicates: by the time this runs the target has
+// gone, so these packets are dropped and counted RetireDropCount (section 8.3,
+// "Delivery on retire"). Tombstones (Nbl == NULL) own NOTHING and the consumer
+// must release nothing from them.
 //
 static
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -589,13 +1233,17 @@ XdpCpuMapDrainRing(
     // zero, and a zero batch would make the drain loop exit immediately WITHOUT
     // draining -- silently leaking every queued NBL. Clamp it.
     //
-    if (Batch == 0) {
+    if (Batch == 0 || Batch > XDP_CPUMAP_DRAIN_BATCH_MAX) {
         Batch = XDP_CPUMAP_DRAIN_BATCH_DEFAULT;
     }
 
     for (;;) {
         KLOCK_QUEUE_HANDLE LockHandle;
+        XDP_CPUMAP_NBL_CHAIN_SET ChainSet;
         UINT32 Drained = 0;
+        UINT32 Returned = 0;
+
+        XdpCpuMapChainSetInit(&ChainSet);
 
         KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
 
@@ -603,22 +1251,24 @@ XdpCpuMapDrainRing(
             XDP_CPUMAP_ENTRY *Entry = &Ring->Entries[Ring->Head & Ring->Mask];
 
             if (Entry->Nbl != NULL) {
-                //
-                // The data path is a later increment; no entry can exist yet.
-                // When it does, this is where the NBL is returned or the deep
-                // copy recycled, and where the entry's backing reference and
-                // NblRundown reference are released.
-                //
-                ASSERT(FALSE);
-                Entry->Nbl = NULL;
+                if (!XdpCpuMapChainSetTake(&ChainSet, Entry)) {
+                    break;
+                }
+
+                Returned++;
             }
 
-            RtlZeroMemory(Entry, sizeof(*Entry));
             Ring->Head++;
             Drained++;
         }
 
         KeReleaseInStackQueuedSpinLock(&LockHandle);
+
+        XdpCpuMapChainSetReturn(&ChainSet);
+
+        if (Returned > 0) {
+            InterlockedAdd64(&XdpCpuMapSweepStats.RetireDropCount, (LONG64)Returned);
+        }
 
         if (Drained == 0) {
             break;
@@ -1554,7 +2204,10 @@ XdpCpuMapQuiesceScope(
 
                 while (Index != TailSnapshot) {
                     KLOCK_QUEUE_HANDLE LockHandle;
+                    XDP_CPUMAP_NBL_CHAIN_SET ChainSet;
                     UINT32 Scanned = 0;
+
+                    XdpCpuMapChainSetInit(&ChainSet);
 
                     KeAcquireInStackQueuedSpinLock(&Ring->Lock, &LockHandle);
 
@@ -1571,11 +2224,21 @@ XdpCpuMapQuiesceScope(
                             // tombstone left behind owns NOTHING and consumers
                             // release nothing from it.
                             //
-                            // The data path is a later increment, so no slot can
-                            // be occupied yet.
+                            // Head and Tail are never touched: the slot stays
+                            // where it is, so there is no compaction, no
+                            // reordering, and no interaction with producers'
+                            // index arithmetic (section 8.4, correction A).
                             //
-                            ASSERT(FALSE);
-                            RtlZeroMemory(Slot, sizeof(*Slot));
+                            if (!XdpCpuMapChainSetTake(&ChainSet, Slot)) {
+                                //
+                                // More distinct filters/ports in flight than the
+                                // chain set holds. Stop without consuming this
+                                // slot; the next chunk revisits it with an empty
+                                // set.
+                                //
+                                break;
+                            }
+
                             Matched++;
                             Tombstoned++;
                         }
@@ -1588,9 +2251,19 @@ XdpCpuMapQuiesceScope(
                     KeReleaseInStackQueuedSpinLock(&LockHandle);
 
                     //
-                    // Returning NBLs and releasing their references happens here,
-                    // outside the ring lock, when the data path lands.
+                    // No CPUMAP lock is held across the NDIS return (section 9).
                     //
+                    XdpCpuMapChainSetReturn(&ChainSet);
+
+                    if (Scanned == 0) {
+                        //
+                        // The set filled on the first slot of this chunk, which
+                        // is impossible: it was just initialized empty. Guard
+                        // against an infinite loop regardless.
+                        //
+                        ASSERT(FALSE);
+                        break;
+                    }
                 }
 
                 ExReleaseRundownProtection(&Target->PacketRundown);

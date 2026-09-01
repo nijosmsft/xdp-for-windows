@@ -72,26 +72,120 @@ XdpGetCpuMapRedirectExtension(
 // released in one operation when the group ends.
 //
 // Increment 6 extends this rather than replacing it: a packet that successfully
-// inserts into the batch simply keeps its credit instead of returning it.
+// inserts into the batch simply KEEPS its credit, because the credit is exactly
+// the reference the ring slot goes on to own. A group that commits more than
+// XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK packets therefore acquires again, which is
+// legitimate and is one trip per chunk rather than one per packet.
 //
 #define XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK 32u
+
+//
+// The flush batch. Section 7 "Batch enqueue": generic RX accumulates redirect
+// decisions and the flush groups them by target so the ring lock is taken once
+// per target per flush rather than once per packet (section 7.1).
+//
+// Batch input count is POC A's 32 (section 7, "Batch input count").
+//
+#define XDP_CPUMAP_BATCH_SIZE 32u
+
+//
+// One accumulated redirect. FilterHandle, PortNumber and the owning receive
+// queue are properties of the INDICATION, not of the packet, so they are held
+// once on the group and stamped into every ring slot the flush writes rather
+// than repeated per entry. Keeping them off the entry is what holds the batch
+// -- which lives on the receive path's stack -- to a kilobyte.
+//
+typedef struct _XDP_CPUMAP_BATCH_ENTRY {
+    NET_BUFFER_LIST *Nbl;
+
+    //
+    // The map the frame's backing reference was taken on, carried explicitly so
+    // the release site names the same object as the acquire site rather than
+    // rediscovering it through Target->OwnerMap.
+    //
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_TARGET *Target;
+} XDP_CPUMAP_BATCH_ENTRY;
 
 typedef struct _XDP_CPUMAP_COMMIT_GROUP {
     EX_RUNDOWN_REF *NblRundown;
     ULONG Credits;      // acquired but not yet handed to a packet
     BOOLEAN RundownDown; // acquisition failed; the queue is running down
+
+    //
+    // TRUE when this group belongs to a TX-inspect queue, which is an
+    // ASSERTED-IMPOSSIBLE state rather than a runtime one.
+    //
+    // CPUMAP is receive-side only. The generic LWF runs outbound sends through
+    // the SAME post-inspection path as receives, and an XDP program may attach
+    // to XDP_HOOK_L2/XDP_HOOK_TX/XDP_HOOK_INSPECT, so the exclusion has to be
+    // real. It is made structurally, in XdpGenericRxActivateQueue: a TX-inspect
+    // queue never gets CpuMapRedirectEnabled, so it never registers the frame
+    // extension and no send NBL can reach the commit point.
+    //
+    // This field records which side of that boundary the group came from so the
+    // boundary is checked where it matters rather than only where it is
+    // established. It is not a policy knob and there is no counter: a violation
+    // is a broken invariant, and checked builds assert on it exactly as they do
+    // on malformed helper metadata below. Retail still falls through to Reject
+    // and releases everything the metadata owns, so it fails closed rather than
+    // injecting a send into the receive path.
+    //
+    BOOLEAN TxInspect;
+
+    //
+    // Indication identity, stamped into every ring slot this group produces.
+    // The ring slot snapshots FilterHandle rather than re-deriving it from the
+    // receive queue, so the drain path never dereferences generic state it does
+    // not hold a reference on (section 6.3, "Why rundown, and why here").
+    //
+    NDIS_HANDLE FilterHandle;
+    NDIS_PORT_NUMBER PortNumber;
+    const VOID *RxQueueOwner;
+    const VOID *GenericOwner;
+
+    //
+    // Originals CPUMAP committed but could not queue. Ownership was taken and
+    // ActionNbl cleared, so the RX action switch can no longer deliver them and
+    // the caller must return them to the miniport (section 6.3 step 6, section
+    // 8.1a row 9a "Released -- post-commit failure").
+    //
+    NET_BUFFER_LIST *RejectedNbls;
+
+    UINT32 Count;
+    XDP_CPUMAP_BATCH_ENTRY Entries[XDP_CPUMAP_BATCH_SIZE];
 } XDP_CPUMAP_COMMIT_GROUP;
 
+//
+// N.B. Entries is deliberately left uninitialized: zeroing a kilobyte on every
+// receive flush, almost all of which carry no CPUMAP traffic at all, is exactly
+// the per-packet cost section 11 forbids. Count bounds every read of it. The
+// caller does not initialize a group at all unless the receive queue has CPUMAP
+// redirect enabled.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
 FORCEINLINE
 VOID
 XdpCpuMapCommitGroupInit(
     _Out_ XDP_CPUMAP_COMMIT_GROUP *Group,
-    _In_ EX_RUNDOWN_REF *NblRundown
+    _In_ EX_RUNDOWN_REF *NblRundown,
+    _In_opt_ NDIS_HANDLE FilterHandle,
+    _In_ NDIS_PORT_NUMBER PortNumber,
+    _In_opt_ const VOID *RxQueueOwner,
+    _In_opt_ const VOID *GenericOwner,
+    _In_ BOOLEAN TxInspect
     )
 {
     Group->NblRundown = NblRundown;
     Group->Credits = 0;
     Group->RundownDown = FALSE;
+    Group->TxInspect = TxInspect;
+    Group->FilterHandle = FilterHandle;
+    Group->PortNumber = PortNumber;
+    Group->RxQueueOwner = RxQueueOwner;
+    Group->GenericOwner = GenericOwner;
+    Group->RejectedNbls = NULL;
+    Group->Count = 0;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -133,26 +227,29 @@ XdpCpuMapCommitGroupReturnCredit(
     Group->Credits++;
 }
 
+//
+// Ends the flush group: flushes whatever the batch still holds (section 7) and
+// then releases the credits no packet consumed, in one interlocked operation.
+//
+// RejectedNbls returns the originals CPUMAP committed and then could not queue.
+// They are unconditionally dropped, not fallen back, so the caller returns them
+// to the miniport rather than re-entering the RX action switch.
+//
 _IRQL_requires_max_(DISPATCH_LEVEL)
-FORCEINLINE
 VOID
 XdpCpuMapCommitGroupFinish(
-    _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
-    )
-{
-    if (Group->Credits > 0) {
-        ExReleaseRundownProtectionEx(Group->NblRundown, Group->Credits);
-        Group->Credits = 0;
-    }
-}
+    _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group,
+    _Outptr_result_maybenull_ NET_BUFFER_LIST **RejectedNbls
+    );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
 BOOLEAN
 XdpCpuMapCommitRedirect(
     _Inout_ XDP_FRAME_CPUMAP_REDIRECT_V1 *Redirect,
-    _In_opt_ const NET_BUFFER_LIST *ActionNbl,
+    _In_opt_ NET_BUFFER_LIST *ActionNbl,
     _In_ BOOLEAN RxQueuePaused,
+    _In_ BOOLEAN CanPend,
     _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
     );
 

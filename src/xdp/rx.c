@@ -341,11 +341,27 @@ XdpReceiveEbpf(
 
     XdpReceiveBatchStart(RxQueue);
 
+    //
+    // The eBPF dispatch table is selected for every eBPF program, but CPUMAP
+    // redirect is not enabled for every eBPF queue -- a TX-inspect queue is
+    // excluded by XdpProgramCanCpuMapRedirect. Only the CPUMAP variant may run
+    // when the private frame extension is registered: it zeroes that extension
+    // per frame, and running it against an unregistered extension would write
+    // through an uninitialized offset.
+    //
     if (XdpInspectEbpfStartBatch(RxQueue->Program, &RxQueue->InspectionContext)) {
-        XdppReceiveBatchCpuMap(RxQueue, XdpInspectEbpf);
+        if (RxQueue->CpuMapRedirectEnabled) {
+            XdppReceiveBatchCpuMap(RxQueue, XdpInspectEbpf);
+        } else {
+            XdppReceiveBatch(RxQueue, XdpInspectEbpf);
+        }
         XdpInspectEbpfEndBatch(RxQueue->Program, &RxQueue->InspectionContext);
     } else {
-        XdppReceiveBatchCpuMap(RxQueue, XdpInspect);
+        if (RxQueue->CpuMapRedirectEnabled) {
+            XdppReceiveBatchCpuMap(RxQueue, XdpInspect);
+        } else {
+            XdppReceiveBatch(RxQueue, XdpInspect);
+        }
     }
 
     XdppFlushReceive(RxQueue);
@@ -1009,6 +1025,7 @@ XdpRxQueueDetachInterface(
     RtlZeroMemory(&RxQueue->RxActionExtension, sizeof(RxQueue->RxActionExtension));
     RtlZeroMemory(&RxQueue->CpuMapRedirectExtension, sizeof(RxQueue->CpuMapRedirectExtension));
     RxQueue->CpuMapRedirectEnabled = FALSE;
+    RxQueue->InspectionContext.CpuMapRedirectAllowed = FALSE;
 
 #if DBG
     RxQueue->FrameConsumerIndex = 0;
@@ -1073,7 +1090,9 @@ XdpRxQueueAttachInterface(
 
     TraceEnter(TRACE_CORE, "RxQueue=%p", RxQueue);
 
-    RxQueue->CpuMapRedirectEnabled = XdpProgramCanCpuMapRedirect(RxQueue->Program);
+    RxQueue->CpuMapRedirectEnabled =
+        XdpProgramCanCpuMapRedirect(RxQueue->Program, &RxQueue->Key.HookId);
+    RxQueue->InspectionContext.CpuMapRedirectAllowed = RxQueue->CpuMapRedirectEnabled;
 
     if (RxQueue->IsChecksumOffloadEnabled) {
         XdpExtensionSetEnableEntry(

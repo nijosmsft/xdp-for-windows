@@ -19,6 +19,16 @@ typedef struct _XDP_INSPECTION_CONTEXT {
     ULONG IfIndex;
     UINT32 QueueId;
     XDP_INTERFACE_MODE InterfaceMode;
+
+    //
+    // Mirrors XDP_RX_QUEUE::CpuMapRedirectEnabled, which is the single decision
+    // XdpProgramCanCpuMapRedirect makes. The helper reads it so that admission
+    // and frame-extension registration can never disagree: if the extension is
+    // absent the helper declines BEFORE acquiring anything, so a reference is
+    // never taken with nothing left to consume it.
+    //
+    BOOLEAN CpuMapRedirectAllowed;
+
     LOCK_STATE_EX MapLockState;
 } XDP_INSPECTION_CONTEXT;
 
@@ -83,7 +93,8 @@ XdpProgramCanXskBypass(
 
 BOOLEAN
 XdpProgramCanCpuMapRedirect(
-    _In_ XDP_PROGRAM *Program
+    _In_ XDP_PROGRAM *Program,
+    _In_ CONST XDP_HOOK_ID *HookId
     );
 
 XDP_FILE_CREATE_ROUTINE XdpIrpCreateProgram;

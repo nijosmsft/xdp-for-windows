@@ -164,6 +164,7 @@ XdpCpuMapRedirectMap(
     _In_ UINT64 Key,
     _In_ intptr_t FallbackAction,
     _In_ BOOLEAN IsProgTestRun,
+    _In_ BOOLEAN CpuMapRedirectAllowed,
     _In_ XDP_INTERFACE_MODE InterfaceMode,
     _Inout_ XDP_CPUMAP *CpuMap,
     _Inout_ XDP_CPUMAP_REDIRECT_CONTEXT *Redirect
@@ -174,7 +175,17 @@ XdpCpuMapRedirectMap(
 
     XdpCpuMapRecordHelperCall(CpuMap);
 
-    if (IsProgTestRun || InterfaceMode != XDP_INTERFACE_MODE_GENERIC) {
+    //
+    // Unsupported receiving context, in one gate and BEFORE any reference is
+    // acquired. CpuMapRedirectAllowed is the queue-scoped half: it is FALSE
+    // whenever the private frame extension was not registered, which today means
+    // a non-eBPF program or a TX-inspect queue. CPUMAP is receive-side only --
+    // its drain indicates through NdisFIndicateReceiveNetBufferLists -- and
+    // declining here is what guarantees the helper never takes a reference that
+    // no commit will consume.
+    //
+    if (IsProgTestRun || !CpuMapRedirectAllowed ||
+        InterfaceMode != XDP_INTERFACE_MODE_GENERIC) {
         XdpCpuMapRecordHelperFallback(
             CpuMap, XdpCpuMapHelperFallbackRedirectModeUnsupported);
         return FallbackAction;

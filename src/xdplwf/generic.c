@@ -194,6 +194,27 @@ XdpGenericPause(
     KeClearEvent(&Generic->Tx.Datapath.ReadyEvent);
     KeClearEvent(&Generic->Rx.Datapath.ReadyEvent);
 
+    //
+    // Publish the pause gate on EVERY receive queue before anything scans, then
+    // release CPUMAP's held packets once for the whole interface, and only then
+    // wait on the queues' NBL rundowns.
+    //
+    // The order is load-bearing (design section 8.4, correction B). CPUMAP ring
+    // entries hold RxQueue->NblRundown references, so a queue with packets still
+    // queued cannot complete its rundown wait until the target CPU's DPC drains
+    // them -- unboundedly, if that CPU cannot run. Quiescing first removes that
+    // dependency. Quiescing BEFORE the gate is fully published would instead let
+    // producers refill rings behind the scan.
+    //
+    // It is hoisted out of the per-queue loop because XdpGenericRxPause walks
+    // queues sequentially and the interface-scoped scan costs one pointer
+    // comparison per ring entry across every live map -- running it per queue
+    // would multiply that by the queue count.
+    //
+    XdpGenericRxMarkPaused(Generic);
+    XdpCpuMapQuiesceInterface(Generic);
+    Generic->Flags.CpuMapQuiesced = TRUE;
+
     XdpGenericRxPause(Generic);
     XdpGenericTxPause(Generic);
     RtlReleasePushLockExclusive(&Generic->Lock);
@@ -223,6 +244,7 @@ XdpGenericRestart(
 
     RtlAcquirePushLockExclusive(&Generic->Lock);
     Generic->Flags.Paused = FALSE;
+    Generic->Flags.CpuMapQuiesced = FALSE;
 
     XdpGenericRxRestart(Generic, NewMtu);
     XdpGenericTxRestart(Generic, NewMtu);

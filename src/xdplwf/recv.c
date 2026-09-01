@@ -1669,12 +1669,30 @@ XdpGenericReceivePostInspectNbs(
     NET_BUFFER_LIST *CachedNextNbl = NULL;
 
     //
-    // Rundown credits for this flush group. Section 6.3 requires NblRundown
-    // acquisition to be batched per group rather than taken per packet; the
-    // group is finished once, below, releasing whatever went unconsumed.
+    // The CPUMAP flush group for this indication. Section 6.3 requires
+    // NblRundown acquisition to be batched per group rather than taken per
+    // packet, and section 7 requires the ring lock to be taken once per target
+    // per flush rather than once per packet; the group carries both. It also
+    // carries the indication identity -- filter handle, port, and the opaque
+    // queue tokens quiesce matches on -- which is constant for this whole call
+    // and so is held once rather than repeated per entry.
+    //
+    // A queue without CPUMAP redirect enabled pays NOTHING: no initialization,
+    // no flush, no call. That is the overwhelmingly common case -- every native
+    // program, every XSK-only path, and every TX-inspect queue -- and section 11
+    // does not allow it to be charged for a feature it cannot use. Skipping the
+    // finish is safe because no CPUMAP frame can exist on such a queue: the
+    // frame extension is not even registered, so nothing can be committed and
+    // nothing can be stranded.
     //
     XDP_CPUMAP_COMMIT_GROUP CpuMapCommitGroup;
-    XdpCpuMapCommitGroupInit(&CpuMapCommitGroup, &RxQueue->NblRundown);
+
+    if (RxQueue->Flags.CpuMapRedirectEnabled) {
+        ASSERT(!RxQueue->Flags.TxInspect);
+        XdpCpuMapCommitGroupInit(
+            &CpuMapCommitGroup, &RxQueue->NblRundown, RxQueue->Generic->NdisFilterHandle,
+            PortNumber, RxQueue, RxQueue->Generic, (BOOLEAN)RxQueue->Flags.TxInspect);
+    }
 
     while (NbHead != NbTail) {
         XDP_FRAME *Frame;
@@ -1761,7 +1779,12 @@ XdpGenericReceivePostInspectNbs(
                     ReadBooleanAcquire(&RxQueue->Flags.Paused) != FALSE;
 
                 if (XdpCpuMapCommitRedirect(
-                        CpuMapRedirect, ActionNbl, RxQueuePaused, &CpuMapCommitGroup)) {
+                        CpuMapRedirect, ActionNbl, RxQueuePaused, CanPend,
+                        &CpuMapCommitGroup)) {
+                    //
+                    // Ownership has transferred to CPUMAP. The original must not
+                    // reach PassList, DropList or TxList (section 8.1a row 9a).
+                    //
                     ActionNbl = NULL;
                 }
             }
@@ -1819,11 +1842,30 @@ XdpGenericReceivePostInspectNbs(
     }
 
     //
-    // End of the flush group: release any rundown credits acquired above but
-    // not consumed by a committing packet. One interlocked operation for the
-    // whole group.
+    // End of the flush group: enqueue whatever the batch still holds, then
+    // release the rundown credits no packet consumed, in one interlocked
+    // operation for the whole group.
     //
-    XdpCpuMapCommitGroupFinish(&CpuMapCommitGroup);
+    if (RxQueue->Flags.CpuMapRedirectEnabled) {
+        NET_BUFFER_LIST *CpuMapRejectedNbls;
+
+        XdpCpuMapCommitGroupFinish(&CpuMapCommitGroup, &CpuMapRejectedNbls);
+
+        if (CpuMapRejectedNbls != NULL) {
+            //
+            // Packets CPUMAP committed and then could not queue. Ownership was
+            // taken and ActionNbl cleared, so no RX action remains and the
+            // originals are returned to the miniport rather than delivered
+            // (section 6.3 step 6).
+            //
+            // These only exist on the CanPend path: a low-resource indication is
+            // rejected before commit, so this list is provably empty while
+            // XdpGenericReceiveLowResources owns the ordering of DropList.
+            //
+            ASSERT(CanPend);
+            NdisAppendNblChainToNblQueue(DropList, CpuMapRejectedNbls);
+        }
+    }
 
     ASSERT(FrameRing->InterfaceReserved == FrameRing->ProducerIndex);
 }
@@ -2106,6 +2148,76 @@ XdpGenericReceiveTxInspectPoll(
     return PollDidWork;
 }
 
+//
+// Publishes the pause gate on one receive queue and reports whether THIS call
+// made the transition. Only the caller that transitioned the queue owes it a
+// rundown wait; a queue that was already paused has already had one, either from
+// an earlier pause or from queue create, which waits inline when it inherits a
+// paused interface.
+//
+static
+_IRQL_requires_max_(PASSIVE_LEVEL)
+BOOLEAN
+XdpGenericRxMarkQueuePaused(
+    _In_ XDP_LWF_GENERIC_RX_QUEUE *RxQueue
+    )
+{
+    KIRQL OldIrql;
+    BOOLEAN Transitioned = FALSE;
+
+    KeAcquireSpinLock(&RxQueue->EcLock, &OldIrql);
+    if (!RxQueue->Flags.Paused) {
+        RxQueue->Flags.Paused = TRUE;
+        Transitioned = TRUE;
+    }
+    KeReleaseSpinLock(&RxQueue->EcLock, OldIrql);
+
+    return Transitioned;
+}
+
+//
+// Releases everything CPUMAP holds for this queue, then waits for the queue's
+// NBL rundown. The quiesce is skipped when the interface-wide pass has already
+// run for this pause; see XdpGenericPause.
+//
+static
+_IRQL_requires_max_(PASSIVE_LEVEL)
+_Requires_exclusive_lock_held_(&Generic->Lock)
+VOID
+XdpGenericRxQuiesceAndWaitQueue(
+    _In_ XDP_LWF_GENERIC *Generic,
+    _In_ XDP_LWF_GENERIC_RX_QUEUE *RxQueue
+    )
+{
+    if (!Generic->Flags.CpuMapQuiesced) {
+        XdpCpuMapQuiesceRxQueue(RxQueue);
+    }
+
+    ExWaitForRundownProtectionRelease(&RxQueue->NblRundown);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+_Requires_exclusive_lock_held_(&Generic->Lock)
+VOID
+XdpGenericRxMarkPaused(
+    _In_ XDP_LWF_GENERIC *Generic
+    )
+{
+    LIST_ENTRY *Entry = Generic->Rx.Queues.Flink;
+
+    TraceEnter(TRACE_GENERIC, "IfIndex=%u", Generic->IfIndex);
+
+    while (Entry != &Generic->Rx.Queues) {
+        XDP_LWF_GENERIC_RX_QUEUE *RxQueue =
+            CONTAINING_RECORD(Entry, XDP_LWF_GENERIC_RX_QUEUE, Link);
+        Entry = Entry->Flink;
+
+        XdpGenericRxMarkQueuePaused(RxQueue);
+    }
+
+    TraceExitSuccess(TRACE_GENERIC);
+}
+
 static
 _IRQL_requires_max_(PASSIVE_LEVEL)
 _Requires_exclusive_lock_held_(&Generic->Lock)
@@ -2115,22 +2227,12 @@ XdpGenericRxPauseQueue(
     _In_ XDP_LWF_GENERIC_RX_QUEUE *RxQueue
     )
 {
-    KIRQL OldIrql;
-    BOOLEAN NeedPause = FALSE;
-
     TraceEnter(
         TRACE_GENERIC, "RxQueue=%p IfIndex=%u QueueId=%u TxInspect=%!BOOLEAN!",
         RxQueue, Generic->IfIndex, RxQueue->QueueId, RxQueue->Flags.TxInspect);
 
-    KeAcquireSpinLock(&RxQueue->EcLock, &OldIrql);
-    if (!RxQueue->Flags.Paused) {
-        RxQueue->Flags.Paused = TRUE;
-        NeedPause = TRUE;
-    }
-    KeReleaseSpinLock(&RxQueue->EcLock, OldIrql);
-
-    if (NeedPause) {
-        ExWaitForRundownProtectionRelease(&RxQueue->NblRundown);
+    if (XdpGenericRxMarkQueuePaused(RxQueue)) {
+        XdpGenericRxQuiesceAndWaitQueue(Generic, RxQueue);
     }
 
     TraceExitSuccess(TRACE_GENERIC);
@@ -2151,7 +2253,27 @@ XdpGenericRxPause(
             CONTAINING_RECORD(Entry, XDP_LWF_GENERIC_RX_QUEUE, Link);
         Entry = Entry->Flink;
 
-        XdpGenericRxPauseQueue(Generic, RxQueue);
+        //
+        // XdpGenericPause has already marked every queue, so the wait runs
+        // unconditionally here rather than only for queues this pass
+        // transitioned.
+        //
+        // A second wait on an already run-down reference is explicitly legal:
+        // "If ExWaitForRundownProtectionRelease is called to run down a shared
+        // object, but the RunRef parameter indicates that this object is already
+        // run down, the call has no effect but is not treated as an error"
+        // (wdm.h documentation). Upstream already relies on this: a queue
+        // created while a datapath was not inserted waits inline at create with
+        // Flags.Paused clear, and the next pause transitions it and waits again
+        // with no ExReInitializeRundownProtection in between.
+        //
+        // Nor can the extra calls block. Flags.Paused is set only by a path that
+        // also runs the queue down -- create waits inline when it inherits a
+        // paused interface, and every pause waits -- and restart clears the flag
+        // as it re-initializes the reference. So Paused implies run down, and a
+        // queue this pass did not transition returns from the wait immediately.
+        //
+        XdpGenericRxQuiesceAndWaitQueue(Generic, RxQueue);
     }
 
     TraceExitSuccess(TRACE_GENERIC);
@@ -2472,7 +2594,18 @@ XdpGenericRxActivateQueue(
 
     RxQueue->FrameRing = XdpRxQueueGetFrameRing(Config);
     RxQueue->FragmentRing = XdpRxQueueGetFragmentRing(Config);
+
+    //
+    // CPUMAP is receive-side only, and the exclusion is made in xdp.sys at
+    // extension-registration time (XdpProgramCanCpuMapRedirect), not here. This
+    // flag only reads that decision, so a TX-inspect queue arrives with it
+    // already clear and no second condition is needed -- nor would one be safe:
+    // gating here while xdp.sys still registered the extension would leave the
+    // helper callable with nothing consuming its output, stranding the target
+    // rundown and backing references it takes per packet.
+    //
     RxQueue->Flags.CpuMapRedirectEnabled = XdpRxQueueIsCpuMapRedirectEnabled(Config);
+    ASSERT(!RxQueue->Flags.CpuMapRedirectEnabled || !RxQueue->Flags.TxInspect);
     RxQueue->Flags.ChecksumOffloadEnabled = XdpRxQueueIsChecksumOffloadEnabled(Config);
     RxQueue->Flags.TimestampOffloadEnabled = XdpRxQueueIsTimestampOffloadEnabled(Config);
 

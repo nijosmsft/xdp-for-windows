@@ -41,6 +41,14 @@ typedef struct _XDP_LWF_GENERIC {
     KEVENT CleanupEvent;
     struct {
         BOOLEAN Paused : 1;
+
+        //
+        // Set once XdpCpuMapQuiesceInterface has run for this pause, so the
+        // per-queue pause path knows the interface-wide pass already covered it
+        // and must not repeat a scan whose cost is proportional to global ring
+        // occupancy. Cleared on restart. See design section 8.4, correction B.
+        //
+        BOOLEAN CpuMapQuiesced : 1;
     } Flags;
 
     XDP_LWF_GENERIC_RSS Rss;
