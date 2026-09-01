@@ -276,6 +276,43 @@ XdpInvokeEbpf(
     XdpMd.ProgTestRunContext = NULL;
     RtlZeroMemory(&XdpMd.Redirect, sizeof(XdpMd.Redirect));
 
+    //
+    // Divergence detector for the two halves of the CPUMAP admission decision.
+    // Both derive from the same XdpProgramCanCpuMapRedirect result: one gates
+    // whether the private frame extension is registered, the other is mirrored
+    // into the inspection context for the helper to read. They are deliberately
+    // independent derivations that must agree, so they can disagree only through
+    // a plumbing defect -- attach/detach ordering, program replacement, or queue
+    // reactivation setting one without the other. This is the only place both
+    // are in scope.
+    //
+    // A divergence is SILENT MISBEHAVIOUR, not a leak. Reference stranding is
+    // structurally impossible on both sides:
+    //
+    //   * Extension absent, admission true: the helper acquires, the redirect
+    //     case below drops the frame because it has nowhere to record the
+    //     metadata, and Exit releases both references through
+    //     EbpfXdpReleaseCpuMapIntent. Every CPUMAP redirect on that queue is
+    //     silently dropped after paying for an acquire and a release.
+    //
+    //   * Extension present, admission false: the helper declines before
+    //     acquiring anything, so CPUMAP redirect silently never engages on a
+    //     queue where it should.
+    //
+    // Both are functional failures that stay invisible until someone notices
+    // missing steering or unexplained drops. Asserting converts that into a loud
+    // failure at the first packet, which is the treatment increment 5 gave the
+    // XSK case.
+    //
+    // N.B. the invariant this protects is the ORDERING one -- admission precedes
+    // acquisition -- not a leak. Exit is the single release site for the
+    // invocation's CPUMAP intent and it runs on every path out of the redirect
+    // case, so no path here can strand a reference.
+    //
+    ASSERT(
+        (CpuMapRedirectExtension != NULL) ==
+        (InspectionContext->CpuMapRedirectAllowed != FALSE));
+
     ebpf_program_batch_invoke_function_t EbpfInvokeProgram =
         EbpfExtensionClientGetProgramDispatch(Client)->ebpf_program_batch_invoke_function;
     EbpfResult = EbpfInvokeProgram(ClientBindingContext, &XdpMd.Base, &Result, EbpfContext);
@@ -308,6 +345,23 @@ XdpInvokeEbpf(
         } else if (XdpMd.RedirectIntent == EbpfXdpRedirectIntentCpuMap) {
             XDP_FRAME_CPUMAP_REDIRECT_V1 *CpuMapRedirect;
 
+            //
+            // Impossible by construction. A CPUMAP intent can only be recorded
+            // by XdpCpuMapRedirectMap, which declines before acquiring anything
+            // unless InspectionContext->CpuMapRedirectAllowed is set -- and that
+            // is the same XdpProgramCanCpuMapRedirect result that decides
+            // whether this extension is registered. The two cannot disagree, so
+            // an intent here implies a registered extension. This is the same
+            // treatment XdpReceive gives CpuMapRedirectEnabled.
+            //
+            // N.B. the retail fallback is NOT a leak: this break exits the
+            // switch to the Exit label, whose EbpfXdpReleaseCpuMapIntent sees
+            // RedirectIntent still set to CpuMap -- it is cleared only on the
+            // success path below -- and releases the target rundown and backing
+            // references through XdpCpuMapClearRedirectContext. That single site
+            // is section 6.3 step 8, and releasing here as well would be a
+            // double release.
+            //
             ASSERT(CpuMapRedirectExtension != NULL);
             if (CpuMapRedirectExtension == NULL) {
                 RxAction = XDP_RX_ACTION_DROP;
@@ -786,6 +840,7 @@ EbpfXdpRedirectMap(
     BOOLEAN IsProgTestRun = XdpMd->ProgTestRunContext != NULL;
     XDP_RX_QUEUE *RxQueue;
     XDP_INTERFACE_MODE InterfaceMode;
+    BOOLEAN CpuMapRedirectAllowed;
     XDP_EBPF_MAP_TYPE MapType;
     ebpf_result_t MapTypeResult;
     XDP_CPUMAP *CpuMap = NULL;
@@ -802,12 +857,14 @@ EbpfXdpRedirectMap(
         //
         RxQueue = NULL;
         InterfaceMode = XDP_INTERFACE_MODE_NATIVE;
+        CpuMapRedirectAllowed = FALSE;
     } else {
         ASSERT(XdpMd->InspectionContext != NULL);
         RxQueue =
             XdpRxQueueFromRedirectContext(&XdpMd->InspectionContext->RedirectContext);
         ASSERT(RxQueue != NULL);
         InterfaceMode = XdpMd->InspectionContext->InterfaceMode;
+        CpuMapRedirectAllowed = XdpMd->InspectionContext->CpuMapRedirectAllowed;
     }
 
     EbpfXdpClearRedirectIntent(XdpMd);
@@ -835,8 +892,9 @@ EbpfXdpRedirectMap(
 
             ReturnAction =
                 XdpCpuMapRedirectMap(
-                    Map, Key, FallbackAction, IsProgTestRun || RxQueue == NULL, InterfaceMode,
-                    CpuMap, &XdpMd->Redirect.CpuMap);
+                    Map, Key, FallbackAction, IsProgTestRun || RxQueue == NULL,
+                    CpuMapRedirectAllowed, InterfaceMode, CpuMap,
+                    &XdpMd->Redirect.CpuMap);
             if (ReturnAction == XDP_REDIRECT && XdpMd->Redirect.CpuMap.CpuMapTarget != NULL) {
                 XdpMd->RedirectIntent = EbpfXdpRedirectIntentCpuMap;
             }
@@ -1278,7 +1336,8 @@ XdpProgramCanXskBypass(
 
 BOOLEAN
 XdpProgramCanCpuMapRedirect(
-    _In_ XDP_PROGRAM *Program
+    _In_ XDP_PROGRAM *Program,
+    _In_ CONST XDP_HOOK_ID *HookId
     )
 {
     //
@@ -1286,7 +1345,14 @@ XdpProgramCanCpuMapRedirect(
     // helper. Native XDP redirect targets do not include CPUMAP, so non-eBPF
     // programs must not pay for the private CPUMAP frame metadata.
     //
-    return XdpProgramIsEbpf(Program);
+    // The direction half is XdpCpuMapIsHookSupported, which is unit-tested
+    // directly against a real hook id. This is the ONLY place the exclusion may
+    // be made: it decides whether the private frame extension is registered, and
+    // the same result is mirrored into the inspection context so the helper
+    // declines before acquiring anything. Gating any later would leave the
+    // helper acquiring per-packet references that no commit would consume.
+    //
+    return XdpProgramIsEbpf(Program) && XdpCpuMapIsHookSupported(HookId);
 }
 
 static

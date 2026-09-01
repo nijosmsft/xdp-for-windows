@@ -83,12 +83,98 @@ typedef struct _DRIVER_OBJECT DRIVER_OBJECT;
 typedef struct _DEVICE_OBJECT DEVICE_OBJECT;
 
 //
-// NDIS types. CPUMAP stores these in ring entries and never dereferences them
-// in the control plane, so an opaque definition is faithful.
+// NDIS types.
+//
+// NET_BUFFER_LIST is modelled only as far as CPUMAP touches it: the data path
+// chains NBLs through Next when it builds indication partitions, so Next has to
+// be real. Everything else about an NBL is NDIS-internal and CPUMAP never reads
+// it.
 //
 typedef VOID *NDIS_HANDLE;
 typedef ULONG NDIS_PORT_NUMBER;
-typedef struct _NET_BUFFER_LIST NET_BUFFER_LIST;
+
+typedef struct _NET_BUFFER_LIST {
+    struct _NET_BUFFER_LIST *Next;
+} NET_BUFFER_LIST;
+
+#define NET_BUFFER_LIST_NEXT_NBL(_NBL) ((_NBL)->Next)
+
+#define NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL 0x00000001
+#define NDIS_RECEIVE_FLAGS_RESOURCES      0x00000002
+#define NDIS_RETURN_FLAGS_DISPATCH_LEVEL  0x00000001
+
+//
+// Every indication and every return is recorded, because partitioned indication
+// (design section 7) is a property of HOW MANY calls are made and with WHICH
+// handle, port, flags and count -- not of the NBLs themselves. A harness that
+// only counted NBLs could not tell a correctly partitioned drain from the POC
+// defect that indicates one merged chain with the last entry's handle and port.
+//
+
+#define XDP_CPUMAP_TEST_MAX_INDICATIONS 64
+
+typedef struct _XDP_CPUMAP_TEST_INDICATION {
+    NDIS_HANDLE FilterHandle;
+    NDIS_PORT_NUMBER PortNumber;
+    ULONG NblCount;
+    ULONG Flags;
+    NET_BUFFER_LIST *Head;
+} XDP_CPUMAP_TEST_INDICATION;
+
+extern XDP_CPUMAP_TEST_INDICATION XdpCpuMapTestIndications[XDP_CPUMAP_TEST_MAX_INDICATIONS];
+extern ULONG XdpCpuMapTestIndicationCount;
+extern XDP_CPUMAP_TEST_INDICATION XdpCpuMapTestReturns[XDP_CPUMAP_TEST_MAX_INDICATIONS];
+extern ULONG XdpCpuMapTestReturnCount;
+
+VOID
+XdpCpuMapTestResetNdis(
+    VOID
+    );
+
+VOID
+XdpCpuMapTestRecordNdisCall(
+    _Inout_ XDP_CPUMAP_TEST_INDICATION *Log,
+    _Inout_ ULONG *LogCount,
+    _In_ NDIS_HANDLE FilterHandle,
+    _In_ NET_BUFFER_LIST *NblChain,
+    _In_ NDIS_PORT_NUMBER PortNumber,
+    _In_ ULONG NblCount,
+    _In_ ULONG Flags
+    );
+
+FORCEINLINE
+VOID
+NdisFIndicateReceiveNetBufferLists(
+    _In_ NDIS_HANDLE FilterHandle,
+    _In_ NET_BUFFER_LIST *NetBufferLists,
+    _In_ NDIS_PORT_NUMBER PortNumber,
+    _In_ ULONG NumberOfNetBufferLists,
+    _In_ ULONG ReceiveFlags
+    )
+{
+    XdpCpuMapTestRecordNdisCall(
+        XdpCpuMapTestIndications, &XdpCpuMapTestIndicationCount, FilterHandle,
+        NetBufferLists, PortNumber, NumberOfNetBufferLists, ReceiveFlags);
+}
+
+FORCEINLINE
+VOID
+NdisFReturnNetBufferLists(
+    _In_ NDIS_HANDLE FilterHandle,
+    _In_ NET_BUFFER_LIST *NetBufferLists,
+    _In_ ULONG ReturnFlags
+    )
+{
+    ULONG NblCount = 0;
+
+    for (NET_BUFFER_LIST *Nbl = NetBufferLists; Nbl != NULL; Nbl = Nbl->Next) {
+        NblCount++;
+    }
+
+    XdpCpuMapTestRecordNdisCall(
+        XdpCpuMapTestReturns, &XdpCpuMapTestReturnCount, FilterHandle, NetBufferLists,
+        0, NblCount, ReturnFlags);
+}
 
 VOID
 XdpCpuMapTestAssert(
@@ -200,6 +286,11 @@ KeGetProcessorNumberFromIndex(
 //
 // DPC.
 //
+// The queue is modelled, not stubbed away. A DPC that is queued, cancelled,
+// flushed, or re-queued by its own routine is exactly the state machine design
+// section 7 makes safe with the rundown gate, and an empty stub would let a
+// broken gate pass.
+//
 
 typedef struct _KDPC KDPC;
 
@@ -217,7 +308,59 @@ struct _KDPC {
     VOID *Context;
     PROCESSOR_NUMBER Target;
     BOOLEAN Targeted;
+    BOOLEAN Queued;
 };
+
+#define XDP_CPUMAP_TEST_MAX_QUEUED_DPCS 16
+
+extern KDPC *XdpCpuMapTestQueuedDpcs[XDP_CPUMAP_TEST_MAX_QUEUED_DPCS];
+extern ULONG XdpCpuMapTestQueuedDpcCount;
+extern ULONG XdpCpuMapTestDpcInsertCalls;
+extern ULONG XdpCpuMapTestDpcRunCount;
+
+//
+// The lowest Target->PacketRundown count observed at the instant
+// KeInsertQueueDpc was called, over every insert since the last reset.
+//
+// Design section 7 orders step 5 (KeInsertQueueDpc) BEFORE step 6 (release the
+// group's target rundown references), and that ordering is the entire reason
+// step 5 needs no separate producer reference: while the group still holds one,
+// the retire path's rundown wait cannot have completed and the DPC cannot have
+// been freed. Nothing about the resulting state records the order, so it has to
+// be sampled at the call.
+//
+extern LONG XdpCpuMapTestMinRundownAtDpcInsert;
+
+//
+// Set nonzero to make KeShouldYieldProcessor report that the DPC must yield, so
+// the bounded-drain yield/requeue path and its rundown gate are reachable.
+//
+extern BOOLEAN XdpCpuMapTestShouldYield;
+
+VOID
+XdpCpuMapTestResetDpcs(
+    VOID
+    );
+
+BOOLEAN
+XdpCpuMapTestInsertQueueDpc(
+    _Inout_ KDPC *Dpc
+    );
+
+BOOLEAN
+XdpCpuMapTestRemoveQueueDpc(
+    _Inout_ KDPC *Dpc
+    );
+
+//
+// Runs every queued DPC to completion, bounded. A DPC that re-queues itself is
+// run again, which is what the real KeFlushQueuedDpcs ends up doing and is the
+// only way the self-requeue path is observable here.
+//
+VOID
+XdpCpuMapTestRunQueuedDpcs(
+    VOID
+    );
 
 //
 // Set nonzero to make the next KeSetTargetProcessorDpcEx fail. Without this the
@@ -237,6 +380,7 @@ KeInitializeDpc(
     Dpc->Routine = Routine;
     Dpc->Context = Context;
     Dpc->Targeted = FALSE;
+    Dpc->Queued = FALSE;
 }
 
 FORCEINLINE
@@ -257,12 +401,25 @@ KeSetTargetProcessorDpcEx(
 
 FORCEINLINE
 BOOLEAN
+KeInsertQueueDpc(
+    _Inout_ KDPC *Dpc,
+    _In_opt_ VOID *SystemArgument1,
+    _In_opt_ VOID *SystemArgument2
+    )
+{
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    return XdpCpuMapTestInsertQueueDpc(Dpc);
+}
+
+FORCEINLINE
+BOOLEAN
 KeRemoveQueueDpc(
     _Inout_ KDPC *Dpc
     )
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    return FALSE;
+    return XdpCpuMapTestRemoveQueueDpc(Dpc);
 }
 
 FORCEINLINE
@@ -271,6 +428,16 @@ KeFlushQueuedDpcs(
     VOID
     )
 {
+    XdpCpuMapTestRunQueuedDpcs();
+}
+
+FORCEINLINE
+BOOLEAN
+KeShouldYieldProcessor(
+    VOID
+    )
+{
+    return XdpCpuMapTestShouldYield;
 }
 
 //
@@ -384,24 +551,26 @@ RtlReleasePushLockShared(
 // single-threaded harness a nonzero count at wait time is a guaranteed deadlock
 // in the kernel, so asserting is strictly better than hanging.
 //
-// The Ex variants additionally count CALLS, not just references. Reference
-// totals cannot distinguish a batched flush group from per-packet acquisition --
-// both end at the same count -- so the number of trips to the shared rundown is
-// the only observable that proves batching. Only the Ex variants are counted:
-// within this harness they are reached exclusively from
-// XdpCpuMapCommitGroupTakeCredit and XdpCpuMapCommitGroupFinish, whereas the
-// non-Ex variants serve per-target PacketRundown references and would pollute
-// the signal. XdpCpuMapTestRundownAcquireCalls counts ATTEMPTS, so a failed
-// acquire against an active rundown still increments it. Neither counter resets
-// itself; a test that reads them zeroes them first.
+// CALLS are counted, not just references, and they are counted PER OBJECT.
+// Reference totals cannot distinguish a batched flush group from per-packet
+// acquisition -- both end at the same count -- so the number of trips to a given
+// shared rundown is the only observable that proves batching. Counting them
+// globally was not enough once the data path landed: a target's PacketRundown
+// and a receive queue's NblRundown are both released in batches now, and a
+// global counter cannot tell which object a call went to. Per-object counters
+// let each test name the rundown whose call count carries its claim.
 //
-
-extern ULONG XdpCpuMapTestRundownAcquireCalls;
-extern ULONG XdpCpuMapTestRundownReleaseCalls;
+// AcquireCalls counts ATTEMPTS, so a failed acquire against an active rundown
+// still increments it. ExInitializeRundownProtection zeroes all four.
+//
 
 typedef struct _EX_RUNDOWN_REF {
     LONG Count;
     BOOLEAN RundownActive;
+    ULONG AcquireCalls;
+    ULONG ReleaseCalls;
+    ULONG AcquireExCalls;
+    ULONG ReleaseExCalls;
 } EX_RUNDOWN_REF;
 
 FORCEINLINE
@@ -412,6 +581,10 @@ ExInitializeRundownProtection(
 {
     RunRef->Count = 0;
     RunRef->RundownActive = FALSE;
+    RunRef->AcquireCalls = 0;
+    RunRef->ReleaseCalls = 0;
+    RunRef->AcquireExCalls = 0;
+    RunRef->ReleaseExCalls = 0;
 }
 
 FORCEINLINE
@@ -420,6 +593,8 @@ ExAcquireRundownProtection(
     _Inout_ EX_RUNDOWN_REF *RunRef
     )
 {
+    RunRef->AcquireCalls++;
+
     if (RunRef->RundownActive) {
         return FALSE;
     }
@@ -435,7 +610,7 @@ ExAcquireRundownProtectionEx(
     _In_ ULONG Count
     )
 {
-    XdpCpuMapTestRundownAcquireCalls++;
+    RunRef->AcquireExCalls++;
 
     if (RunRef->RundownActive) {
         return FALSE;
@@ -451,6 +626,8 @@ ExReleaseRundownProtection(
     _Inout_ EX_RUNDOWN_REF *RunRef
     )
 {
+    RunRef->ReleaseCalls++;
+
     XDPCPUMAP_TEST_ASSERT(RunRef->Count > 0);
     RunRef->Count--;
 }
@@ -462,7 +639,7 @@ ExReleaseRundownProtectionEx(
     _In_ ULONG Count
     )
 {
-    XdpCpuMapTestRundownReleaseCalls++;
+    RunRef->ReleaseExCalls++;
 
     XDPCPUMAP_TEST_ASSERT(RunRef->Count >= (LONG)Count);
     RunRef->Count -= Count;

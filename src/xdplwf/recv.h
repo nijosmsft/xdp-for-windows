@@ -151,6 +151,13 @@ XdpGenericRecvInjectComplete(
 _IRQL_requires_max_(PASSIVE_LEVEL)
 _Requires_exclusive_lock_held_(&Generic->Lock)
 VOID
+XdpGenericRxMarkPaused(
+    _In_ XDP_LWF_GENERIC *Generic
+    );
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+_Requires_exclusive_lock_held_(&Generic->Lock)
+VOID
 XdpGenericRxPause(
     _In_ XDP_LWF_GENERIC *Generic
     );
