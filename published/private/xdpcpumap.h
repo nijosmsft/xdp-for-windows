@@ -18,6 +18,7 @@
 #include <xdp/datapath.h>
 #include <xdp/extension.h>
 #include <xdp/rxqueueconfig.h>
+#include <xdpcpumaplimits.h>
 
 EXTERN_C_START
 
@@ -77,16 +78,17 @@ XdpGetCpuMapRedirectExtension(
 // XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK packets therefore acquires again, which is
 // legitimate and is one trip per chunk rather than one per packet.
 //
-#define XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK 32u
+// N.B. XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK and XDP_CPUMAP_BATCH_SIZE now live in
+// xdpcpumaplimits.h, included above. They moved so the user-mode functional test
+// can static_assert its frame count against them; this header cannot be included
+// from user mode.
+//
 
 //
 // The flush batch. Section 7 "Batch enqueue": generic RX accumulates redirect
 // decisions and the flush groups them by target so the ring lock is taken once
 // per target per flush rather than once per packet (section 7.1).
 //
-// Batch input count is POC A's 32 (section 7, "Batch input count").
-//
-#define XDP_CPUMAP_BATCH_SIZE 32u
 
 //
 // One accumulated redirect. FilterHandle, PortNumber and the owning receive

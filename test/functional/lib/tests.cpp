@@ -44,6 +44,7 @@
 #include <xdp/ebpfhook.h>
 #include <xdp/buffervirtualaddress.h>
 #include <xdp/cpumap.h>
+#include <xdpcpumaplimits.h>
 #include <xdp/framefragment.h>
 #include <xdp/framerxaction.h>
 
@@ -6370,6 +6371,225 @@ GenericRxEbpfCpuMapRedirect()
         LwfRxDequeueFrame(FnLwf, 0);
         LwfRxFlush(FnLwf);
     }
+}
+
+//
+// Zero-copy across a multi-NBL arrival chain that exceeds one commit batch.
+//
+// GenericRxEbpfCpuMapRedirect proves one frame reaches the target CPU. A chain
+// longer than both private batching thresholds reaches things it cannot. What
+// this test establishes, stated as what is actually observable:
+//
+//   1. Receive-side processing crosses the private batch-size boundary: one
+//      XdpGenericReceivePostInspectNbs call commits more than
+//      XDP_CPUMAP_BATCH_SIZE redirects.
+//   2. The full-group flush path is INVOKED MID-TRAVERSAL.
+//      XdpCpuMapCommitRedirect flushes a full group inline before inserting the
+//      current entry, so XdpCpuMapFlushBatch runs while the arrival chain is
+//      still being walked. At 32 or fewer the only flush is in
+//      XdpCpuMapCommitGroupFinish, after traversal has finished.
+//   3. A second rundown credit chunk is required: XdpCpuMapCommitGroupTakeCredit
+//      acquires XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK references at a time, so a group
+//      of 40 must acquire twice. No other functional test reaches that.
+//   4. More than one logical flush occurs in a single receive call, so
+//      KeInsertQueueDpc is ATTEMPTED more than once for the target.
+//   5. Forty distinct originals are indicated and accounted for by identity.
+//
+// What it does NOT establish, and must not be recorded as:
+//
+//   - That the first DPC actually ran before source traversal finished. The test
+//     observes only the final indications; it cannot order them against the
+//     source loop, so "the target CPU drains concurrently with source
+//     processing" is possible but unproven here.
+//   - That every KeInsertQueueDpc SUCCEEDED in queueing. Inserting a DPC that is
+//     already queued coalesces and returns FALSE, which is both legal and
+//     expected here, so item 4 is attempts, not successful insertions.
+//   - That recv.c's CachedNextNbl is load-bearing for CPUMAP. That claim is
+//     false at EVERY chain length, not merely below 32: the flush empties the
+//     group and only then inserts the current NBL, so the NBL whose
+//     NET_BUFFER_LIST_NEXT_NBL the loop reads at recv.c:1754 is never in the
+//     batch that flush queued a DPC for, and its Next cannot have been rewritten
+//     by that DPC. CachedNextNbl is load-bearing for PASS/TX/DROP, where
+//     NdisAppendSingleNblToNblQueue nulls Next synchronously. Removing or moving
+//     the cache is predicted NOT to fail this test.
+//   - That each original returned to the miniport exactly once. FnMp exposes no
+//     RX return stream (fnmpioctl.h defines RX_ENQUEUE and RX_FLUSH only), so no
+//     assertion at this layer can correlate an indicated original to a miniport
+//     return. The retained WPP/ETW evidence on issue #18 is where that leg
+//     lives.
+//
+#define XDPCPUMAP_TEST_CHAIN_FRAMES 40u
+
+//
+// The whole reason for 40 is to cross BOTH private thresholds, so a later change
+// to either constant must fail the build rather than quietly reducing this to a
+// longer version of the single-frame test. The values come from
+// xdpcpumaplimits.h; they are not restated here.
+//
+static_assert(
+    XDPCPUMAP_TEST_CHAIN_FRAMES > XDP_CPUMAP_BATCH_SIZE,
+    "chain must exceed XDP_CPUMAP_BATCH_SIZE so the mid-traversal full-group "
+    "flush is invoked");
+static_assert(
+    XDPCPUMAP_TEST_CHAIN_FRAMES > XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK,
+    "chain must exceed XDP_CPUMAP_RUNDOWN_CREDIT_CHUNK so a second credit chunk "
+    "is acquired");
+
+//
+// Index bytes stay printable and distinct across all 40 frames: 'A'..'h'.
+//
+#define XDPCPUMAP_TEST_CHAIN_INDEX_BASE 'A'
+
+static_assert(
+    XDPCPUMAP_TEST_CHAIN_FRAMES <= 0x7F - XDPCPUMAP_TEST_CHAIN_INDEX_BASE,
+    "index byte encoding must stay printable and distinct for every frame");
+
+
+VOID
+GenericRxEbpfCpuMapRedirectChain()
+{
+    auto If = FnMpIf;
+    unique_fnmp_handle GenericMp;
+    unique_fnlwf_handle FnLwf;
+    UCHAR Payload[] = "GenericRxEbpfCpuMapRedirectChain#";
+    const SIZE_T PayloadIndexOffset = sizeof(Payload) - 2;
+    PROCESSOR_NUMBER ArrivalProcessor;
+    PROCESSOR_NUMBER TargetProcessor = {0};
+    UINT32 TargetIndex = MAXUINT32;
+    BOOLEAN Seen[XDPCPUMAP_TEST_CHAIN_FRAMES] = {0};
+
+    const UINT32 ProcessorCount = GetProcessorCount(0);
+    TEST_TRUE(ProcessorCount >= 2);
+
+    GenericMp = MpOpenGeneric(If.GetIfIndex());
+    FnLwf = LwfOpenDefault(If.GetIfIndex());
+
+    //
+    // Match on the payload prefix only, so every frame in the chain is captured
+    // regardless of its index byte.
+    //
+    CxPlatVector<UCHAR> Mask(sizeof(Payload), 0xFF);
+    Mask[PayloadIndexOffset] = 0x00;
+    auto LwfFilter = LwfRxFilter(FnLwf, Payload, Mask.data(), sizeof(Payload));
+
+    DATA_FLUSH_OPTIONS FlushOptions = {0};
+    FlushOptions.Flags.RssCpu = TRUE;
+    FlushOptions.RssCpuQueueId = If.GetQueueId();
+
+    //
+    // Establish the arrival processor with a control frame, so the target can be
+    // chosen to differ from it.
+    //
+    {
+        unique_xdp_program PassProgram =
+            AttachEbpfXdpProgram(If, "\\bpf\\pass.sys", "pass");
+
+        RX_FRAME Frame;
+        RxInitializeFrame(&Frame, If.GetQueueId(), Payload, sizeof(Payload));
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+        TEST_HRESULT(TryMpRxFlush(GenericMp, &FlushOptions));
+
+        auto RxFrame = LwfRxAllocateAndGetFrame(FnLwf, 0);
+        ArrivalProcessor = RxFrame->Output.ProcessorNumber;
+        LwfRxDequeueFrame(FnLwf, 0);
+        LwfRxFlush(FnLwf);
+    }
+
+    TEST_EQUAL(0, ArrivalProcessor.Group);
+
+    for (UINT32 Index = 0; Index < ProcessorCount; Index++) {
+        PROCESSOR_NUMBER Candidate;
+
+        ProcessorIndexToProcessorNumber(Index, &Candidate);
+        if (Candidate.Group == 0 && Candidate.Number != ArrivalProcessor.Number) {
+            TargetIndex = Index;
+            TargetProcessor = Candidate;
+            break;
+        }
+    }
+
+    TEST_NOT_EQUAL(MAXUINT32, TargetIndex);
+
+    unique_xdp_program BpfProgram =
+        AttachEbpfXdpProgram(If, "\\bpf\\cpumap_redirect.sys", "cpumap_redirect");
+
+    fd_t cpu_map_fd = bpf_object__find_map_fd_by_name(BpfProgram.get(), "cpu_map");
+    TEST_NOT_EQUAL(cpu_map_fd, ebpf_fd_invalid);
+
+    XDP_CPUMAP_KEY MapKey = 0;
+    XDP_CPUMAP_ENTRY_V1 MapEntry;
+
+    RtlZeroMemory(&MapEntry, sizeof(MapEntry));
+    MapEntry.Size = XDP_CPUMAP_ENTRY_SIZE_V1;
+    MapEntry.Version = XDP_CPUMAP_ENTRY_VERSION_1;
+    MapEntry.TargetCpu = TargetIndex;
+    TEST_EQUAL(0, bpf_map_update_elem(cpu_map_fd, &MapKey, &MapEntry, BPF_ANY));
+
+    //
+    // Enqueue the whole chain BEFORE flushing, so the miniport indicates it as
+    // one linked chain rather than as N separate indications. Each frame carries
+    // its index so identity, not just count, can be checked on the way out.
+    //
+    for (UINT32 Index = 0; Index < XDPCPUMAP_TEST_CHAIN_FRAMES; Index++) {
+        Payload[PayloadIndexOffset] = (UCHAR)(XDPCPUMAP_TEST_CHAIN_INDEX_BASE + Index);
+
+        RX_FRAME Frame;
+        RxInitializeFrame(&Frame, If.GetQueueId(), Payload, sizeof(Payload));
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+    }
+
+    TEST_HRESULT(TryMpRxFlush(GenericMp, &FlushOptions));
+
+    //
+    // Every frame in the chain must arrive, on the target processor, exactly
+    // once, with its payload intact. A chain that lost its traversal would drop
+    // the tail; one that duplicated would repeat an index; one that was not
+    // redirected would arrive on the arrival processor.
+    //
+    // Drain one frame at a time from index 0 rather than reading indices 0..N-1
+    // in place: nothing in this repo exercises a filtered-frame index above 0,
+    // so the LWF's simultaneous queue depth is not established here, and this
+    // loop is correct for any depth >= 1.
+    //
+    for (UINT32 Index = 0; Index < XDPCPUMAP_TEST_CHAIN_FRAMES; Index++) {
+        auto RxFrame = LwfRxAllocateAndGetFrame(FnLwf, 0);
+
+        TEST_EQUAL(TargetProcessor.Group, RxFrame->Output.ProcessorNumber.Group);
+        TEST_EQUAL(TargetProcessor.Number, RxFrame->Output.ProcessorNumber.Number);
+        TEST_NOT_EQUAL(ArrivalProcessor.Number, RxFrame->Output.ProcessorNumber.Number);
+
+        TEST_EQUAL(1u, (UINT32)RxFrame->BufferCount);
+
+        const DATA_BUFFER *Buffer = &RxFrame->Buffers[0];
+        TEST_EQUAL(sizeof(Payload), Buffer->DataLength);
+
+        const UCHAR *Data = Buffer->VirtualAddress + Buffer->DataOffset;
+        UINT32 FrameIndex =
+            (UINT32)(Data[PayloadIndexOffset] - XDPCPUMAP_TEST_CHAIN_INDEX_BASE);
+
+        //
+        // Identity, not merely count. A duplicated NBL consumes one of the N
+        // reads and repeats an index; the missing index is then caught below.
+        //
+        TEST_TRUE(FrameIndex < XDPCPUMAP_TEST_CHAIN_FRAMES);
+        TEST_FALSE(Seen[FrameIndex]);
+        Seen[FrameIndex] = TRUE;
+
+        LwfRxDequeueFrame(FnLwf, 0);
+        LwfRxFlush(FnLwf);
+    }
+
+    for (UINT32 Index = 0; Index < XDPCPUMAP_TEST_CHAIN_FRAMES; Index++) {
+        TEST_TRUE(Seen[Index]);
+    }
+
+    //
+    // And nothing beyond the chain.
+    //
+    UINT32 FrameLength = 0;
+    TEST_EQUAL(
+        HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+        LwfRxGetFrame(FnLwf, 0, &FrameLength, NULL));
 }
 
 VOID
