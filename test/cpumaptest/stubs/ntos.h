@@ -113,12 +113,35 @@ typedef struct _NET_BUFFER_LIST {
 
 #define XDP_CPUMAP_TEST_MAX_INDICATIONS 64
 
+//
+// Bounds the per-call identity snapshot below. A drain partition cannot exceed
+// one ring's worth of entries, and the tests that assert identity use rings far
+// smaller than this.
+//
+#define XDP_CPUMAP_TEST_MAX_NBLS_PER_CALL 128
+
 typedef struct _XDP_CPUMAP_TEST_INDICATION {
     NDIS_HANDLE FilterHandle;
     NDIS_PORT_NUMBER PortNumber;
     ULONG NblCount;
     ULONG Flags;
     NET_BUFFER_LIST *Head;
+
+    //
+    // The chain as it was AT CALL TIME, by identity.
+    //
+    // Head alone is not sufficient evidence. Once a chain is handed to NDIS the
+    // callee owns it and may relink it, and in this harness the NBLs are
+    // caller-owned storage that later production steps -- ChainSetTake's
+    // termination, a subsequent commit reusing the same NBL -- legitimately
+    // rewrite. Walking Head->Next after the fact therefore reports what the
+    // chain looks like NOW, not what was passed, so a mutation that corrupts
+    // linkage can appear to have passed a different set than it did. Snapshot
+    // the pointers while the call is on the stack.
+    //
+    ULONG NblSnapshotCount;
+    BOOLEAN NblSnapshotTruncated;
+    NET_BUFFER_LIST *NblSnapshot[XDP_CPUMAP_TEST_MAX_NBLS_PER_CALL];
 } XDP_CPUMAP_TEST_INDICATION;
 
 extern XDP_CPUMAP_TEST_INDICATION XdpCpuMapTestIndications[XDP_CPUMAP_TEST_MAX_INDICATIONS];

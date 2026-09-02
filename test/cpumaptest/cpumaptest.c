@@ -208,6 +208,23 @@ XdpCpuMapTestRecordNdisCall(
     Log[*LogCount].NblCount = NblCount;
     Log[*LogCount].Flags = Flags;
     Log[*LogCount].Head = NblChain;
+
+    Log[*LogCount].NblSnapshotCount = 0;
+    Log[*LogCount].NblSnapshotTruncated = FALSE;
+    for (NET_BUFFER_LIST *Nbl = NblChain; Nbl != NULL; Nbl = Nbl->Next) {
+        if (Log[*LogCount].NblSnapshotCount == RTL_NUMBER_OF(Log[*LogCount].NblSnapshot)) {
+            //
+            // Recorded rather than silently dropped: a truncated snapshot would
+            // make a duplicate look absent, which is the exact conclusion these
+            // tests must never reach by accident.
+            //
+            Log[*LogCount].NblSnapshotTruncated = TRUE;
+            break;
+        }
+
+        Log[*LogCount].NblSnapshot[Log[*LogCount].NblSnapshotCount++] = Nbl;
+    }
+
     (*LogCount)++;
 }
 
@@ -2390,6 +2407,23 @@ XdpCpuMapTestInitGroup(
 }
 
 //
+// Ends a group and returns the originals the flush handed back as undeliverable,
+// as a chain, so callers can check IDENTITY rather than count.
+//
+static
+NET_BUFFER_LIST *
+XdpCpuMapTestFinishGroupEx(
+    _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
+    )
+{
+    NET_BUFFER_LIST *Rejected;
+
+    XdpCpuMapCommitGroupFinish(Group, &Rejected);
+
+    return Rejected;
+}
+
+//
 // Ends a group and returns how many originals the flush handed back as
 // undeliverable. The caller owns those in production; here the count is the
 // assertion.
@@ -2400,10 +2434,8 @@ XdpCpuMapTestFinishGroup(
     _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
     )
 {
-    NET_BUFFER_LIST *Rejected;
+    NET_BUFFER_LIST *Rejected = XdpCpuMapTestFinishGroupEx(Group);
     UINT32 Count = 0;
-
-    XdpCpuMapCommitGroupFinish(Group, &Rejected);
 
     while (Rejected != NULL) {
         Rejected = NET_BUFFER_LIST_NEXT_NBL(Rejected);
@@ -3572,6 +3604,615 @@ XdpCpuMapTestTargetDpcAffinity(
 }
 
 //
+// Per-NBL disposition across everything NDIS was told to do with it.
+//
+// Increment 6's tests counted indications and returns. That cannot see the
+// failures increment 7 exists to rule out: an NBL indicated twice, an NBL both
+// indicated and returned, or an NBL that quietly appears in a partition it does
+// not belong to all produce the same totals as correct behaviour. Identity is
+// the only observable that separates them, so every zero-copy assertion below is
+// made per NBL rather than per count.
+//
+typedef struct _XDPCPUMAP_TEST_NBL_DISPOSITION {
+    UINT32 Indicated;
+    UINT32 Returned;
+    UINT32 IndicationIndex;
+    ULONG IndicationFlags;
+} XDPCPUMAP_TEST_NBL_DISPOSITION;
+
+static
+XDPCPUMAP_TEST_NBL_DISPOSITION
+XdpCpuMapTestNblDisposition(
+    _In_ const NET_BUFFER_LIST *Nbl
+    )
+{
+    XDPCPUMAP_TEST_NBL_DISPOSITION Disposition = {0};
+
+    Disposition.IndicationIndex = MAXUINT32;
+
+    for (ULONG Index = 0; Index < XdpCpuMapTestIndicationCount; Index++) {
+        const XDP_CPUMAP_TEST_INDICATION *Indication = &XdpCpuMapTestIndications[Index];
+
+        //
+        // The snapshot, not Head->Next: see XDP_CPUMAP_TEST_INDICATION. A
+        // truncated snapshot cannot support a negative conclusion, so refuse it
+        // outright rather than under-reporting appearances.
+        //
+        XDPCPUMAP_TEST_ASSERT(!Indication->NblSnapshotTruncated);
+        XDPCPUMAP_TEST_ASSERT(Indication->NblSnapshotCount == Indication->NblCount);
+
+        for (ULONG Slot = 0; Slot < Indication->NblSnapshotCount; Slot++) {
+            if (Indication->NblSnapshot[Slot] == Nbl) {
+                Disposition.Indicated++;
+                Disposition.IndicationIndex = Index;
+                Disposition.IndicationFlags = Indication->Flags;
+            }
+        }
+    }
+
+    for (ULONG Index = 0; Index < XdpCpuMapTestReturnCount; Index++) {
+        const XDP_CPUMAP_TEST_INDICATION *Return = &XdpCpuMapTestReturns[Index];
+
+        XDPCPUMAP_TEST_ASSERT(!Return->NblSnapshotTruncated);
+        XDPCPUMAP_TEST_ASSERT(Return->NblSnapshotCount == Return->NblCount);
+
+        for (ULONG Slot = 0; Slot < Return->NblSnapshotCount; Slot++) {
+            if (Return->NblSnapshot[Slot] == Nbl) {
+                Disposition.Returned++;
+            }
+        }
+    }
+
+    return Disposition;
+}
+
+//
+// Counts how many of the NBLs in a caller-supplied array appear in a chain, so a
+// rejected-original list can be checked for identity rather than length.
+//
+static
+UINT32
+XdpCpuMapTestCountNblsInChain(
+    _In_opt_ const NET_BUFFER_LIST *Chain,
+    _In_ const NET_BUFFER_LIST *Nbl
+    )
+{
+    UINT32 Count = 0;
+
+    for (const NET_BUFFER_LIST *Cur = Chain; Cur != NULL; Cur = Cur->Next) {
+        if (Cur == Nbl) {
+            Count++;
+        }
+    }
+
+    return Count;
+}
+
+//
+// Zero-copy ownership, end to end, asserted on NBL IDENTITY.
+//
+// Design section 8.1a row 9a: the original miniport NBL is taken at commit,
+// placed in the ring slot, and released by NdisFIndicateReceiveNetBufferLists
+// WITHOUT NDIS_RECEIVE_FLAGS_RESOURCES on the target CPU. Issue #17 proved the
+// indication processor; it did not prove that the thing indicated is the same
+// NBL, indicated once, and never returned. A count-based test passes while the
+// NBL is duplicated across partitions or both indicated and returned.
+//
+// Two targets and two indication identities, interleaved, so the assertion also
+// covers partitioning: every original must appear in exactly ONE indication, and
+// in the one belonging to its own filter/port/queue.
+//
+// Deletion criteria, each naming the production operation removed. Radii below
+// are from running all 37 cases in isolation, with each outcome typed as pass,
+// assertion failure, crash or hang -- not from FAIL-line counts in a single
+// whole-suite run, which cannot distinguish a crash from a pass.
+//
+//   (a) In the flush, write Slot->IsDeepCopy = TRUE instead of FALSE. The drain
+//       derives the RESOURCES bit from that field, so the operation removed is
+//       "indicate originals without RESOURCES" and the flag assertions fail.
+//       Nothing else changes: the same NBLs are still indicated once each.
+//       Radius: ZeroCopyOwnershipLifecycle 12, DrainPartitionedIndication 4,
+//       ZeroCopyTeardownDisposal 2, DrainTombstoneSkip 1, DrainYieldRequeueGate
+//       1, RetireDrainReturns 1; 31 pass, 0 crash, 0 hang.
+//
+//   (b) In XdpCpuMapChainSetTake, drop the
+//       NET_BUFFER_LIST_NEXT_NBL(Entry->Nbl) = NULL that terminates the NBL
+//       before appending it. The operation removed is "build a well-formed
+//       chain from slot NBLs": the indicated chain then still carries whatever
+//       Next the producer left in place, so the chain walked at indication time
+//       does not match the count the drain computed.
+//       Radius: ZeroCopyPostCommitRejection 167, ZeroCopyOwnershipLifecycle 8;
+//       35 pass, 0 crash, 0 hang.
+//
+//   (c) In step 5 of the flush, acquire Target->PacketRundown before
+//       KeInsertQueueDpc and never release it. The operation removed is "the
+//       group borrows target rundown references and returns ALL of them at step
+//       6, keeping none for the queued DPC" -- the producer reference an earlier
+//       design revision proposed and could not say when to release. The mutated
+//       code still enqueues, still drains and still indicates correctly, so only
+//       the PacketRundown.Count assertions can see it. This one is NOT isolating
+//       and is not meant to be: the same invariant is asserted by every test
+//       that flushes, and it fails in eleven of them -- CommitGroupBatching 11,
+//       EnqueueInsertOrdering 4, ZeroCopyOwnershipLifecycle 4,
+//       DrainYieldRequeueGate 2, EnqueueRingFull 2,
+//       ZeroCopyPostCommitRejection 2, ZeroCopyTeardownDisposal 2,
+//       CommitFrameReuse 1, DrainPartitionedIndication 1, DrainTombstoneSkip 1,
+//       RetireDrainReturns 1; 26 pass, 0 crash, 0 hang.
+//
+#define XDPCPUMAP_TEST_ZEROCOPY_NBLS 6u
+
+static
+VOID
+XdpCpuMapTestZeroCopyOwnershipLifecycle(
+    VOID
+    )
+{
+    NET_BUFFER_LIST Nbls[XDPCPUMAP_TEST_ZEROCOPY_NBLS] = {0};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value0;
+    XDP_CPUMAP_PROVIDER_VALUE Value1;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF RundownA;
+    EX_RUNDOWN_REF RundownB;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_CPUMAP_HELPER_STATS Stats;
+    LONG Baseline;
+    UINT32 Index;
+
+    XDPCPUMAP_TEST_BEGIN("ZeroCopyOwnershipLifecycle");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value0)));
+    Entry = XdpCpuMapTestEntry(1, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value1)));
+
+    ExInitializeRundownProtection(&RundownA);
+    ExInitializeRundownProtection(&RundownB);
+
+    //
+    // Link the originals into an arrival chain, as the miniport indicates them.
+    // This is not decoration: a slot NBL carries whatever Next the producer left
+    // in place, so the drain MUST terminate each one as it appends it to a
+    // partition. With unchained NBLs every Next is already NULL and that
+    // production step would be unobservable.
+    //
+    for (Index = 0; Index + 1 < RTL_NUMBER_OF(Nbls); Index++) {
+        NET_BUFFER_LIST_NEXT_NBL(&Nbls[Index]) = &Nbls[Index + 1];
+    }
+
+    //
+    // Even NBLs go to target 0 via queue A, odd to target 1 via queue B. Two
+    // targets and two rundowns means two rings and, in the drain, two
+    // partitions -- and because the arrival chain interleaves them, a drain that
+    // failed to terminate would splice one partition into the other.
+    //
+    for (Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        BOOLEAN UseA = (Index % 2) == 0;
+
+        XdpCpuMapCommitGroupInit(
+            &CommitGroup,
+            UseA ? &RundownA : &RundownB,
+            UseA ? XDPCPUMAP_TEST_FILTER_A : XDPCPUMAP_TEST_FILTER_B,
+            0,
+            UseA ? (const VOID *)&XdpCpuMapTestRxQueueA : (const VOID *)&XdpCpuMapTestRxQueueB,
+            UseA ? (const VOID *)&XdpCpuMapTestGenericA : (const VOID *)&XdpCpuMapTestGenericB,
+            FALSE);
+
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTestCommit(
+                CpuMap, UseA ? Value0.Target : Value1.Target, &Nbls[Index], &CommitGroup));
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+    }
+
+    //
+    // The ring slots hold the ORIGINALS themselves, in arrival order, flagged as
+    // originals rather than deep copies, each owning its backing reference and
+    // its own queue's rundown.
+    //
+    for (Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        BOOLEAN UseA = (Index % 2) == 0;
+        const XDP_CPUMAP_TARGET *Target = UseA ? Value0.Target : Value1.Target;
+        const XDP_CPUMAP_RING *Ring = Target->Ring;
+        const XDP_CPUMAP_ENTRY *Slot = &Ring->Entries[(Index / 2) & Ring->Mask];
+
+        XDPCPUMAP_TEST_ASSERT(Slot->Nbl == &Nbls[Index]);
+        XDPCPUMAP_TEST_ASSERT(!Slot->IsDeepCopy);
+        XDPCPUMAP_TEST_ASSERT(Slot->BackingRef == CpuMap);
+        XDPCPUMAP_TEST_ASSERT(Slot->NblRundown == (UseA ? &RundownA : &RundownB));
+        XDPCPUMAP_TEST_ASSERT(
+            Slot->FilterHandle == (UseA ? XDPCPUMAP_TEST_FILTER_A : XDPCPUMAP_TEST_FILTER_B));
+    }
+
+    //
+    // The ring owns one reference per queued original; the flush group kept
+    // none of the target rundown references it borrowed.
+    //
+    XDPCPUMAP_TEST_ASSERT(RundownA.Count == (LONG)(RTL_NUMBER_OF(Nbls) / 2));
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == (LONG)(RTL_NUMBER_OF(Nbls) / 2));
+    XDPCPUMAP_TEST_ASSERT(Value0.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(Value1.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1 + (LONG)RTL_NUMBER_OF(Nbls));
+
+    //
+    // Nothing has been handed to NDIS yet: ownership is CPUMAP's, exclusively.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
+
+    XdpCpuMapTestRunQueuedDpcs();
+
+    //
+    // The claim, stated to the harness boundary. Each original is indicated
+    // EXACTLY ONCE by CPUMAP, is the subject of no CPUMAP return call, and is
+    // indicated without RESOURCES -- it is a lent miniport buffer, not a deep
+    // copy, so it must be allowed to complete asynchronously.
+    //
+    // What this proves is CPUMAP's own disposition calls, checked against the
+    // immutable pointer snapshots taken inside the NdisF* stubs at call time
+    // (see XDP_CPUMAP_TEST_INDICATION). It does NOT cross into the stack: the
+    // original's actual return to FnMp travels through
+    // XdpGenericReturnNetBufferLists after the upper stack completes it, which
+    // this harness does not link and no functional test can observe -- FnMp
+    // exposes no RX return stream. That leg is established by the WPP/ETW trace
+    // retained on issue #18, which parsed 40 of 40 exact returns. Treat that as
+    // external evidence, not unit coverage, and do not restate it as a harness
+    // result.
+    //
+    for (Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&Nbls[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 1);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+        XDPCPUMAP_TEST_ASSERT(
+            (Disposition.IndicationFlags & NDIS_RECEIVE_FLAGS_RESOURCES) == 0);
+        XDPCPUMAP_TEST_ASSERT(
+            (Disposition.IndicationFlags & NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL) != 0);
+
+        //
+        // And in the partition belonging to its own queue, not merely in some
+        // indication.
+        //
+        XDPCPUMAP_TEST_ASSERT(Disposition.IndicationIndex != MAXUINT32);
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTestIndications[Disposition.IndicationIndex].FilterHandle ==
+                ((Index % 2) == 0 ? XDPCPUMAP_TEST_FILTER_A : XDPCPUMAP_TEST_FILTER_B));
+    }
+
+    //
+    // Two targets, so two DPCs and two indications; no chain merged across them.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 2);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
+
+    //
+    // Every reference the slots owned went with the packets.
+    //
+    XDPCPUMAP_TEST_ASSERT(RundownA.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueCount == RTL_NUMBER_OF(Nbls));
+    XDPCPUMAP_TEST_ASSERT(Stats.DrainCount == RTL_NUMBER_OF(Nbls));
+    XDPCPUMAP_TEST_ASSERT(Stats.RingFullCount == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueTargetInactive == 0);
+
+    XdpCpuMapTestRelease(CpuMap, &Value0);
+    XdpCpuMapTestRelease(CpuMap, &Value1);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Post-commit rejection: the original is handed back exactly once and is never
+// indicated.
+//
+// Ring-full and the under-lock Target->Active re-check both happen AFTER
+// ownership was taken and ActionNbl cleared, so the packet cannot fall back to
+// PASS or TX -- the caller must return it to the miniport (section 8.1a row 9a,
+// "Released -- post-commit failure"). Increment 6 asserted the counters and the
+// reference balance for these paths; what it could not show is that the NBL
+// handed back is the one that was rejected and that it is not ALSO indicated.
+//
+// Deletion criterion: in the flush's rejection branch, remove
+// NET_BUFFER_LIST_NEXT_NBL(BatchEntry->Nbl) = Group->RejectedNbls and keep the
+// Group->RejectedNbls = BatchEntry->Nbl store. The operation removed is "link
+// each rejected original into the chain handed back to the caller". The mutated
+// code still designates a head and still relinquishes the entry, so a
+// count-based check on the head pointer is unchanged; what it no longer does is
+// splice the previous rejection behind the new one, so the second rejected NBL
+// is unreachable from the returned chain -- it instead carries whatever Next the
+// producer left, which is why this test builds a real arrival chain. Only the
+// per-NBL presence check above can see that.
+//
+// N.B. an earlier draft of this criterion proposed removing
+// BatchEntry->Nbl = NULL instead, on the theory that the batch would then still
+// hold the original. That criterion is INVALID and was discarded rather than
+// run: BatchEntry->Target is set to NULL immediately above the branch, so both
+// the outer target-selection loop and the inner BatchEntry->Target != Target
+// test already skip the entry for the remainder of the flush, and Group->Count
+// is reset before the group is reused. Nothing reads BatchEntry->Nbl again, so
+// the mutation removes no observable behaviour and the test would pass -- rule 3.
+//
+// Radius of the criterion actually run, all 37 cases in isolation:
+// ZeroCopyPostCommitRejection 1; 36 pass, 0 crash, 0 hang. It isolates.
+//
+static
+VOID
+XdpCpuMapTestZeroCopyPostCommitRejection(
+    VOID
+    )
+{
+    NET_BUFFER_LIST Nbls[XDP_CPUMAP_RING_DEPTH_MIN + 2] = {0};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_CPUMAP_HELPER_STATS Stats;
+    NET_BUFFER_LIST *Rejected;
+    LONG Baseline;
+    UINT32 Index;
+
+    XDPCPUMAP_TEST_BEGIN("ZeroCopyPostCommitRejection");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, XDP_CPUMAP_RING_DEPTH_MIN, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    ExInitializeRundownProtection(&NblRundown);
+    XdpCpuMapTestInitGroup(&CommitGroup, &NblRundown);
+
+    //
+    // An arrival chain, as the miniport indicates it, so that the rejected
+    // originals carry a live Next when the flush hands them back. A chain built
+    // by overwriting the head rather than linking would then silently drop all
+    // but the last rejection.
+    //
+    for (Index = 0; Index + 1 < RTL_NUMBER_OF(Nbls); Index++) {
+        NET_BUFFER_LIST_NEXT_NBL(&Nbls[Index]) = &Nbls[Index + 1];
+    }
+
+    //
+    // Two more originals than the ring holds. The last two are rejected as ring
+    // full, after ownership was already taken. TWO, not one: a single rejection
+    // cannot distinguish a chain that is built from one that is overwritten.
+    //
+    for (Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTestCommit(CpuMap, Value.Target, &Nbls[Index], &CommitGroup));
+    }
+
+    Rejected = XdpCpuMapTestFinishGroupEx(&CommitGroup);
+
+    //
+    // Exactly the last two, each present exactly once in the chain handed back.
+    //
+    for (Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        BOOLEAN Overflow = Index >= XDP_CPUMAP_RING_DEPTH_MIN;
+
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTestCountNblsInChain(Rejected, &Nbls[Index]) == (Overflow ? 1u : 0u));
+    }
+
+    //
+    // A rejected original is not in the ring, and a queued one is not in the
+    // rejected chain: ownership went exactly one way for each.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        Value.Target->Ring->Tail - Value.Target->Ring->Head == XDP_CPUMAP_RING_DEPTH_MIN);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.RingFullCount == 2);
+    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueCount == XDP_CPUMAP_RING_DEPTH_MIN);
+
+    XdpCpuMapTestRunQueuedDpcs();
+
+    //
+    // The claim: a rejected original is NEVER indicated. Its terminal fate is
+    // the caller's DropList, which this harness does not execute -- but "not
+    // indicated by CPUMAP" is exactly the half that would be a double delivery.
+    //
+    for (Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&Nbls[Index]);
+        BOOLEAN Overflow = Index >= XDP_CPUMAP_RING_DEPTH_MIN;
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == (Overflow ? 0u : 1u));
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+    }
+
+    //
+    // The rejected originals' references were released with them, so only the
+    // queued ones ever charged the rundown, and the drain has now cleared those.
+    //
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Teardown disposal: queued originals are RETURNED, never indicated, exactly
+// once each.
+//
+// Quiesce tombstones the entries belonging to a pausing queue and the retire
+// drain empties a retiring target's ring; both hand the original back to the
+// miniport with NdisFReturnNetBufferLists rather than indicating it, because in
+// neither case is there a live steering configuration to deliver it under
+// (sections 8.3 and 8.4, row 9a "Released -- teardown").
+//
+// Both paths are exercised in one test on two targets, so the assertion covers
+// the case where they interleave: one target quiesced, the other retired, with
+// no original visible to both.
+//
+// Deletion criterion (direction): in XdpCpuMapChainSetReturn, indicate instead
+// of returning. The operation removed is "teardown returns without indicating";
+// the same NBLs are still disposed of exactly once, so only the
+// identity-and-direction assertions can see it -- counting disposals cannot.
+// Full radius, all 37 cases run in isolation: ZeroCopyTeardownDisposal fails 9,
+// DrainTombstoneSkip 5, RetireDrainReturns 4; the other 34 pass.
+//
+// Deletion criterion (scope): drop the owner predicate from the quiesce scan --
+// replace the Slot->RxQueueOwner/GenericOwner conjunction with the bare
+// Slot->Nbl != NULL test. The operation removed is "quiesce consumes only the
+// entries belonging to the queue that is pausing", which is what the mid-test
+// assertion here on the OTHER target's originals covers.
+//
+// Full radius, all 37 cases run in isolation:
+//   QuiesceScanCost              CRASH  access-violation at cpumap.c:798 in
+//                                       XdpCpuMapChainSetTake -- the scan reaches
+//                                       the poison NBLs that test deliberately
+//                                       plants for entries it expects to be out
+//                                       of scope, and dereferences them
+//   DrainTombstoneSkip           FAIL   6 assertions
+//   ZeroCopyTeardownDisposal     FAIL   3 assertions
+//   the other 34                 pass
+//
+// N.B. this was first reported as "3 failures, ZeroCopyTeardownDisposal only".
+// That number came from a run filtered to this one test and was presented as a
+// whole-suite radius. A filtered run can only ever report the case it selected,
+// so it is not evidence about any other. Whole-suite behaviour must come from a
+// whole-suite run, and a crash must be reported as a crash -- counting FAIL
+// lines alone would have scored QuiesceScanCost as passing.
+//
+static
+VOID
+XdpCpuMapTestZeroCopyTeardownDisposal(
+    VOID
+    )
+{
+    NET_BUFFER_LIST QuiesceNbls[2] = {0};
+    NET_BUFFER_LIST RetireNbls[2] = {0};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value0;
+    XDP_CPUMAP_PROVIDER_VALUE Value1;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF RundownA;
+    EX_RUNDOWN_REF RundownB;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    LONG Baseline;
+    UINT32 Index;
+
+    XDPCPUMAP_TEST_BEGIN("ZeroCopyTeardownDisposal");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value0)));
+    Entry = XdpCpuMapTestEntry(1, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value1)));
+
+    ExInitializeRundownProtection(&RundownA);
+    ExInitializeRundownProtection(&RundownB);
+
+    //
+    // Queue A's originals go to target 0 and will be quiesced. Queue B's go to
+    // target 1 and are left for the retire drain.
+    //
+    for (Index = 0; Index < RTL_NUMBER_OF(QuiesceNbls); Index++) {
+        XdpCpuMapCommitGroupInit(
+            &CommitGroup, &RundownA, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA,
+            &XdpCpuMapTestGenericA, FALSE);
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTestCommit(CpuMap, Value0.Target, &QuiesceNbls[Index], &CommitGroup));
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+    }
+
+    for (Index = 0; Index < RTL_NUMBER_OF(RetireNbls); Index++) {
+        XdpCpuMapCommitGroupInit(
+            &CommitGroup, &RundownB, XDPCPUMAP_TEST_FILTER_B, 0, &XdpCpuMapTestRxQueueB,
+            &XdpCpuMapTestGenericB, FALSE);
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapTestCommit(CpuMap, Value1.Target, &RetireNbls[Index], &CommitGroup));
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+    }
+
+    //
+    // Cancel both drains so quiesce and retire own the disposal rather than the
+    // DPC. Without this the rings would simply drain and neither teardown path
+    // would be reached.
+    //
+    XdpCpuMapTestRemoveQueueDpc(Value0.Target->Dpc);
+    XdpCpuMapTestRemoveQueueDpc(Value1.Target->Dpc);
+
+    //
+    // Quiesce queue A. Its originals are returned; queue B's are untouched,
+    // which is the scoping property tombstoning exists for.
+    //
+    XdpCpuMapQuiesceRxQueue(&XdpCpuMapTestRxQueueA);
+
+    for (Index = 0; Index < RTL_NUMBER_OF(QuiesceNbls); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&QuiesceNbls[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+    }
+
+    for (Index = 0; Index < RTL_NUMBER_OF(RetireNbls); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&RetireNbls[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(RundownA.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == (LONG)RTL_NUMBER_OF(RetireNbls));
+
+    //
+    // Retire target 1 with its ring still occupied. Section 8.3, "Delivery on
+    // retire": returned, not indicated, and counted as a drop.
+    //
+    XdpCpuMapTestRelease(CpuMap, &Value1);
+    XdpCpuMapTestDrainSweeps();
+
+    for (Index = 0; Index < RTL_NUMBER_OF(RetireNbls); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&RetireNbls[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+    }
+
+    //
+    // Nothing was indicated at any point in this test: teardown never delivers.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapTestRelease(CpuMap, &Value0);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
 // Section 7 steps 5 and 6, and the "once per target group" rule.
 //
 // Step 5 queues the DPC while the flush group STILL holds every helper-acquired
@@ -3783,8 +4424,11 @@ XdpCpuMapTestEnqueueTargetInactive(
 //
 // Deletion criterion: delete the capacity test in the flush. The ring's Tail
 // runs past Head + Capacity, the enqueue count exceeds the ring depth and the
-// rejected count is zero; four assertions here fail and no other test does,
-// because no other test fills a ring.
+// rejected count is zero; ten assertions here fail, plus twelve in
+// ZeroCopyPostCommitRejection, which fills the same ring to witness the same
+// invariant from the ownership side. This test asserts the counters and the
+// reference balance; that one asserts WHICH originals came back. No other test
+// notices, because no other test fills a ring.
 //
 #define XDPCPUMAP_TEST_SMALL_RING XDP_CPUMAP_RING_DEPTH_MIN
 
@@ -4042,8 +4686,23 @@ XdpCpuMapTestDrainPartitionedIndication(
 // that owns NOTHING, and the drain advances past it releasing nothing. Entries
 // belonging to other queues are untouched and still indicate normally.
 //
-// Deletion criterion (skip): in the drain, do not advance Head past a tombstone.
-// The ring never drains and nine assertions here fail.
+// Deletion criterion (skip): in the drain, do not advance Head past a tombstone
+// -- delete the Ring->Head++ from the Entry->Nbl == NULL branch, leaving the
+// Scanned++ so the batch still terminates. The operation removed is "the drain
+// makes forward progress over a slot it must not consume".
+//
+// The observed result is a HANG, not an assertion failure: XdpCpuMapDrainDpc's
+// do/while (MoreWork && !Yield) loop is inside ONE DPC invocation, so a Head
+// that never advances keeps MoreWork TRUE and the routine never returns. The
+// test runner's 4096-iteration re-queue bound is never reached, because the
+// spin is below it. That is a faithful model, not a harness artifact: in
+// production this is a DPC that never completes, which is DPC_WATCHDOG_VIOLATION
+// rather than a miscount.
+//
+// N.B. this criterion was previously documented as "the ring never drains and
+// nine assertions here fail". That was never observed and is wrong -- the suite
+// does not get far enough to assert anything. Recorded here because a runner
+// that only counted assertion failures would have called a hang "not detected".
 //
 // Deletion criterion (ownership transfer): replace XdpCpuMapChainSetTake's
 // RtlZeroMemory with a field-by-field copy that leaves BackingRef and
@@ -4297,9 +4956,11 @@ XdpCpuMapTestDrainYieldRequeueGate(
 // drop instead.
 //
 // Deletion criterion: have XdpCpuMapDrainRing call XdpCpuMapChainSetIndicate
-// instead of XdpCpuMapChainSetReturn. The two assertions on indication and
-// return counts here fail; every other test either drains through the DPC or
-// retires an empty ring, so none of them notices.
+// instead of XdpCpuMapChainSetReturn. Four assertions on indication and return
+// counts here fail, plus five in ZeroCopyTeardownDisposal, which drives the same
+// retire path and asserts per-NBL that the original was returned and never
+// indicated. No other test notices: every other one either drains through the
+// DPC or retires an empty ring.
 //
 static
 VOID
@@ -4358,6 +5019,55 @@ XdpCpuMapTestRetireDrainReturns(
     XdpCpuMapStop();
 }
 
+typedef VOID (*XDPCPUMAP_TEST_ROUTINE)(VOID);
+
+typedef struct _XDPCPUMAP_TEST_CASE {
+    const CHAR *Name;
+    XDPCPUMAP_TEST_ROUTINE Routine;
+} XDPCPUMAP_TEST_CASE;
+
+#define XDPCPUMAP_TEST_CASE_ENTRY(fn) { #fn, XdpCpuMapTest ## fn }
+
+static const XDPCPUMAP_TEST_CASE XdpCpuMapTestCases[] = {
+    XDPCPUMAP_TEST_CASE_ENTRY(ZeroSettingsInherit),
+    XDPCPUMAP_TEST_CASE_ENTRY(InvalidCpuIndex),
+    XDPCPUMAP_TEST_CASE_ENTRY(DpcTargetingFailure),
+    XDPCPUMAP_TEST_CASE_ENTRY(SharedTargetAccounting),
+    XDPCPUMAP_TEST_CASE_ENTRY(SweepRearm),
+    XDPCPUMAP_TEST_CASE_ENTRY(CoalescedSweep),
+    XDPCPUMAP_TEST_CASE_ENTRY(AllocationFailure),
+    XDPCPUMAP_TEST_CASE_ENTRY(CapAccounting),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiesceEmpty),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiesceScanCost),
+    XDPCPUMAP_TEST_CASE_ENTRY(TeardownWithoutEpoch),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperTargetRundown),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperContextOffsetGuard),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperFindElement),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperHighKeyRejected),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperFailureFallbacks),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperModeFallback),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperDisallowedQueueNoLeak),
+    XDPCPUMAP_TEST_CASE_ENTRY(HelperReplacementRelease),
+    XDPCPUMAP_TEST_CASE_ENTRY(CommitInvalidMetadata),
+    XDPCPUMAP_TEST_CASE_ENTRY(CommitRejectPaths),
+    XDPCPUMAP_TEST_CASE_ENTRY(CommitNullActionNbl),
+    XDPCPUMAP_TEST_CASE_ENTRY(CommitGroupBatching),
+    XDPCPUMAP_TEST_CASE_ENTRY(CommitFrameReuse),
+    XDPCPUMAP_TEST_CASE_ENTRY(CommitDeepCopyUnsupportedDrop),
+    XDPCPUMAP_TEST_CASE_ENTRY(CommitGroupUnusedIsFree),
+    XDPCPUMAP_TEST_CASE_ENTRY(TargetDpcAffinity),
+    XDPCPUMAP_TEST_CASE_ENTRY(ZeroCopyOwnershipLifecycle),
+    XDPCPUMAP_TEST_CASE_ENTRY(ZeroCopyPostCommitRejection),
+    XDPCPUMAP_TEST_CASE_ENTRY(ZeroCopyTeardownDisposal),
+    XDPCPUMAP_TEST_CASE_ENTRY(EnqueueInsertOrdering),
+    XDPCPUMAP_TEST_CASE_ENTRY(EnqueueTargetInactive),
+    XDPCPUMAP_TEST_CASE_ENTRY(EnqueueRingFull),
+    XDPCPUMAP_TEST_CASE_ENTRY(DrainPartitionedIndication),
+    XDPCPUMAP_TEST_CASE_ENTRY(DrainTombstoneSkip),
+    XDPCPUMAP_TEST_CASE_ENTRY(DrainYieldRequeueGate),
+    XDPCPUMAP_TEST_CASE_ENTRY(RetireDrainReturns),
+};
+
 INT
 __cdecl
 main(
@@ -4365,43 +5075,44 @@ main(
     char **argv
     )
 {
-    UNREFERENCED_PARAMETER(argc);
-    UNREFERENCED_PARAMETER(argv);
+    //
+    // An optional argument selects tests by exact name.
+    //
+    // This exists because of a deletion criterion that reported ZERO failures
+    // while actually being detected: widening the quiesce scope predicate makes
+    // QuiesceScanCost dereference the poison NBLs it deliberately plants, so the
+    // process died by access violation before any later test ran, and a runner
+    // that only counted FAIL lines recorded that as "not detected". Being unable
+    // to run one test in isolation makes every criterion's blast radius a lower
+    // bound rather than a measurement, which is precisely the "harness weaker
+    // than the runtime it models" failure this project keeps hitting.
+    //
+    // The filter measures a criterion by running EVERY case in isolation and
+    // typing each outcome as pass, assertion failure, crash or hang. It is not a
+    // way to run only the case a criterion is expected to hit: a filtered result
+    // is evidence about that case alone and says nothing about the other 36, and
+    // reporting one as a whole-suite radius is how criterion 22's radius was
+    // first understated. Baseline: all 37 pass in isolation; an unknown name
+    // exits 2.
+    //
+    const CHAR *Filter = (argc > 1) ? argv[1] : NULL;
+    BOOLEAN Matched = FALSE;
 
-    XdpCpuMapTestZeroSettingsInherit();
-    XdpCpuMapTestInvalidCpuIndex();
-    XdpCpuMapTestDpcTargetingFailure();
-    XdpCpuMapTestSharedTargetAccounting();
-    XdpCpuMapTestSweepRearm();
-    XdpCpuMapTestCoalescedSweep();
-    XdpCpuMapTestAllocationFailure();
-    XdpCpuMapTestCapAccounting();
-    XdpCpuMapTestQuiesceEmpty();
-    XdpCpuMapTestQuiesceScanCost();
-    XdpCpuMapTestTeardownWithoutEpoch();
-    XdpCpuMapTestHelperTargetRundown();
-    XdpCpuMapTestHelperContextOffsetGuard();
-    XdpCpuMapTestHelperFindElement();
-    XdpCpuMapTestHelperHighKeyRejected();
-    XdpCpuMapTestHelperFailureFallbacks();
-    XdpCpuMapTestHelperModeFallback();
-    XdpCpuMapTestHelperDisallowedQueueNoLeak();
-    XdpCpuMapTestHelperReplacementRelease();
-    XdpCpuMapTestCommitInvalidMetadata();
-    XdpCpuMapTestCommitRejectPaths();
-    XdpCpuMapTestCommitNullActionNbl();
-    XdpCpuMapTestCommitGroupBatching();
-    XdpCpuMapTestCommitFrameReuse();
-    XdpCpuMapTestCommitDeepCopyUnsupportedDrop();
-    XdpCpuMapTestCommitGroupUnusedIsFree();
-    XdpCpuMapTestTargetDpcAffinity();
-    XdpCpuMapTestEnqueueInsertOrdering();
-    XdpCpuMapTestEnqueueTargetInactive();
-    XdpCpuMapTestEnqueueRingFull();
-    XdpCpuMapTestDrainPartitionedIndication();
-    XdpCpuMapTestDrainTombstoneSkip();
-    XdpCpuMapTestDrainYieldRequeueGate();
-    XdpCpuMapTestRetireDrainReturns();
+    for (SIZE_T Index = 0; Index < RTL_NUMBER_OF(XdpCpuMapTestCases); Index++) {
+        const XDPCPUMAP_TEST_CASE *Case = &XdpCpuMapTestCases[Index];
+
+        if (Filter != NULL && strcmp(Filter, Case->Name) != 0) {
+            continue;
+        }
+
+        Matched = TRUE;
+        Case->Routine();
+    }
+
+    if (Filter != NULL && !Matched) {
+        printf("cpumaptest: no test named '%s'\n", Filter);
+        return 2;
+    }
 
     XdpCpuMapTestCurrent = "<summary>";
 
@@ -4411,7 +5122,10 @@ main(
     // without leaving it, which in production would pin reclamation forever.
     //
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestEpochDepth == 0);
-    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestEpochOperations > 0);
+
+    if (Filter == NULL) {
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestEpochOperations > 0);
+    }
 
     if (XdpCpuMapTestFailures > 0) {
         printf("cpumaptest: %u test(s) run, %u FAILURES\n",

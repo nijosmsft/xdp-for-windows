@@ -173,6 +173,9 @@ VOID
 GenericRxEbpfCpuMapRedirect();
 
 VOID
+GenericRxEbpfCpuMapRedirectChain();
+
+VOID
 GenericRxEbpfTx();
 
 VOID
