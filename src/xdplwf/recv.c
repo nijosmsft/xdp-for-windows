@@ -1691,7 +1691,8 @@ XdpGenericReceivePostInspectNbs(
         ASSERT(!RxQueue->Flags.TxInspect);
         XdpCpuMapCommitGroupInit(
             &CpuMapCommitGroup, &RxQueue->NblRundown, RxQueue->Generic->NdisFilterHandle,
-            PortNumber, RxQueue, RxQueue->Generic, (BOOLEAN)RxQueue->Flags.TxInspect);
+            PortNumber, RxQueue, RxQueue->Generic, (BOOLEAN)RxQueue->Flags.TxInspect,
+            (BOOLEAN)!CanPend, &RxQueue->CpuMapDeepCopyPool);
     }
 
     while (NbHead != NbTail) {
@@ -1700,6 +1701,7 @@ XdpGenericReceivePostInspectNbs(
         XDP_LWF_GENERIC_RX_FRAME_CONTEXT *InterfaceExtension;
         NET_BUFFER_LIST *ActionNbl = NULL;
         BOOLEAN FrameInspected = FALSE;
+        BOOLEAN CpuMapDeepCopyRedirected = FALSE;
 
         ASSERT(NblHead != NULL);
         ASSERT(NbHead != NULL);
@@ -1777,15 +1779,38 @@ XdpGenericReceivePostInspectNbs(
                     XDP_FRAME_CPUMAP_REDIRECT_FLAG_OWNERSHIP_PENDING) != 0) {
                 BOOLEAN RxQueuePaused =
                     ReadBooleanAcquire(&RxQueue->Flags.Paused) != FALSE;
+                XDP_CPUMAP_COMMIT_RESULT CommitResult;
 
-                if (XdpCpuMapCommitRedirect(
+                CommitResult =
+                    XdpCpuMapCommitRedirect(
                         CpuMapRedirect, ActionNbl, RxQueuePaused, CanPend,
-                        &CpuMapCommitGroup)) {
+                        &CpuMapCommitGroup);
+
+                if (CommitResult == XdpCpuMapCommitOwnershipTaken) {
                     //
                     // Ownership has transferred to CPUMAP. The original must not
                     // reach PassList, DropList or TxList (section 8.1a row 9a).
                     //
                     ActionNbl = NULL;
+                } else if (CommitResult == XdpCpuMapCommitDeepCopied) {
+                    //
+                    // Row 9b: the low-resource path committed and built a deep
+                    // copy, and deliberately left the original with us so the
+                    // DROP action below returns it.
+                    //
+                    // The original still goes to DropList -- there is nothing
+                    // else to do with it -- but it must not be logged as a
+                    // program-inspection drop. The program said REDIRECT and the
+                    // redirect SUCCEEDED; a copy of this frame is on its way to
+                    // the target CPU.
+                    //
+                    // This needs the explicit result, not an inference from the
+                    // metadata: commit zeroes it on EVERY path, including pause
+                    // rejection, rundown failure, copy failure and ring
+                    // rejection, so testing the metadata would have suppressed
+                    // four genuine drop records as well as the one false one.
+                    //
+                    CpuMapDeepCopyRedirected = TRUE;
                 }
             }
         }
@@ -1809,10 +1834,12 @@ XdpGenericReceivePostInspectNbs(
 
             case XDP_RX_ACTION_DROP:
                 NdisAppendSingleNblToNblQueue(DropList, ActionNbl);
-                XdpPktMonLogDrop(
-                    RxQueue->Generic, ActionNbl, TRUE,
-                    RxQueue->Flags.TxInspect ? PktMonDir_Out : PktMonDir_In,
-                    DropProgramInspection, PktMonDropLoc1);
+                if (!CpuMapDeepCopyRedirected) {
+                    XdpPktMonLogDrop(
+                        RxQueue->Generic, ActionNbl, TRUE,
+                        RxQueue->Flags.TxInspect ? PktMonDir_Out : PktMonDir_In,
+                        DropProgramInspection, PktMonDropLoc1);
+                }
                 break;
 
             default:
@@ -1858,9 +1885,17 @@ XdpGenericReceivePostInspectNbs(
             // originals are returned to the miniport rather than delivered
             // (section 6.3 step 6).
             //
-            // These only exist on the CanPend path: a low-resource indication is
-            // rejected before commit, so this list is provably empty while
-            // XdpGenericReceiveLowResources owns the ordering of DropList.
+            // These are ORIGINALS only, and the list is provably empty on the
+            // low-resource path. A low-resource redirect never gives CPUMAP the
+            // original -- it keeps a deep copy instead -- and a copy the ring
+            // refuses is recycled into the receive queue's pool rather than
+            // chained here (section 8.1a row 9b, "Released -- post-commit
+            // failure (ii)"). That matters beyond tidiness: this list is
+            // appended to DropList, which returns its NBLs to the MINIPORT, and
+            // handing the miniport a buffer from our own pool would be a
+            // straightforward memory-ownership bug. It would also arrive after
+            // XdpGenericReceiveLowResources has already fixed the ordering of
+            // DropList for this call.
             //
             ASSERT(CanPend);
             NdisAppendNblChainToNblQueue(DropList, CpuMapRejectedNbls);
@@ -2471,6 +2506,18 @@ XdpGenericRxCreateQueue(
         goto Exit;
     }
 
+    //
+    // The CPUMAP deep-copy cache, created here for exactly the reasons the TX
+    // clone pool above is: it needs the filter handle, its lifetime is the
+    // queue's, and a queue that cannot get one must not exist. A partially
+    // functional queue would turn every low-resource redirect into a silent
+    // capability gap, which is the POC B behaviour v1 rejects.
+    //
+    Status = XdpCpuMapDeepCopyPoolInitialize(&RxQueue->CpuMapDeepCopyPool, Generic->NdisFilterHandle);
+    if (!NT_SUCCESS(Status)) {
+        goto Exit;
+    }
+
     if (RxQueue->Flags.TxInspect) {
         NdisInitializeNblQueue(&RxQueue->TxInspectNblQueue);
         NdisInitializeNblQueue(&RxQueue->TxInspectPollNblQueue);
@@ -2566,6 +2613,7 @@ Exit:
     if (!NT_SUCCESS(Status)) {
         if (RxQueue != NULL) {
             XdpEcCleanup(&RxQueue->TxInspectEc);
+            XdpCpuMapDeepCopyPoolCleanup(&RxQueue->CpuMapDeepCopyPool);
             if (RxQueue->TxCloneNblPool != NULL) {
                 NdisFreeNetBufferListPool(RxQueue->TxCloneNblPool);
             }
@@ -2679,6 +2727,7 @@ XdpGenericRxDeleteQueueEntry(
         (NET_BUFFER_LIST *)InterlockedFlushSList(&RxQueue->TxCloneNblSList));
     XdpGenericRxFreeNblCloneCache(RxQueue->TxCloneNblList);
     RxQueue->TxCloneNblList = NULL;
+    XdpCpuMapDeepCopyPoolCleanup(&RxQueue->CpuMapDeepCopyPool);
     NdisFreeNetBufferListPool(RxQueue->TxCloneNblPool);
     XdpPcwCloseLwfRxQueue(RxQueue->PcwInstance);
     RxQueue->PcwInstance = NULL;

@@ -69,6 +69,14 @@ typedef struct _XDP_CPUMAP_ENTRY {
     //
     EX_RUNDOWN_REF *NblRundown;
 
+    //
+    // The receiving queue's deep-copy cache, meaningful only when IsDeepCopy.
+    // Carried per slot for the same reason FilterHandle is: the drain runs on
+    // another CPU and must not re-derive queue state it holds no reference on.
+    // The slot's NblRundown reference is what keeps the pool alive.
+    //
+    XDP_CPUMAP_DEEPCOPY_POOL *DeepCopyPool;
+
     NDIS_PORT_NUMBER PortNumber;
     BOOLEAN IsDeepCopy;
 } XDP_CPUMAP_ENTRY;
@@ -208,7 +216,6 @@ XdpCpuMapIsHookSupported(
 typedef enum _XDP_CPUMAP_COMMIT_REJECT_REASON {
     XdpCpuMapCommitRejectPause,
     XdpCpuMapCommitRejectRundown,
-    XdpCpuMapCommitRejectDeepCopyUnsupported,
 } XDP_CPUMAP_COMMIT_REJECT_REASON;
 
 //
@@ -219,6 +226,15 @@ typedef enum _XDP_CPUMAP_COMMIT_REJECT_REASON {
 typedef enum _XDP_CPUMAP_ENQUEUE_DROP_REASON {
     XdpCpuMapEnqueueDropTargetInactive,
     XdpCpuMapEnqueueDropRingFull,
+
+    //
+    // Deep-copy preparation failed at flush: the pool had no descriptor, the
+    // cache cap was reached, or NdisRetreatNetBufferDataStart could not get
+    // pages. Section 8.1a row 9b classifies this POST-commit, because the
+    // original went to DropList at commit and the batch entry already holds
+    // references that need explicit release.
+    //
+    XdpCpuMapEnqueueDropDeepCopyFail,
 } XDP_CPUMAP_ENQUEUE_DROP_REASON;
 
 //
@@ -258,18 +274,54 @@ typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_HELPER_STATS {
     volatile ULONG64 CommitRundownDrop;
 
     //
-    // Low-resource indication with no deep-copy pool. Its own counter because,
-    // unlike the two above, it is a CAPABILITY gap rather than a transient
-    // state, and increment 8 removes it entirely by adding the pool.
-    //
-    volatile ULONG64 DeepCopyUnsupportedDrop;
-
-    //
     // Enqueue. Also drops, for the same reason.
     //
     volatile ULONG64 EnqueueCount;
     volatile ULONG64 EnqueueTargetInactive;
     volatile ULONG64 RingFullCount;
+
+    //
+    // Deep copy (section 8.1a row 9b).
+    //
+    // DeepCopyBuildCount counts copies that were successfully BUILT.
+    //
+    // DeepCopyFailCount is the AGGREGATE of COPY-PREPARATION failures: exactly
+    // one per packet whose deep copy could not be BUILT. It deliberately does
+    // NOT cover every undelivered low-resource redirect -- a copy that is built
+    // and then rejected by the ring or by the under-lock target re-check is
+    // counted by RingFullCount or EnqueueTargetInactive and never touches this
+    // counter. Whole-path packet accounting therefore needs this aggregate PLUS
+    // those rejection counters; what it must never do is add a reason counter
+    // below to this total, because each reason also increments it.
+    //
+    // Reason counters, which partition DeepCopyFailCount and each imply a
+    // DIFFERENT response:
+    //
+    //   DeepCopyMetadataUnsupported -- the SOURCE carried a slot outside the
+    //     carried set, so the redirect was refused rather than deliver a packet
+    //     with metadata we cannot carry. A non-zero value means the carried set
+    //     needs revisiting against real hardware.
+    //
+    //   DeepCopyDescriptorResidue -- a FRESHLY ALLOCATED descriptor arrived with
+    //     a non-carried slot occupied. This says nothing about the carried set
+    //     and widening it would be exactly the wrong reaction: it means the
+    //     ALLOCATOR behaviour behind the uniform cleanliness check has broken,
+    //     and that is what wants investigating. Fresh descriptors only -- a
+    //     dirty RECYCLED descriptor is discarded, the next one is taken, no
+    //     packet is lost, and nothing is counted. That leaves an always-missing
+    //     cache invisible; see issue #22, deferred to increment 10.
+    //
+    // Both were once one counter, which made the guidance "non-zero means
+    // revisit the carried set" wrong half the time.
+    //
+    // The remaining causes -- no descriptor, cache cap reached, retreat failure
+    // -- share DeepCopyFailCount without a reason of their own, which section 12
+    // specifies. Separating those is a diagnostics question for increment 10.
+    //
+    volatile ULONG64 DeepCopyBuildCount;
+    volatile ULONG64 DeepCopyFailCount;
+    volatile ULONG64 DeepCopyMetadataUnsupported;
+    volatile ULONG64 DeepCopyDescriptorResidue;
 
     //
     // Drain.

@@ -646,6 +646,14 @@ public:
         ::GenericRxEbpfCpuMapRedirectChain();
     }
 
+    TEST_METHOD_PRERELEASE(GenericRxEbpfCpuMapRedirectLowResources) {
+        ::GenericRxEbpfCpuMapRedirectLowResources();
+    }
+
+    TEST_METHOD_PRERELEASE(GenericRxEbpfCpuMapRedirectPauseRace) {
+        ::GenericRxEbpfCpuMapRedirectPauseRace();
+    }
+
     TEST_METHOD_PRERELEASE(GenericRxEbpfTx) {
         ::GenericRxEbpfTx();
     }

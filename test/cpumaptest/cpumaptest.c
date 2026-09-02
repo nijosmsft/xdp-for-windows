@@ -163,6 +163,14 @@ ULONG XdpCpuMapTestIndicationCount;
 XDP_CPUMAP_TEST_INDICATION XdpCpuMapTestReturns[XDP_CPUMAP_TEST_MAX_INDICATIONS];
 ULONG XdpCpuMapTestReturnCount;
 
+//
+// When set, the indication stub stamps upper-stack metadata into slots CPUMAP
+// does not carry -- which real consumers do, and nothing requires them to clear.
+// Off by default so the reuse path is testable; on, it makes the discard path
+// testable. Both are real: a clean return is reused, a stamped one is freed.
+//
+BOOLEAN XdpCpuMapTestStampOnIndicate;
+
 VOID
 XdpCpuMapTestResetNdis(
     VOID
@@ -223,6 +231,22 @@ XdpCpuMapTestRecordNdisCall(
         }
 
         Log[*LogCount].NblSnapshot[Log[*LogCount].NblSnapshotCount++] = Nbl;
+
+        //
+        // Model the upper stack stamping its OWN metadata on an NBL it was
+        // handed. Real consumers do this -- classification handles, cancel ids,
+        // WFP context -- and it is what makes a recycled descriptor dirty.
+        //
+        // Without it the harness could not tell a build that zeroes the OOB
+        // slots before copying from one that does not, because every descriptor
+        // it ever saw was already clean. That gap let the cross-packet metadata
+        // leak survive a full criterion sweep undetected.
+        //
+        if (XdpCpuMapTestStampOnIndicate) {
+            Nbl->NetBufferListInfo[ClassificationHandleNetBufferListInfo] =
+                (VOID *)(ULONG_PTR)0xC1A551F1;
+            Nbl->NetBufferListInfo[NetBufferListCancelId] = (VOID *)(ULONG_PTR)0xCA9CE11D;
+        }
     }
 
     (*LogCount)++;
@@ -2403,7 +2427,23 @@ XdpCpuMapTestInitGroup(
 {
     XdpCpuMapCommitGroupInit(
         Group, NblRundown, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA,
-        &XdpCpuMapTestGenericA, FALSE);
+        &XdpCpuMapTestGenericA, FALSE, FALSE, NULL);
+}
+
+//
+// A low-resource group: every entry becomes a deep copy taken from Pool.
+//
+static
+VOID
+XdpCpuMapTestInitDeepCopyGroup(
+    _Out_ XDP_CPUMAP_COMMIT_GROUP *Group,
+    _In_ EX_RUNDOWN_REF *NblRundown,
+    _In_opt_ XDP_CPUMAP_DEEPCOPY_POOL *Pool
+    )
+{
+    XdpCpuMapCommitGroupInit(
+        Group, NblRundown, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA,
+        &XdpCpuMapTestGenericA, FALSE, TRUE, Pool);
 }
 
 //
@@ -2514,7 +2554,7 @@ XdpCpuMapTestCommitInvalidMetadata(
     XdpCpuMapTestExpectAssert = 1;
     XdpCpuMapTestAssertsObserved = 0;
     XDPCPUMAP_TEST_ASSERT(
-        !XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, FALSE, TRUE, &CommitGroup));
+        XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, FALSE, TRUE, &CommitGroup) == XdpCpuMapCommitDeclined);
     XdpCpuMapTestExpectAssert = 0;
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestAssertsObserved > 0);
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
@@ -2580,7 +2620,7 @@ XdpCpuMapTestCommitRejectPaths(
     XdpCpuMapReferenceBacking(CpuMap);
     Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
     XDPCPUMAP_TEST_ASSERT(
-        !XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, TRUE, TRUE, &CommitGroup));
+        XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, TRUE, TRUE, &CommitGroup) == XdpCpuMapCommitDeclined);
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
     XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
     XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
@@ -2590,17 +2630,15 @@ XdpCpuMapTestCommitRejectPaths(
     Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
     XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseDrop == 1);
     XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownDrop == 0);
-    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyUnsupportedDrop == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 0);
 
     //
     // Step 3 reject: failed ExAcquireRundownProtectionEx does not take a
     // reference, so the shared reject path must again leave NblRundown alone.
     //
-    // N.B. the low-resource (!CanPend) outcome is NOT covered here. It is a
-    // counted DROP rather than one of these transient rejections, and
-    // CommitDeepCopyUnsupportedDrop owns it, asserting that the commit declines
-    // ownership -- which a counter alone cannot show. The packet's terminal fate
-    // is decided by the caller and is not observable in this harness.
+    // N.B. the low-resource (!CanPend) outcome is NOT a rejection at all since
+    // increment 8. It commits, and the flush builds a deep copy; DeepCopySuccess
+    // and DeepCopyFailurePaths own it.
     //
     ExInitializeRundownProtection(&NblRundown);
     XdpCpuMapTestInitGroup(&CommitGroup, &NblRundown);
@@ -2609,7 +2647,7 @@ XdpCpuMapTestCommitRejectPaths(
     XdpCpuMapReferenceBacking(CpuMap);
     Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
     XDPCPUMAP_TEST_ASSERT(
-        !XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, FALSE, TRUE, &CommitGroup));
+        XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, FALSE, TRUE, &CommitGroup) == XdpCpuMapCommitDeclined);
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
     XDPCPUMAP_TEST_ASSERT(Redirect.Size == 0);
     XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
@@ -2618,7 +2656,7 @@ XdpCpuMapTestCommitRejectPaths(
     Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
     XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseDrop == 1);
     XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownDrop == 1);
-    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyUnsupportedDrop == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 0);
 
     //
     // TX-inspect is an ASSERTED-IMPOSSIBLE state, not a reject reason. The
@@ -2638,7 +2676,7 @@ XdpCpuMapTestCommitRejectPaths(
     ExInitializeRundownProtection(&NblRundown);
     XdpCpuMapCommitGroupInit(
         &CommitGroup, &NblRundown, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA,
-        &XdpCpuMapTestGenericA, TRUE);
+        &XdpCpuMapTestGenericA, TRUE, FALSE, NULL);
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
     XdpCpuMapReferenceBacking(CpuMap);
     Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
@@ -2646,7 +2684,7 @@ XdpCpuMapTestCommitRejectPaths(
     XdpCpuMapTestExpectAssert = 1;
     XdpCpuMapTestAssertsObserved = 0;
     XDPCPUMAP_TEST_ASSERT(
-        !XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, FALSE, TRUE, &CommitGroup));
+        XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, FALSE, TRUE, &CommitGroup) == XdpCpuMapCommitDeclined);
     XdpCpuMapTestExpectAssert = 0;
 
     //
@@ -2668,7 +2706,7 @@ XdpCpuMapTestCommitRejectPaths(
     Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
     XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseDrop == 1);
     XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownDrop == 1);
-    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyUnsupportedDrop == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 0);
 
     //
     // Nothing was ever enqueued, so no producer may have queued a DPC.
@@ -2799,7 +2837,7 @@ XdpCpuMapTestCommitNullActionNbl(
     XdpCpuMapTestExpectAssert = 1;
     XdpCpuMapTestAssertsObserved = 0;
     XDPCPUMAP_TEST_ASSERT(
-        !XdpCpuMapCommitRedirect(&Redirect, NULL, FALSE, TRUE, &CommitGroup));
+        XdpCpuMapCommitRedirect(&Redirect, NULL, FALSE, TRUE, &CommitGroup) == XdpCpuMapCommitDeclined);
     XdpCpuMapTestExpectAssert = 0;
 
     //
@@ -3307,48 +3345,234 @@ XdpCpuMapTestCommitFrameReuse(
 }
 
 //
-// A low-resource indication makes the commit DECLINE OWNERSHIP, counted.
+// Per-NBL disposition across everything NDIS was told to do with it.
 //
-// Scope of this test, stated narrowly and deliberately. It proves what the
-// harness can execute: that the commit leaves the original with the caller --
-// not consumed into the batch, not handed back as a flush rejection -- and
-// releases every reference the metadata held, having taken none of its own.
+// Increment 6's tests counted indications and returns. That cannot see the
+// failures increment 7 exists to rule out: an NBL indicated twice, an NBL both
+// indicated and returned, or an NBL that quietly appears in a partition it does
+// not belong to all produce the same totals as correct behaviour. Identity is
+// the only observable that separates them, so every zero-copy assertion below is
+// made per NBL rather than per count.
 //
-// It does NOT prove the terminal fate of the NBL. That is decided by the
-// caller's RX action, which is DROP because XdpInvokeEbpf converted the
-// program's XDP_REDIRECT before post-inspection ran, and neither program.c nor
-// the LWF receive path is compiled into this harness. Issue #16 called this "a
-// counted fallback" and an earlier version of this comment claimed the terminal
-// drop; both overstated what is checked here. The end-to-end outcome is
-// hardware coverage.
+typedef struct _XDPCPUMAP_TEST_NBL_DISPOSITION {
+    UINT32 Indicated;
+    UINT32 Returned;
+    UINT32 IndicationIndex;
+    ULONG IndicationFlags;
+} XDPCPUMAP_TEST_NBL_DISPOSITION;
+
+static
+XDPCPUMAP_TEST_NBL_DISPOSITION
+XdpCpuMapTestNblDisposition(
+    _In_ const NET_BUFFER_LIST *Nbl
+    )
+{
+    XDPCPUMAP_TEST_NBL_DISPOSITION Disposition = {0};
+
+    Disposition.IndicationIndex = MAXUINT32;
+
+    for (ULONG Index = 0; Index < XdpCpuMapTestIndicationCount; Index++) {
+        const XDP_CPUMAP_TEST_INDICATION *Indication = &XdpCpuMapTestIndications[Index];
+
+        //
+        // The snapshot, not Head->Next: see XDP_CPUMAP_TEST_INDICATION. A
+        // truncated snapshot cannot support a negative conclusion, so refuse it
+        // outright rather than under-reporting appearances.
+        //
+        XDPCPUMAP_TEST_ASSERT(!Indication->NblSnapshotTruncated);
+        XDPCPUMAP_TEST_ASSERT(Indication->NblSnapshotCount == Indication->NblCount);
+
+        for (ULONG Slot = 0; Slot < Indication->NblSnapshotCount; Slot++) {
+            if (Indication->NblSnapshot[Slot] == Nbl) {
+                Disposition.Indicated++;
+                Disposition.IndicationIndex = Index;
+                Disposition.IndicationFlags = Indication->Flags;
+            }
+        }
+    }
+
+    for (ULONG Index = 0; Index < XdpCpuMapTestReturnCount; Index++) {
+        const XDP_CPUMAP_TEST_INDICATION *Return = &XdpCpuMapTestReturns[Index];
+
+        XDPCPUMAP_TEST_ASSERT(!Return->NblSnapshotTruncated);
+        XDPCPUMAP_TEST_ASSERT(Return->NblSnapshotCount == Return->NblCount);
+
+        for (ULONG Slot = 0; Slot < Return->NblSnapshotCount; Slot++) {
+            if (Return->NblSnapshot[Slot] == Nbl) {
+                Disposition.Returned++;
+            }
+        }
+    }
+
+    return Disposition;
+}
+
 //
-// What the narrowed claim still rules out is the failure that matters: a
-// low-resource NBL being lent out across a DPC. If the commit took ownership,
-// the NBL would be enqueued and later indicated from another CPU, which is
-// exactly what NDIS forbids for a RESOURCES indication.
-//
-// Deletion criterion: move the !CanPend check after XdpCpuMapCommitGroupTakeCredit
-// and let it fall into the batch insert instead of the reject path. The NBL is
-// then consumed, enqueued and indicated, and the ownership, counter and
-// indication assertions here fail.
+// Counts how many of the NBLs in a caller-supplied array appear in a chain, so a
+// rejected-original list can be checked for identity rather than length.
 //
 static
+UINT32
+XdpCpuMapTestCountNblsInChain(
+    _In_opt_ const NET_BUFFER_LIST *Chain,
+    _In_ const NET_BUFFER_LIST *Nbl
+    )
+{
+    UINT32 Count = 0;
+
+    for (const NET_BUFFER_LIST *Cur = Chain; Cur != NULL; Cur = Cur->Next) {
+        if (Cur == Nbl) {
+            Count++;
+        }
+    }
+
+    return Count;
+}
+
+
+//
+// Deep-copy success, end to end, on NBL IDENTITY (design section 8.1a row 9b).
+//
+// Row 9b differs from row 9a in the one way that matters: the ORIGINAL never
+// enters the ring. Commit leaves it with the caller, whose DROP action returns
+// it to the miniport, and only a COPY travels to the target CPU. Round 5 of the
+// design collapsed the two rows and would have had a reviewer expect a double
+// return of the original.
+//
+// What is asserted here, and why counting cannot substitute:
+//
+//   - The ring slot holds a DIFFERENT NBL from the one committed, flagged as a
+//     deep copy, carrying the pool it came from. A build that enqueued the
+//     original would pass any count-based check.
+//   - The copy carries the original's BYTES and its RSS hash and checksum OOB
+//     slots. The harness copies real bytes through a real MDL walk, so a build
+//     that allocated but did not copy fails here rather than silently
+//     delivering garbage.
+//   - The copy is indicated WITH NDIS_RECEIVE_FLAGS_RESOURCES. This is the first
+//     increment in which that branch executes at all.
+//   - The copy is RECYCLED before the DPC returns, and never returned to the
+//     miniport. The page counter proves the recycle actually gave the pages
+//     back rather than merely unlinking the NBL.
+//   - The original is untouched by CPUMAP throughout: not indicated, not
+//     returned, and still chained where the caller left it.
+//
+// Deletion criteria, each naming the production operation removed. Radii are
+// from running all 40 cases in isolation, with each outcome typed as pass,
+// assertion failure, crash or hang.
+//
+//   (a) In XdpCpuMapDeepCopyAllocate, return Original instead of Copy. The
+//       operation removed is "the ring carries the copy, not the original": the
+//       ORIGINAL is then enqueued, indicated from the target CPU, and finally
+//       recycled into the pool by the drain -- which is a miniport-owned NBL
+//       being pushed onto our own free list. Detected as a CRASH rather than an
+//       assertion failure. That is the point: in production this is memory
+//       corruption, not a miscount.
+//
+//       N.B. deleting "BatchEntry->Nbl = Copy;" in the flush pre-pass is the
+//       more direct phrasing of the same deletion and was the original wording
+//       here, but it does not compile: removing it costs /analyze the path
+//       invariant that Target != NULL implies CpuMap != NULL, and C6387/C6011
+//       fire at the Stats fetch. Mutating the allocator's return value removes
+//       the same operation without perturbing that proof.
+//   (b) In XdpCpuMapChainSetIndicate, skip XdpCpuMapChainRecycleDeepCopies. The
+//       operation removed is "a deep copy goes back to its pool inside the DPC".
+//       Counts are unchanged -- the copy is still indicated exactly once -- and
+//       only the live-page and live-descriptor assertions can see the leak.
+//   (c) In XdpCpuMapDeepCopyAllocate, delete the carry loop outright. The
+//       operation removed is "carried metadata travels with the copy"; bytes
+//       still arrive, so only the per-slot metadata assertions fail -- one per
+//       carried slot.
+//   (i) In XdpCpuMapCommitRedirect, return XdpCpuMapCommitOwnershipTaken on the
+//       low-resource path. The operation removed is "the caller keeps the
+//       original": recv.c clears ActionNbl, so the original never reaches
+//       DropList and is never returned to the miniport, while the copy is
+//       delivered as well.
+//   (k) In XdpCpuMapDeepCopyAllocate, drop the Copy->SourceHandle assignment.
+//       The operation removed is "an originated receive NBL names its
+//       originating filter", which is what NDIS routes the return by.
+//   (l) In XdpCpuMapCommitRedirect, replace the inline
+//       "Enqueued = XdpCpuMapFlushBatch(Group);" with "Enqueued = 1;", so the
+//       batch is NOT flushed before returning and defers to
+//       XdpCpuMapCommitGroupFinish. The operation removed is "nothing is in
+//       flight when the caller can release the EC lock" -- section 8.4's quiesce
+//       guarantee. See the note at the assertion site: this criterion is the
+//       ONLY proof of that property until issue #21 lands a functional test that
+//       can construct the race.
+//
+//       N.B. forcing the count necessarily also removes the outcome
+//       propagation, so this mutation is compound. Criterion (o) isolates the
+//       outcome half; (l) is retained for the flush half because nothing else
+//       covers it.
+//   (m) In XdpCpuMapDeepCopyAllocate, collapse the whole descriptor-selection
+//       while-loop -- including its free/decrement body -- to a plain pop, so a
+//       dirty CACHED descriptor is reused instead of freed. The operation
+//       removed is "a descriptor we cannot prove clean is discarded, not
+//       repaired": the previous packet's metadata then survives into the next
+//       copy through the cache. Disabling only the cleanliness guard does NOT
+//       compile: it leaves the free branch unreachable and /WX rejects it.
+//   (n) In XdpCpuMapDeepCopyAllocate, delete the rule-2 refusal loop outright.
+//       The operation removed is "a source carrying a slot outside the carried
+//       set is refused rather than copied": the redirect then proceeds and
+//       delivers a packet whose un-carried metadata was silently dropped. This
+//       is the only coverage of the carry/refuse policy -- see the note on case
+//       3 of DeepCopyFailurePaths.
+//   (o) In XdpCpuMapCommitRedirect, delete the "if (Enqueued == 0) return
+//       XdpCpuMapCommitDeclined;" guard. The operation removed is "the commit
+//       result reports the real enqueue outcome": every failure then reports a
+//       successful deep-copy redirect, and recv.c suppresses the
+//       DropProgramInspection record for a packet that was actually lost.
+//   (p) In XdpCpuMapDeepCopyAllocate, delete the fresh-descriptor cleanliness
+//       branch. The operation removed is "a freshly allocated descriptor is
+//       checked too, and a dirty one is a counted ONE-SHOT failure rather than a
+//       retry": allocator residue is then carried into the copy. The recycled
+//       half of the same check is criterion (m); this is the fresh half, which
+//       is unreachable without the harness injecting residue.
+//   (q) In XdpCpuMapDeepCopyAllocate, add a DeepCopyDescriptorResidue increment
+//       to the RECYCLED-dirty discard. Unlike every other criterion here this is
+//       an addition, because the invariant it covers is a NEGATIVE one: a
+//       discarded recycled descriptor costs an allocation, not a packet, so no
+//       counter may move for it. Deleting something cannot break a claim that
+//       nothing happens, so the mutation has to be the thing the claim forbids.
+//       Without it, the two residue paths could be merged back onto one counter
+//       and nothing would notice -- which is the same "one counter, two jobs"
+//       defect the fresh/source split already had to correct once.//
+// Measured radii live in the increment-8 report, NOT here: embedded numbers go
+// stale every round and turned the audit into four separate passes. What the
+// source carries is exactly one current, unambiguous OPERATION per criterion.
+// Every criterion is re-run in
+// isolation after any change to the copy path, because a criterion validated
+// against superseded code is reported as evidence while proving nothing.
+//
+#define XDPCPUMAP_TEST_DEEPCOPY_PAYLOAD_LEN 137u
+
+static
 VOID
-XdpCpuMapTestCommitDeepCopyUnsupportedDrop(
+XdpCpuMapTestDeepCopySuccess(
     VOID
     )
 {
-    NET_BUFFER_LIST ActionNbl = {0};
+    UCHAR Payload[XDPCPUMAP_TEST_DEEPCOPY_PAYLOAD_LEN];
+    NET_BUFFER_LIST *Original;
     XDP_CPUMAP *CpuMap;
     XDP_CPUMAP_PROVIDER_VALUE Value;
     XDP_CPUMAP_ENTRY_V1 Entry;
     EX_RUNDOWN_REF NblRundown;
     XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_CPUMAP_DEEPCOPY_POOL Pool;
     XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
     XDP_CPUMAP_HELPER_STATS Stats;
+    XDPCPUMAP_TEST_NBL_DISPOSITION Disposition;
+    NET_BUFFER_LIST *Copy;
     LONG Baseline;
+    ULONG Index;
 
-    XDPCPUMAP_TEST_BEGIN("CommitDeepCopyUnsupportedDrop");
+    XDPCPUMAP_TEST_BEGIN("DeepCopySuccess");
+
+    XdpCpuMapTestResetNdisPool();
+
+    for (Index = 0; Index < sizeof(Payload); Index++) {
+        Payload[Index] = (UCHAR)(Index * 7 + 3);
+    }
 
     XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
     Baseline = XdpCpuMapTestLiveAllocations;
@@ -3356,50 +3580,539 @@ XdpCpuMapTestCommitDeepCopyUnsupportedDrop(
     Entry = XdpCpuMapTestEntry(0, 0, 0);
     XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
 
+    XDPCPUMAP_TEST_ASSERT(
+        NT_SUCCESS(XdpCpuMapDeepCopyPoolInitialize(&Pool, (NDIS_HANDLE)(ULONG_PTR)0xF117A)));
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblPoolLive == 1);
+
     ExInitializeRundownProtection(&NblRundown);
-    XdpCpuMapTestInitGroup(&CommitGroup, &NblRundown);
+    XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+
+    Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
 
     //
-    // Chain the original to a sentinel so a consumer that took ownership would
-    // be visible: the batch and the reject list both re-link Next.
+    // Every copied slot gets a distinct non-zero value, so a copy that carried
+    // only some of them is caught by identity rather than by a zero check an
+    // uninitialised slot would also pass. The pointer-owned slots are already
+    // populated with real allocations by XdpCpuMapTestCreateSourceNbl.
     //
-    NET_BUFFER_LIST_NEXT_NBL(&ActionNbl) = (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0;
+    for (ULONG Slot = 0; Slot < MaxNetBufferListInfo; Slot++) {
+        if (XdpCpuMapTestIsCarriedSlot(Slot)) {
+            Original->NetBufferListInfo[Slot] = (VOID *)(ULONG_PTR)(0xAB0000 + Slot);
+        }
+    }
+
+    //
+    // A sentinel successor, so a build that consumed the original into a chain
+    // is visible rather than merely suspected.
+    //
+    NET_BUFFER_LIST_NEXT_NBL(Original) = (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0;
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+
+    //
+    // FALSE, and that is the contract: on the low-resource path FALSE means
+    // "the caller still owns this NBL", not "the commit was rejected". The batch
+    // entry below proves ownership WAS committed.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+                XdpCpuMapCommitDeepCopied);
+
+    //
+    // Section 8.4: the batch is ALREADY FLUSHED when commit returns on this
+    // path. A batch entry is invisible to the quiesce scan, and the caller goes
+    // on to call XdpGenericReceiveLowResources, which releases and reacquires
+    // the EC spinlock -- a pause landing in that window would scan, find
+    // nothing, and complete, and a deferred flush would then enqueue behind it.
+    //
+    // Asserting Count == 0 AND a populated ring is the observable form of
+    // "nothing is in flight when the lock can be dropped".
+    //
+    // THESE TWO LINES AND CRITERION (l) ARE THE ONLY PROOF OF THAT PROPERTY.
+    //
+    // The functional pause-race test does NOT cover it and says so:
+    // XdpGenericReceiveLowResources releases the EC lock only when the pass list
+    // is non-empty, so the window needs a [PASS, REDIRECT] chain in one receive
+    // call, which needs a selectively-redirecting BPF program that does not
+    // exist yet. That work is issue #21 in increment 9. Until it lands, deleting
+    // or weakening these assertions removes the last thing standing between a
+    // deferred flush and a pause that silently depends on a target DPC.
+    //
+    XDPCPUMAP_TEST_ASSERT(CommitGroup.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Tail - Value.Target->Ring->Head == 1);
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+    //
+    // The ring holds a copy, not the original.
+    //
+    XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Tail - Value.Target->Ring->Head == 1);
+    {
+        const XDP_CPUMAP_ENTRY *Slot = &Value.Target->Ring->Entries[0];
+
+        Copy = Slot->Nbl;
+        XDPCPUMAP_TEST_ASSERT(Copy != NULL);
+        XDPCPUMAP_TEST_ASSERT(Copy != Original);
+        XDPCPUMAP_TEST_ASSERT(Slot->IsDeepCopy);
+        XDPCPUMAP_TEST_ASSERT(Slot->DeepCopyPool == &Pool);
+        XDPCPUMAP_TEST_ASSERT(Slot->NblRundown == &NblRundown);
+    }
+
+    //
+    // Bytes and receive metadata match, checked against the ORIGINAL's values
+    // rather than against constants the test also wrote into the copy.
+    //
+    // Asserted over XdpCpuMapTestReceiveInfoSlots -- the policy -- not over a
+    // list restated here. An enumerated list is how VLAN, frame type and
+    // filtering information went missing while a criterion still claimed
+    // "preserved OOB travels with the copy".
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestNblPayloadEquals(Copy, Payload, sizeof(Payload)));
+    //
+    // Carried slots match; nothing else is set.
+    //
+    // Asserted over the WHOLE array rather than over the carried list alone,
+    // because the defect this guards is precisely that an uncarried slot keeps
+    // whatever was in the descriptor -- allocator residue on a fresh one, the
+    // previous packet's metadata on a recycled one.
+    //
+    for (ULONG Slot = 0; Slot < MaxNetBufferListInfo; Slot++) {
+        if (XdpCpuMapTestIsCarriedSlot(Slot)) {
+            XDPCPUMAP_TEST_ASSERT(
+                Copy->NetBufferListInfo[Slot] == Original->NetBufferListInfo[Slot]);
+        } else {
+            XDPCPUMAP_TEST_ASSERT(Copy->NetBufferListInfo[Slot] == NULL);
+        }
+    }
+
+    //
+    // No NDIS-managed reference was taken. A build that went back to
+    // NdisCopyReceiveNetBufferListInfo would acquire a WFP context reference it
+    // has no way to release from a cached descriptor.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestWfpReferences == 0);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyMetadataUnsupported == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyDescriptorResidue == 0);
+
+    //
+    // An originated receive NBL must name its originating filter, or NDIS has
+    // nowhere to route the return.
+    //
+    XDPCPUMAP_TEST_ASSERT(Copy->SourceHandle == (NDIS_HANDLE)(ULONG_PTR)0xF117A);
+
+    //
+    // One descriptor allocated and one page outstanding while the copy is queued.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 1);
+    XDPCPUMAP_TEST_ASSERT(Pool.CacheCount == 1);
+
+    //
+    // The original is exactly where the caller left it.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        NET_BUFFER_LIST_NEXT_NBL(Original) == (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
+
+    XdpCpuMapTestRunQueuedDpcs();
+
+    //
+    // The copy was indicated once, WITH RESOURCES, and never returned to the
+    // miniport. The original was neither indicated nor returned by CPUMAP.
+    //
+    Disposition = XdpCpuMapTestNblDisposition(Copy);
+    XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 1);
+    XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+    XDPCPUMAP_TEST_ASSERT(
+        (Disposition.IndicationFlags & NDIS_RECEIVE_FLAGS_RESOURCES) != 0);
+    XDPCPUMAP_TEST_ASSERT(
+        (Disposition.IndicationFlags & NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL) != 0);
+
+    Disposition = XdpCpuMapTestNblDisposition(Original);
+    XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+    XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+
+    //
+    // Recycled before the DPC returned: the pages are back, the descriptor is
+    // still cached rather than freed, and no new descriptor was allocated.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblAllocTotal == 1);
+
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyBuildCount == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueCount == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.DrainCount == 1);
+
+    XdpCpuMapTestDeleteSourceNbl(Original);
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+
+    XdpCpuMapDeepCopyPoolCleanup(&Pool);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblPoolLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XdpCpuMapStop();
+}
+
+//
+// Every row 9b failure path, and the one that leaks if unhandled.
+//
+// Section 8.1a row 9b names three ways preparing a copy can fail and one way the
+// ring can refuse a finished one. All four are POST-commit: the original is
+// already on the caller's DropList and the batch entry already holds a backing
+// reference, an NblRundown credit and a target rundown reference, so each has to
+// release explicitly rather than fall through to a pre-commit path that no
+// longer exists.
+//
+// The retreat-succeeded-then-failed case is called out in the design as the one
+// that leaks if unhandled, because the descriptor has pages attached by then and
+// caching it as-is would strand them. The harness models pages as real
+// allocations precisely so that "leaked" is observable rather than argued.
+//
+// Deletion criteria:
+//
+//   (d) In XdpCpuMapDeepCopyAllocate, replace the XdpCpuMapDeepCopyRecycle on
+//       the MDL-copy failure path with XdpCpuMapDeepCopyPushFree. The operation
+//       removed is "a partially built copy has its data start advanced back
+//       before it is cached": the descriptor still returns to the free list, so
+//       descriptor accounting is unchanged and only the live-PAGE assertion
+//       fails. This is the exact substitution the design warns about.
+//
+//   (e) In the flush pre-pass, drop the three release calls on the failure path.
+//       The operation removed is "a failed entry releases the references commit
+//       gave it"; the packet is still lost and still counted, so only the
+//       reference-balance assertions fail.
+//   (f) In the flush's rejection branch, chain a deep copy into
+//       Group->RejectedNbls instead of the recycle list. The operation removed
+//       is "a rejected copy goes back to its pool, not to the miniport": the
+//       copy is handed to the caller for DropList, which would return a
+//       pool-owned buffer to a miniport that never owned it.
+//
+//
+static
+VOID
+XdpCpuMapTestDeepCopyFailurePaths(
+    VOID
+    )
+{
+    UCHAR Payload[XDPCPUMAP_TEST_DEEPCOPY_PAYLOAD_LEN];
+    NET_BUFFER_LIST *Original;
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_CPUMAP_DEEPCOPY_POOL Pool;
+    XDP_CPUMAP_DEEPCOPY_POOL FreshPool;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    XDP_CPUMAP_HELPER_STATS Stats;
+    LONG Baseline;
+    UINT32 AllocsBefore;
+    UINT32 NblLiveBefore;
+    UINT32 Case;
+
+    XDPCPUMAP_TEST_BEGIN("DeepCopyFailurePaths");
+
+    XdpCpuMapTestResetNdisPool();
+    for (UINT32 Index = 0; Index < sizeof(Payload); Index++) {
+        Payload[Index] = (UCHAR)(Index ^ 0x5A);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    XDPCPUMAP_TEST_ASSERT(
+        NT_SUCCESS(XdpCpuMapDeepCopyPoolInitialize(&Pool, (NDIS_HANDLE)(ULONG_PTR)0xF117A)));
+    ExInitializeRundownProtection(&NblRundown);
+
+    //
+    // Case 0: no descriptor available.        Case 1: retreat fails.
+    // Case 2: the copy fails AFTER the retreat succeeded -- the leaking case.
+    //
+    for (Case = 0; Case < 3; Case++) {
+        XdpCpuMapTestFailNblAllocAfter = (Case == 0) ? 0 : -1;
+        XdpCpuMapTestFailRetreatAfter = (Case == 1) ? 0 : -1;
+        XdpCpuMapTestFailMdlCopyAfter = (Case == 2) ? 0 : -1;
+
+        XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+        Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+        NET_BUFFER_LIST_NEXT_NBL(Original) = (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0;
+
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+        XdpCpuMapReferenceBacking(CpuMap);
+        Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+                XdpCpuMapCommitDeclined);
+
+        //
+        // Flushed inline, so the failure has already been taken and accounted
+        // for by the time commit returns.
+        //
+        XDPCPUMAP_TEST_ASSERT(CommitGroup.Count == 0);
+
+        //
+        // Nothing is handed back to the caller: the original was never taken, so
+        // there is no rejected chain to return.
+        //
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+        //
+        // Lost, counted, and not queued.
+        //
+        XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Tail == Value.Target->Ring->Head);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
+        XDPCPUMAP_TEST_ASSERT(
+            NET_BUFFER_LIST_NEXT_NBL(Original) == (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0);
+
+        //
+        // Exactly what row 9b says the entry releases: the backing reference,
+        // the NblRundown credit and the target rundown reference.
+        //
+        XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+        XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+        XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+
+        //
+        // And no leak. Case 2 is the one that would strand a page: the retreat
+        // succeeded, so the descriptor had pages attached when the copy failed.
+        //
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+
+        XdpCpuMapTestDeleteSourceNbl(Original);
+    }
+
+    XdpCpuMapTestFailNblAllocAfter = -1;
+    XdpCpuMapTestFailRetreatAfter = -1;
+    XdpCpuMapTestFailMdlCopyAfter = -1;
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 3);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyBuildCount == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueCount == 0);
+
+    //
+    // Case 3: the source carries metadata we cannot carry, so the redirect is
+    // REFUSED rather than delivered damaged.
+    //
+    // This is the ONLY coverage of the refuse half of the carry/refuse policy.
+    // If it is deleted or weakened, nothing detects a build that silently
+    // delivers a packet holding a pointer into storage the miniport has already
+    // reclaimed. The carry half has its own criterion -- deleting the carry loop
+    // fails six assertions in DeepCopySuccess, one per carried slot.
+    //
+    // N.B. an earlier revision claimed the carry loop's criterion was VACUOUS,
+    // on the grounds that the refusal guarantees every non-carried slot is NULL
+    // before the carry runs, so hand-carrying and calling
+    // NdisCopyReceiveNetBufferListInfo produce an identical copy. That
+    // equivalence is real but proves nothing: a deletion criterion DELETES the
+    // operation, it does not swap it for an equivalent one. Deleting the carry
+    // loses all six values and is detected immediately.
+    //
+    // Refusal, not assertion: a conforming miniport supplying media-specific
+    // information is valid input, and a checked build must not bugcheck on it.
+    //
+    XdpCpuMapTestSourceMetadataBlobs = TRUE;
+
+    XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+    Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+    NET_BUFFER_LIST_NEXT_NBL(Original) = (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0;
 
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
     XdpCpuMapReferenceBacking(CpuMap);
     Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
 
     XDPCPUMAP_TEST_ASSERT(
-        !XdpCpuMapCommitRedirect(&Redirect, &ActionNbl, FALSE, FALSE, &CommitGroup));
-
-    //
-    // The scope of the claim. Ownership stayed with the caller: the NBL is not
-    // in the batch and its chain is untouched, and the flush hands nothing back.
-    // What the caller then does with it is not observable here.
-    //
-    XDPCPUMAP_TEST_ASSERT(CommitGroup.Count == 0);
-    XDPCPUMAP_TEST_ASSERT(
-        NET_BUFFER_LIST_NEXT_NBL(&ActionNbl) == (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0);
+        XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+            XdpCpuMapCommitDeclined);
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
 
     //
-    // Nothing was queued, nothing indicated, and the references the helper took
-    // were all released.
+    // Nothing queued, nothing indicated, the original untouched, and the loss
+    // counted under its own reason rather than folded into allocation failure.
     //
     XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Tail == Value.Target->Ring->Head);
-    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestDpcInsertCalls == 0);
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
-    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(
+        NET_BUFFER_LIST_NEXT_NBL(Original) == (NET_BUFFER_LIST *)(ULONG_PTR)0xD0D0D0D0);
+
     XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
     XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
-    XDPCPUMAP_TEST_ASSERT(NblRundown.AcquireExCalls == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
 
     Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
-    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyUnsupportedDrop == 1);
-    XDPCPUMAP_TEST_ASSERT(Stats.CommitPauseDrop == 0);
-    XDPCPUMAP_TEST_ASSERT(Stats.CommitRundownDrop == 0);
-    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueCount == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyMetadataUnsupported == 1);
+    //
+    // The SOURCE reason, not the descriptor one: the two imply different
+    // responses, so a test that could not tell them apart would let either
+    // fire for the other's reason.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyDescriptorResidue == 0);
+
+    //
+    // And the PARTITION claim: a reason counter never fires alone. Every
+    // copy-preparation failure increments the aggregate exactly once, whatever
+    // its reason, which is what makes the aggregate the only figure packet
+    // accounting may sum. Pinning the reasons against each other does not check
+    // that -- three earlier cases plus this one is four.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 4);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyBuildCount == 0);
+
+    XdpCpuMapTestDeleteSourceNbl(Original);
+    XdpCpuMapTestSourceMetadataBlobs = FALSE;
+
+    //
+    // Case 3: the ring refuses a finished copy. Row 9b "(ii)": the copy goes back
+    // to its pool, and NOT into RejectedNbls, which the caller would append to
+    // DropList and return to a miniport that never owned it.
+    //
+    // Deactivating the target is the same lever EnqueueTargetInactive uses: it
+    // is what the sweep publishes under ConfigLock before it waits, so the
+    // under-ring-lock re-check in step 2 refuses the entry.
+    //
+    Value.Target->Active = FALSE;
+
+    XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+    Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+                XdpCpuMapCommitDeclined);
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueTargetInactive == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyBuildCount == 1);
+
+    XdpCpuMapTestDeleteSourceNbl(Original);
+
+    //
+    // Case 5: a FRESH descriptor arrives dirty.
+    //
+    // The uniform cleanliness check applies to freshly allocated descriptors as
+    // well as recycled ones, because NDIS does NOT document that
+    // NdisAllocateNetBufferAndNetBufferList zeroes NetBufferListInfo -- it
+    // documents initialization only for specific fields such as Scratch. Every
+    // other case here reaches only the RECYCLED half of that check. Without
+    // residue injection the fresh half never executes at all, and an invariant
+    // that never executes can only be argued about.
+    //
+    // A DEDICATED pool is required. A shared one holds cached descriptors, and a
+    // clean cached descriptor short-circuits to Found before the allocator is
+    // ever reached, so the fresh branch is unreachable on a warm pool. That is
+    // why injecting residue into a shared-pool case appears to do nothing.
+    //
+    // The assertions are the whole rule, not just the outcome: exactly ONE
+    // allocation and no retry -- retrying would spin at DISPATCH_LEVEL for as
+    // long as the allocator kept returning residue -- the descriptor FREED
+    // rather than repaired or cached, the loss counted under its own reason, and
+    // no pages or references left behind.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        NT_SUCCESS(
+            XdpCpuMapDeepCopyPoolInitialize(&FreshPool, (NDIS_HANDLE)(ULONG_PTR)0xF117B)));
+
+    //
+    // Reactivate the target. The previous case left it inactive, and leaving it
+    // that way would make this case decline via EnqueueTargetInactive whether or
+    // not the fresh-dirty branch exists -- passing for the wrong reason. The
+    // EnqueueTargetInactive assertion below pins that down: it must stay at 1,
+    // proving the decline came from the DESCRIPTOR-RESIDUE check and not the
+    // ring.
+    //
+    Value.Target->Active = TRUE;
+
+    AllocsBefore = (UINT32)XdpCpuMapTestNblAllocTotal;
+    NblLiveBefore = (UINT32)XdpCpuMapTestNblLive;
+
+    XdpCpuMapTestDirtyFreshAlloc = TRUE;
+
+    XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &FreshPool);
+    Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+            XdpCpuMapCommitDeclined);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+    XdpCpuMapTestDirtyFreshAlloc = FALSE;
+
+    XDPCPUMAP_TEST_ASSERT((UINT32)XdpCpuMapTestNblAllocTotal == AllocsBefore + 1);
+    XDPCPUMAP_TEST_ASSERT((UINT32)XdpCpuMapTestNblLive == NblLiveBefore);
+    XDPCPUMAP_TEST_ASSERT(FreshPool.CacheCount == 0);
+
+    XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Tail == Value.Target->Ring->Head);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyDescriptorResidue == 1);
+    //
+    // And NOT the source reason: this decline came from allocator residue,
+    // which says nothing about the carried set.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyMetadataUnsupported == 1);
+
+    //
+    // The partition again: this failure also lands on the aggregate, making
+    // five copy-preparation failures so far.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 5);
+    //
+    // The decline came from the DESCRIPTOR-RESIDUE check, and not from the ring:
+    // the target was reactivated above, so EnqueueTargetInactive must not have
+    // moved and no copy was built. Without this pin the case would pass on the
+    // previous case's inactive target -- which is exactly how its first version
+    // passed for the wrong reason.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.EnqueueTargetInactive == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyBuildCount == 1);
+
+    XdpCpuMapTestDeleteSourceNbl(Original);
+    XdpCpuMapDeepCopyPoolCleanup(&FreshPool);
 
     XdpCpuMapTestRelease(CpuMap, &Value);
     XdpCpuMapTestDrainSweeps();
@@ -3407,11 +4120,419 @@ XdpCpuMapTestCommitDeepCopyUnsupportedDrop(
     XdpCpuMapTestDrainSweeps();
     XdpCpuMapTestDrainEpochFrees();
     XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+
+    XdpCpuMapDeepCopyPoolCleanup(&Pool);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
     XdpCpuMapStop();
 }
 
 //
-// A flush group that carries no CPUMAP packet must be FREE.
+// Teardown: a deep copy goes back to its POOL, and the miniport hears nothing.
+//
+// Section 8.1a row 9b, "Released -- teardown". Quiesce tombstoning and the
+// retire drain both reach XdpCpuMapChainSetReturn, whose name is now only half
+// right: an original is returned to the miniport, a copy is recycled. Handing a
+// copy to NdisFReturnNetBufferLists would give the miniport a buffer allocated
+// from our own pool, which never belonged to it.
+//
+// Increment 8 left this only INCIDENTALLY exercised: the deep-copy tests drained
+// through the DPC, and the teardown tests carried originals, so no assertion
+// anywhere said "zero miniport returns" for a copy. A build that returned the
+// copy to the miniport AND recycled it would have passed every one of them.
+//
+// Deletion criterion (j): in XdpCpuMapChainSetReturn, drop the IsDeepCopy branch
+// so every partition goes to NdisFReturnNetBufferLists. The operation removed is
+// "teardown recycles copies instead of returning them". Descriptor and page
+// accounting still balance -- the recycle is gone, so nothing double-frees --
+// and only the return-count and disposition assertions here can see it.
+//
+static
+VOID
+XdpCpuMapTestDeepCopyTeardownRecycle(
+    VOID
+    )
+{
+    UCHAR Payload[96];
+    NET_BUFFER_LIST *Originals[3];
+    NET_BUFFER_LIST *Copies[3];
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_CPUMAP_DEEPCOPY_POOL Pool;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    LONG Baseline;
+    UINT32 Index;
+
+    XDPCPUMAP_TEST_BEGIN("DeepCopyTeardownRecycle");
+
+    XdpCpuMapTestResetNdisPool();
+    for (Index = 0; Index < sizeof(Payload); Index++) {
+        Payload[Index] = (UCHAR)(Index + 11);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    XDPCPUMAP_TEST_ASSERT(
+        NT_SUCCESS(XdpCpuMapDeepCopyPoolInitialize(&Pool, (NDIS_HANDLE)(ULONG_PTR)0xF117A)));
+    ExInitializeRundownProtection(&NblRundown);
+
+    //
+    // Cancel the drain so teardown owns disposal rather than the DPC.
+    //
+    XdpCpuMapTestRemoveQueueDpc(Value.Target->Dpc);
+
+    for (Index = 0; Index < RTL_NUMBER_OF(Originals); Index++) {
+        XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+        Originals[Index] = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+        XdpCpuMapReferenceBacking(CpuMap);
+        Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapCommitRedirect(
+                &Redirect, Originals[Index], FALSE, FALSE, &CommitGroup) ==
+                    XdpCpuMapCommitDeepCopied);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+        Copies[Index] = Value.Target->Ring->Entries[Index & Value.Target->Ring->Mask].Nbl;
+        XDPCPUMAP_TEST_ASSERT(Copies[Index] != NULL);
+        XDPCPUMAP_TEST_ASSERT(Copies[Index] != Originals[Index]);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == (LONG)RTL_NUMBER_OF(Copies));
+    XDPCPUMAP_TEST_ASSERT(Pool.CacheCount == RTL_NUMBER_OF(Copies));
+
+    //
+    // Retire with the ring occupied. Section 8.3, "Delivery on retire".
+    //
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+
+    //
+    // The claim, and the one no previous test made: NOTHING went to the
+    // miniport. Not counted-as-zero-returns-of-originals, but zero return CALLS
+    // at all, because on this path there is no original to return -- each went
+    // home through the caller's DropList at commit time.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+
+    for (Index = 0; Index < RTL_NUMBER_OF(Copies); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition;
+
+        Disposition = XdpCpuMapTestNblDisposition(Copies[Index]);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+
+        Disposition = XdpCpuMapTestNblDisposition(Originals[Index]);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+    }
+
+    //
+    // Recycled, not leaked and not freed: the pages are back, the descriptors
+    // are still cached, and the pool never grew past what it built.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == (LONG)RTL_NUMBER_OF(Copies));
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblAllocTotal == (LONG)RTL_NUMBER_OF(Copies));
+
+    XDPCPUMAP_TEST_ASSERT(NblRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    for (Index = 0; Index < RTL_NUMBER_OF(Originals); Index++) {
+        XdpCpuMapTestDeleteSourceNbl(Originals[Index]);
+    }
+
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+
+    XdpCpuMapDeepCopyPoolCleanup(&Pool);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XdpCpuMapStop();
+}
+
+//
+// The cache: descriptors are reused, growth is lazy and bounded, and reaching
+// the cap is a counted drop rather than an error.
+// Deletion criteria:
+//
+//   (g) In XdpCpuMapDeepCopyAllocate, remove the
+//       Pool->CacheCount < XDP_CPUMAP_DEEPCOPY_CACHE_MAX guard. The operation
+//       removed is the cap itself: allocation continues past it, so the
+//       exhaustion assertions fail and nothing bounds the pool.
+//
+//   (h) In XdpCpuMapDeepCopyAllocate, skip the InterlockedFlushSList refill of
+//       the local list. The operation removed is "recycled descriptors are
+//       reused": every copy then allocates a new descriptor, so the
+//       allocation-total and reuse assertions fail while packet counts stay
+//       identical.
+//
+static
+VOID
+XdpCpuMapTestDeepCopyCacheReuseAndCap(
+    VOID
+    )
+{
+    UCHAR Payload[64];
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF NblRundown;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_CPUMAP_DEEPCOPY_POOL Pool;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    XDP_CPUMAP_HELPER_STATS Stats;
+    NET_BUFFER_LIST *Original;
+    ULONG64 FirstCopyTag = 0;
+    LONG Baseline;
+    UINT32 Index;
+
+    XDPCPUMAP_TEST_BEGIN("DeepCopyCacheReuseAndCap");
+
+    XdpCpuMapTestResetNdisPool();
+    RtlZeroMemory(Payload, sizeof(Payload));
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    XDPCPUMAP_TEST_ASSERT(
+        NT_SUCCESS(XdpCpuMapDeepCopyPoolInitialize(&Pool, (NDIS_HANDLE)(ULONG_PTR)0xF117A)));
+    ExInitializeRundownProtection(&NblRundown);
+
+    //
+    // Eight sequential low-resource redirects, each drained before the next.
+    // Every one after the first must reuse the descriptor the previous recycled,
+    // so the pool grows to exactly one.
+    //
+    for (Index = 0; Index < 8; Index++) {
+        XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+        Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+        XdpCpuMapReferenceBacking(CpuMap);
+        Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+                XdpCpuMapCommitDeepCopied);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+        if (Index == 0) {
+            FirstCopyTag = Value.Target->Ring->Entries[0].Nbl->TestTag;
+        } else {
+            //
+            // Identity, not just a count: the SAME descriptor came back.
+            //
+            XDPCPUMAP_TEST_ASSERT(
+                Value.Target->Ring->Entries[Index & Value.Target->Ring->Mask].Nbl->TestTag ==
+                    FirstCopyTag);
+        }
+
+        //
+        // And it came back CLEAN. The indication stub stamps upper-stack
+        // metadata into the slots NDIS does not copy, so a descriptor reused
+        // without zeroing carries the previous packet's values into this one --
+        // a cross-packet data leak through the cache.
+        //
+        {
+            const NET_BUFFER_LIST *Reused =
+                Value.Target->Ring->Entries[Index & Value.Target->Ring->Mask].Nbl;
+
+            XDPCPUMAP_TEST_ASSERT(
+                Reused->NetBufferListInfo[ClassificationHandleNetBufferListInfo] == NULL);
+            XDPCPUMAP_TEST_ASSERT(
+                Reused->NetBufferListInfo[NetBufferListCancelId] == NULL);
+        }
+
+        XdpCpuMapTestRunQueuedDpcs();
+        XdpCpuMapTestDeleteSourceNbl(Original);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(Pool.CacheCount == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblAllocTotal == 1);
+
+    //
+    // Now the other half of the rule: a descriptor the upper stack STAMPED is
+    // discarded rather than reused.
+    //
+    // Slots CPUMAP does not carry are not ours to clear -- the array holds
+    // entries with mixed ownership and blanket-clearing one NDIS
+    // reference-manages would bypass its handling. So a dirty descriptor is
+    // freed and a fresh one allocated: the cache degrades to slower and correct
+    // instead of fast and carrying the previous packet's metadata.
+    //
+    XdpCpuMapTestStampOnIndicate = TRUE;
+
+    for (Index = 0; Index < 3; Index++) {
+        UINT32 AllocsBefore = (UINT32)XdpCpuMapTestNblAllocTotal;
+
+        XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+        Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+        XdpCpuMapReferenceBacking(CpuMap);
+        Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+                XdpCpuMapCommitDeepCopied);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+        //
+        // The copy handed to the ring is clean in every slot CPUMAP does not
+        // carry, whatever the previous packet's consumer left behind.
+        //
+        {
+            const NET_BUFFER_LIST *Fresh =
+                Value.Target->Ring->Entries[
+                    (Index + 8) & Value.Target->Ring->Mask].Nbl;
+
+            for (ULONG Slot = 0; Slot < MaxNetBufferListInfo; Slot++) {
+                if (!XdpCpuMapTestIsCarriedSlot(Slot)) {
+                    XDPCPUMAP_TEST_ASSERT(Fresh->NetBufferListInfo[Slot] == NULL);
+                }
+            }
+        }
+
+        XdpCpuMapTestRunQueuedDpcs();
+        XdpCpuMapTestDeleteSourceNbl(Original);
+
+        //
+        // After the first, every iteration must ALLOCATE: the descriptor it
+        // would otherwise have reused was stamped and therefore discarded.
+        //
+        if (Index > 0) {
+            XDPCPUMAP_TEST_ASSERT((UINT32)XdpCpuMapTestNblAllocTotal == AllocsBefore + 1);
+        }
+    }
+
+    //
+    // Discarded descriptors are FREED, not leaked: the cache never holds more
+    // than the one live copy in flight.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XdpCpuMapTestStampOnIndicate = FALSE;
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+
+    Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+    //
+    // Eight reused copies plus three the stamped-discard phase built.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyBuildCount == 11);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 0);
+
+    //
+    // The stamped-discard phase freed three dirty RECYCLED descriptors, and no
+    // counter moved for any of them. That is the design's position, not an
+    // oversight: a discarded recycled descriptor costs an allocation, not a
+    // packet, so it is not a loss and does not belong in DeepCopyFailCount.
+    // DeepCopyDescriptorResidue is FRESH-only and must stay at zero here --
+    // asserting it is what stops the two residue paths being merged back into
+    // one counter, which is the defect issue #22 has to reason about.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyDescriptorResidue == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyMetadataUnsupported == 0);
+
+    //
+    // Now the cap. Drive the pool to XDP_CPUMAP_DEEPCOPY_CACHE_MAX outstanding
+    // copies by never draining, then take one more: the next allocation must be
+    // refused and counted rather than growing the pool.
+    //
+    // The ring is left at the map's established depth, which is
+    // XDP_CPUMAP_RING_DEPTH_DEFAULT and already well above the cache cap, so
+    // ring-full cannot absorb the packet first and make this a test of the wrong
+    // limit. Asking for a different depth here would be rejected anyway: section
+    // 5.3 fixes the setting on first write.
+    //
+    {
+        XDP_CPUMAP_PROVIDER_VALUE BigValue;
+
+        C_ASSERT(XDP_CPUMAP_RING_DEPTH_DEFAULT > XDP_CPUMAP_DEEPCOPY_CACHE_MAX);
+
+        Entry = XdpCpuMapTestEntry(1, 0, 0);
+        XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &BigValue)));
+        XdpCpuMapTestRemoveQueueDpc(BigValue.Target->Dpc);
+
+        for (Index = 0; Index < XDP_CPUMAP_DEEPCOPY_CACHE_MAX; Index++) {
+            XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+            Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+
+            XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, BigValue.Target));
+            XdpCpuMapReferenceBacking(CpuMap);
+            Redirect = XdpCpuMapTestFrameRedirect(CpuMap, BigValue.Target, 0);
+            XDPCPUMAP_TEST_ASSERT(
+                XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+                XdpCpuMapCommitDeepCopied);
+            XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+            XdpCpuMapTestDeleteSourceNbl(Original);
+        }
+
+        XDPCPUMAP_TEST_ASSERT(Pool.CacheCount == XDP_CPUMAP_DEEPCOPY_CACHE_MAX);
+
+        //
+        // One past the cap.
+        //
+        XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &NblRundown, &Pool);
+        Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, BigValue.Target));
+        XdpCpuMapReferenceBacking(CpuMap);
+        Redirect = XdpCpuMapTestFrameRedirect(CpuMap, BigValue.Target, 0);
+        XDPCPUMAP_TEST_ASSERT(
+            XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+                XdpCpuMapCommitDeclined);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+
+        //
+        // Refused, counted, non-fatal: the pool did not grow, the ring did not
+        // take the packet, and the run continues.
+        //
+        XDPCPUMAP_TEST_ASSERT(Pool.CacheCount == XDP_CPUMAP_DEEPCOPY_CACHE_MAX);
+        XDPCPUMAP_TEST_ASSERT(
+            BigValue.Target->Ring->Tail - BigValue.Target->Ring->Head ==
+                XDP_CPUMAP_DEEPCOPY_CACHE_MAX);
+
+        Stats = XdpCpuMapTestQueryHelperStats(CpuMap);
+        XDPCPUMAP_TEST_ASSERT(Stats.DeepCopyFailCount == 1);
+        //
+        // Eight from the reuse phase, three from the stamped discard phase,
+        // then a full cache's worth here.
+        //
+        XDPCPUMAP_TEST_ASSERT(
+            Stats.DeepCopyBuildCount == 11 + XDP_CPUMAP_DEEPCOPY_CACHE_MAX);
+
+        XdpCpuMapTestDeleteSourceNbl(Original);
+        XdpCpuMapTestRelease(CpuMap, &BigValue);
+        XdpCpuMapTestDrainSweeps();
+    }
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+
+    XdpCpuMapDeepCopyPoolCleanup(&Pool);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XdpCpuMapStop();
+}
+
+
 //
 // This is the cost model the receive path depends on. `XdpGenericReceivePostInspectNbs`
 // skips group init and finish entirely when the receive queue has no CPUMAP
@@ -3604,91 +4725,6 @@ XdpCpuMapTestTargetDpcAffinity(
 }
 
 //
-// Per-NBL disposition across everything NDIS was told to do with it.
-//
-// Increment 6's tests counted indications and returns. That cannot see the
-// failures increment 7 exists to rule out: an NBL indicated twice, an NBL both
-// indicated and returned, or an NBL that quietly appears in a partition it does
-// not belong to all produce the same totals as correct behaviour. Identity is
-// the only observable that separates them, so every zero-copy assertion below is
-// made per NBL rather than per count.
-//
-typedef struct _XDPCPUMAP_TEST_NBL_DISPOSITION {
-    UINT32 Indicated;
-    UINT32 Returned;
-    UINT32 IndicationIndex;
-    ULONG IndicationFlags;
-} XDPCPUMAP_TEST_NBL_DISPOSITION;
-
-static
-XDPCPUMAP_TEST_NBL_DISPOSITION
-XdpCpuMapTestNblDisposition(
-    _In_ const NET_BUFFER_LIST *Nbl
-    )
-{
-    XDPCPUMAP_TEST_NBL_DISPOSITION Disposition = {0};
-
-    Disposition.IndicationIndex = MAXUINT32;
-
-    for (ULONG Index = 0; Index < XdpCpuMapTestIndicationCount; Index++) {
-        const XDP_CPUMAP_TEST_INDICATION *Indication = &XdpCpuMapTestIndications[Index];
-
-        //
-        // The snapshot, not Head->Next: see XDP_CPUMAP_TEST_INDICATION. A
-        // truncated snapshot cannot support a negative conclusion, so refuse it
-        // outright rather than under-reporting appearances.
-        //
-        XDPCPUMAP_TEST_ASSERT(!Indication->NblSnapshotTruncated);
-        XDPCPUMAP_TEST_ASSERT(Indication->NblSnapshotCount == Indication->NblCount);
-
-        for (ULONG Slot = 0; Slot < Indication->NblSnapshotCount; Slot++) {
-            if (Indication->NblSnapshot[Slot] == Nbl) {
-                Disposition.Indicated++;
-                Disposition.IndicationIndex = Index;
-                Disposition.IndicationFlags = Indication->Flags;
-            }
-        }
-    }
-
-    for (ULONG Index = 0; Index < XdpCpuMapTestReturnCount; Index++) {
-        const XDP_CPUMAP_TEST_INDICATION *Return = &XdpCpuMapTestReturns[Index];
-
-        XDPCPUMAP_TEST_ASSERT(!Return->NblSnapshotTruncated);
-        XDPCPUMAP_TEST_ASSERT(Return->NblSnapshotCount == Return->NblCount);
-
-        for (ULONG Slot = 0; Slot < Return->NblSnapshotCount; Slot++) {
-            if (Return->NblSnapshot[Slot] == Nbl) {
-                Disposition.Returned++;
-            }
-        }
-    }
-
-    return Disposition;
-}
-
-//
-// Counts how many of the NBLs in a caller-supplied array appear in a chain, so a
-// rejected-original list can be checked for identity rather than length.
-//
-static
-UINT32
-XdpCpuMapTestCountNblsInChain(
-    _In_opt_ const NET_BUFFER_LIST *Chain,
-    _In_ const NET_BUFFER_LIST *Nbl
-    )
-{
-    UINT32 Count = 0;
-
-    for (const NET_BUFFER_LIST *Cur = Chain; Cur != NULL; Cur = Cur->Next) {
-        if (Cur == Nbl) {
-            Count++;
-        }
-    }
-
-    return Count;
-}
-
-//
 // Zero-copy ownership, end to end, asserted on NBL IDENTITY.
 //
 // Design section 8.1a row 9a: the original miniport NBL is taken at commit,
@@ -3800,7 +4836,7 @@ XdpCpuMapTestZeroCopyOwnershipLifecycle(
             0,
             UseA ? (const VOID *)&XdpCpuMapTestRxQueueA : (const VOID *)&XdpCpuMapTestRxQueueB,
             UseA ? (const VOID *)&XdpCpuMapTestGenericA : (const VOID *)&XdpCpuMapTestGenericB,
-            FALSE);
+            FALSE, FALSE, NULL);
 
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(
@@ -3944,7 +4980,6 @@ XdpCpuMapTestZeroCopyOwnershipLifecycle(
 // the mutation removes no observable behaviour and the test would pass -- rule 3.
 //
 // Radius of the criterion actually run, all 37 cases in isolation:
-// ZeroCopyPostCommitRejection 1; 36 pass, 0 crash, 0 hang. It isolates.
 //
 static
 VOID
@@ -4133,7 +5168,7 @@ XdpCpuMapTestZeroCopyTeardownDisposal(
     for (Index = 0; Index < RTL_NUMBER_OF(QuiesceNbls); Index++) {
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownA, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA,
-            &XdpCpuMapTestGenericA, FALSE);
+            &XdpCpuMapTestGenericA, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value0.Target, &QuiesceNbls[Index], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
@@ -4142,7 +5177,7 @@ XdpCpuMapTestZeroCopyTeardownDisposal(
     for (Index = 0; Index < RTL_NUMBER_OF(RetireNbls); Index++) {
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownB, XDPCPUMAP_TEST_FILTER_B, 0, &XdpCpuMapTestRxQueueB,
-            &XdpCpuMapTestGenericB, FALSE);
+            &XdpCpuMapTestGenericB, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value1.Target, &RetireNbls[Index], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
@@ -4568,21 +5603,21 @@ XdpCpuMapTestDrainPartitionedIndication(
     for (Index = 0; Index < 2; Index++) {
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownA, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA,
-            &XdpCpuMapTestGenericA, FALSE);
+            &XdpCpuMapTestGenericA, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value.Target, &Nbls[Index * 4 + 0], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
 
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownA, XDPCPUMAP_TEST_FILTER_A, 5, &XdpCpuMapTestRxQueueA,
-            &XdpCpuMapTestGenericA, FALSE);
+            &XdpCpuMapTestGenericA, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value.Target, &Nbls[Index * 4 + 1], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
 
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownB, XDPCPUMAP_TEST_FILTER_B, 0, &XdpCpuMapTestRxQueueB,
-            &XdpCpuMapTestGenericB, FALSE);
+            &XdpCpuMapTestGenericB, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value.Target, &Nbls[Index * 4 + 2], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
@@ -4594,7 +5629,7 @@ XdpCpuMapTestDrainPartitionedIndication(
         //
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownA2, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA2,
-            &XdpCpuMapTestGenericA, FALSE);
+            &XdpCpuMapTestGenericA, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value.Target, &Nbls[Index * 4 + 3], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
@@ -4751,14 +5786,14 @@ XdpCpuMapTestDrainTombstoneSkip(
     for (Index = 0; Index < 2; Index++) {
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownA, XDPCPUMAP_TEST_FILTER_A, 0, &XdpCpuMapTestRxQueueA,
-            &XdpCpuMapTestGenericA, FALSE);
+            &XdpCpuMapTestGenericA, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value.Target, &Nbls[Index * 2 + 0], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
 
         XdpCpuMapCommitGroupInit(
             &CommitGroup, &RundownB, XDPCPUMAP_TEST_FILTER_B, 0, &XdpCpuMapTestRxQueueB,
-            &XdpCpuMapTestGenericB, FALSE);
+            &XdpCpuMapTestGenericB, FALSE, FALSE, NULL);
         XDPCPUMAP_TEST_ASSERT(
             XdpCpuMapTestCommit(CpuMap, Value.Target, &Nbls[Index * 2 + 1], &CommitGroup));
         XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
@@ -5053,7 +6088,10 @@ static const XDPCPUMAP_TEST_CASE XdpCpuMapTestCases[] = {
     XDPCPUMAP_TEST_CASE_ENTRY(CommitNullActionNbl),
     XDPCPUMAP_TEST_CASE_ENTRY(CommitGroupBatching),
     XDPCPUMAP_TEST_CASE_ENTRY(CommitFrameReuse),
-    XDPCPUMAP_TEST_CASE_ENTRY(CommitDeepCopyUnsupportedDrop),
+    XDPCPUMAP_TEST_CASE_ENTRY(DeepCopySuccess),
+    XDPCPUMAP_TEST_CASE_ENTRY(DeepCopyFailurePaths),
+    XDPCPUMAP_TEST_CASE_ENTRY(DeepCopyTeardownRecycle),
+    XDPCPUMAP_TEST_CASE_ENTRY(DeepCopyCacheReuseAndCap),
     XDPCPUMAP_TEST_CASE_ENTRY(CommitGroupUnusedIsFree),
     XDPCPUMAP_TEST_CASE_ENTRY(TargetDpcAffinity),
     XDPCPUMAP_TEST_CASE_ENTRY(ZeroCopyOwnershipLifecycle),
@@ -5092,7 +6130,7 @@ main(
     // way to run only the case a criterion is expected to hit: a filtered result
     // is evidence about that case alone and says nothing about the other 36, and
     // reporting one as a whole-suite radius is how criterion 22's radius was
-    // first understated. Baseline: all 37 pass in isolation; an unknown name
+    // first understated. Baseline: all 40 pass in isolation; an unknown name
     // exits 2.
     //
     const CHAR *Filter = (argc > 1) ? argv[1] : NULL;

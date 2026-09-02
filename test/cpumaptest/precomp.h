@@ -32,6 +32,7 @@
 #include <xdpifmode.h>
 
 #define XDP_POOLTAG_CPUMAP 'mCdX'
+#define XDP_POOLTAG_CPUMAP_DEEPCOPY 'dCdX'
 
 //
 // cpumap.c passes the driver object through to XdpCreateWorkQueue, which the

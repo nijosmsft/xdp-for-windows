@@ -40,3 +40,18 @@
 // XdpCpuMapCommitGroupFinish.
 //
 #define XDP_CPUMAP_BATCH_SIZE 32u
+
+//
+// Upper bound on deep-copy NBLs a single RX queue's pool will ever allocate.
+//
+// The cache grows lazily and never pre-allocates data buffers: a copy's pages
+// come from NdisRetreatNetBufferDataStart at copy time and are released back at
+// recycle time, so this caps bare NBL descriptors, not memory held for payload.
+// Reaching it is a counted, non-fatal drop rather than an error -- CanPend ==
+// FALSE is an exceptional path, and POC A's equivalent fallback pool caps at 64.
+//
+// Counted like the TX clone cache upstream: the count is of descriptors ever
+// allocated and is not decremented on recycle, because a recycled descriptor
+// stays in the cache and is reused rather than freed.
+//
+#define XDP_CPUMAP_DEEPCOPY_CACHE_MAX 256u

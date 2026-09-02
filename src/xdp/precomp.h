@@ -16,6 +16,8 @@
 #include <ntifs.h>
 #include <ntintsafe.h>
 #include <ndis.h>
+#include <ndis/ndl/mdl.h>
+#include <ndis/ndl/nblqueue.h>
 #include <wdmsec.h>
 
 //
