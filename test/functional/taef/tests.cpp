@@ -638,6 +638,10 @@ public:
         ::GenericRxEbpfPass();
     }
 
+    TEST_METHOD_PRERELEASE(GenericRxEbpfCpuMapRedirect) {
+        ::GenericRxEbpfCpuMapRedirect();
+    }
+
     TEST_METHOD_PRERELEASE(GenericRxEbpfTx) {
         ::GenericRxEbpfTx();
     }

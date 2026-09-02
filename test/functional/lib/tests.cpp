@@ -43,6 +43,7 @@
 #include <qeo_ndis.h>
 #include <xdp/ebpfhook.h>
 #include <xdp/buffervirtualaddress.h>
+#include <xdp/cpumap.h>
 #include <xdp/framefragment.h>
 #include <xdp/framerxaction.h>
 
@@ -6189,10 +6190,191 @@ GenericRxEbpfPass()
     LwfRxFlush(FnLwf);
 }
 
+//
+// Software RSS: prove a packet is indicated on the CPU the CPUMAP names, not on
+// the CPU it arrived on.
+//
+// This is the first test in which a packet traverses CPUMAP at all. It asserts
+// the INDICATION PROCESSOR, deliberately, because that is the only observable
+// that distinguishes software RSS from a working ring: a packet count is
+// satisfied by a build that redirects nothing and passes the frame straight up.
+//
+// Three phases, each changing exactly one thing:
+//
+//   1. Baseline, no CPUMAP. The frame is indicated on its arrival processor,
+//      which is recorded rather than assumed. XDP's generic path preserves the
+//      indication processor for a PASS, which is what makes it the control.
+//   2. CPUMAP targeting processor A. Same interface, same queue, same flush
+//      options -- only the map differs. The frame must be indicated on A, and
+//      A is chosen to differ from the arrival processor.
+//   3. The map is repointed at processor B, with nothing else touched at all.
+//      The frame must follow to B.
+//
+// Phase 3 is what rules out the arrival hash: arrival is bit-for-bit identical
+// between phases 2 and 3, so a changed indication processor can only have come
+// from the map. Phases 2 and 3 together also rule out a fixed mis-steer, which
+// asserting a single target could not.
+//
+// The BPF program keys the map with a constant, not ctx->rx_queue_index, so the
+// target is a property of the map alone; see test/bpf/cpumap_redirect.c.
+//
 VOID
-GenericRxEbpfTx()
+GenericRxEbpfCpuMapRedirect()
 {
     auto If = FnMpIf;
+    unique_fnmp_handle GenericMp;
+    unique_fnlwf_handle FnLwf;
+    const UCHAR Payload[] = "GenericRxEbpfCpuMapRedirect";
+    PROCESSOR_NUMBER ArrivalProcessor;
+    PROCESSOR_NUMBER TargetProcessorA = {0};
+    PROCESSOR_NUMBER TargetProcessorB = {0};
+    UINT32 TargetIndexA = MAXUINT32;
+    UINT32 TargetIndexB = MAXUINT32;
+
+    //
+    // Arrival plus two distinct targets. Retargeting onto the arrival processor
+    // in phase 3 would make that phase pass against a build that redirects
+    // nothing, so a third processor is required rather than optional.
+    //
+    const UINT32 ProcessorCount = GetProcessorCount(0);
+    TEST_TRUE(ProcessorCount >= 3);
+
+    GenericMp = MpOpenGeneric(If.GetIfIndex());
+    FnLwf = LwfOpenDefault(If.GetIfIndex());
+
+    CxPlatVector<UCHAR> Mask(sizeof(Payload), 0xFF);
+    auto LwfFilter = LwfRxFilter(FnLwf, Payload, Mask.data(), sizeof(Payload));
+
+    //
+    // Pin the arrival processor: the miniport indicates on the processor its RSS
+    // table maps this queue to, so every phase arrives identically.
+    //
+    DATA_FLUSH_OPTIONS FlushOptions = {0};
+    FlushOptions.Flags.RssCpu = TRUE;
+    FlushOptions.RssCpuQueueId = If.GetQueueId();
+
+    //
+    // Phase 1: the control. No CPUMAP, so the frame is indicated where it
+    // arrived.
+    //
+    {
+        unique_xdp_program PassProgram =
+            AttachEbpfXdpProgram(If, "\\bpf\\pass.sys", "pass");
+
+        RX_FRAME Frame;
+        RxInitializeFrame(&Frame, If.GetQueueId(), Payload, sizeof(Payload));
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+        TEST_HRESULT(TryMpRxFlush(GenericMp, &FlushOptions));
+
+        auto RxFrame = LwfRxAllocateAndGetFrame(FnLwf, 0);
+        ArrivalProcessor = RxFrame->Output.ProcessorNumber;
+        LwfRxDequeueFrame(FnLwf, 0);
+        LwfRxFlush(FnLwf);
+    }
+
+    //
+    // XDP_CPUMAP_ENTRY_V1::TargetCpu is an ABSOLUTE NT processor index, which
+    // coincides with the group-relative number only within group 0. Restrict the
+    // test to group 0 and assert it, so a multi-group machine fails here rather
+    // than silently steering to a processor the test did not mean.
+    //
+    TEST_EQUAL(0, ArrivalProcessor.Group);
+
+    for (UINT32 Index = 0; Index < ProcessorCount; Index++) {
+        PROCESSOR_NUMBER Candidate;
+
+        ProcessorIndexToProcessorNumber(Index, &Candidate);
+        if (Candidate.Group != 0 || Candidate.Number == ArrivalProcessor.Number) {
+            continue;
+        }
+
+        if (TargetIndexA == MAXUINT32) {
+            TargetIndexA = Index;
+            TargetProcessorA = Candidate;
+        } else if (TargetIndexB == MAXUINT32) {
+            TargetIndexB = Index;
+            TargetProcessorB = Candidate;
+            break;
+        }
+    }
+
+    TEST_NOT_EQUAL(MAXUINT32, TargetIndexA);
+    TEST_NOT_EQUAL(MAXUINT32, TargetIndexB);
+
+    //
+    // Phases 2 and 3 share one attach, so the only difference between them is
+    // the map contents.
+    //
+    unique_xdp_program BpfProgram =
+        AttachEbpfXdpProgram(If, "\\bpf\\cpumap_redirect.sys", "cpumap_redirect");
+
+    fd_t cpu_map_fd = bpf_object__find_map_fd_by_name(BpfProgram.get(), "cpu_map");
+    TEST_NOT_EQUAL(cpu_map_fd, ebpf_fd_invalid);
+
+    XDP_CPUMAP_KEY MapKey = 0;
+    XDP_CPUMAP_ENTRY_V1 MapEntry;
+
+    RtlZeroMemory(&MapEntry, sizeof(MapEntry));
+    MapEntry.Size = XDP_CPUMAP_ENTRY_SIZE_V1;
+    MapEntry.Version = XDP_CPUMAP_ENTRY_VERSION_1;
+
+    //
+    // Phase 2: redirect to A.
+    //
+    MapEntry.TargetCpu = TargetIndexA;
+    TEST_EQUAL(0, bpf_map_update_elem(cpu_map_fd, &MapKey, &MapEntry, BPF_ANY));
+
+    {
+        RX_FRAME Frame;
+        RxInitializeFrame(&Frame, If.GetQueueId(), Payload, sizeof(Payload));
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+        TEST_HRESULT(TryMpRxFlush(GenericMp, &FlushOptions));
+
+        //
+        // The redirect crosses a CPU, so the indication is asynchronous with
+        // respect to the flush: the target's DPC has to run first.
+        //
+        auto RxFrame = LwfRxAllocateAndGetFrame(FnLwf, 0);
+        PROCESSOR_NUMBER Indicated = RxFrame->Output.ProcessorNumber;
+
+        TEST_EQUAL(TargetProcessorA.Group, Indicated.Group);
+        TEST_EQUAL(TargetProcessorA.Number, Indicated.Number);
+        TEST_NOT_EQUAL(ArrivalProcessor.Number, Indicated.Number);
+
+        LwfRxDequeueFrame(FnLwf, 0);
+        LwfRxFlush(FnLwf);
+    }
+
+    //
+    // Phase 3: repoint the map at B and change nothing else. Live
+    // reconfiguration under traffic is supported by design, so no detach and no
+    // reattach.
+    //
+    MapEntry.TargetCpu = TargetIndexB;
+    TEST_EQUAL(0, bpf_map_update_elem(cpu_map_fd, &MapKey, &MapEntry, BPF_ANY));
+
+    {
+        RX_FRAME Frame;
+        RxInitializeFrame(&Frame, If.GetQueueId(), Payload, sizeof(Payload));
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+        TEST_HRESULT(TryMpRxFlush(GenericMp, &FlushOptions));
+
+        auto RxFrame = LwfRxAllocateAndGetFrame(FnLwf, 0);
+        PROCESSOR_NUMBER Indicated = RxFrame->Output.ProcessorNumber;
+
+        TEST_EQUAL(TargetProcessorB.Group, Indicated.Group);
+        TEST_EQUAL(TargetProcessorB.Number, Indicated.Number);
+        TEST_NOT_EQUAL(ArrivalProcessor.Number, Indicated.Number);
+        TEST_NOT_EQUAL(TargetProcessorA.Number, Indicated.Number);
+
+        LwfRxDequeueFrame(FnLwf, 0);
+        LwfRxFlush(FnLwf);
+    }
+}
+
+VOID
+GenericRxEbpfTx()
+{    auto If = FnMpIf;
     unique_fnmp_handle GenericMp;
     const UCHAR Payload[] = "GenericRxEbpfTx";
 

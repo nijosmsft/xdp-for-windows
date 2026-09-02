@@ -3484,6 +3484,94 @@ XdpCpuMapTestCommitGroupUnusedIsFree(
 }
 
 //
+// The DPC is affinitized to the CPU the map entry names.
+//
+// This is the driver-side mechanism that the functional test
+// GenericRxEbpfCpuMapRedirect observes end to end: the packet is indicated on
+// the target CPU because the drain DPC runs there. That test needs hardware, so
+// the mechanism is pinned here as well, where it can be mutated.
+//
+// It asserts across SEVERAL DISTINCT CPUs on purpose. The pre-existing check in
+// DpcTargetingFailure asserts Target.Number == 0 for a target configured at CPU
+// 0, which cannot distinguish "affinitized to the configured CPU" from
+// "affinitized to CPU 0" or from a zero-initialized field -- it varies nothing.
+//
+// Deletion criterion: in XdpCpuMapCreateTarget, target the DPC at a fixed
+// processor number rather than the one resolved for AbsoluteCpu. Affinity stops
+// tracking configuration and the per-CPU assertions here fail.
+//
+static
+VOID
+XdpCpuMapTestTargetDpcAffinity(
+    VOID
+    )
+{
+    static const UINT32 Cpus[] = {1, 3, 5};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Values[RTL_NUMBER_OF(Cpus)];
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    LONG Baseline;
+    UINT32 Index;
+
+    XDPCPUMAP_TEST_BEGIN("TargetDpcAffinity");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+
+    for (Index = 0; Index < RTL_NUMBER_OF(Cpus); Index++) {
+        C_ASSERT(RTL_NUMBER_OF(Cpus) <= XDP_CPUMAP_TEST_PROCESSOR_COUNT);
+
+        Entry = XdpCpuMapTestEntry(Cpus[Index], 0, 0);
+        XDPCPUMAP_TEST_ASSERT(
+            NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Values[Index])));
+        XDPCPUMAP_TEST_ASSERT(Values[Index].Target != NULL);
+    }
+
+    for (Index = 0; Index < RTL_NUMBER_OF(Cpus); Index++) {
+        const XDP_CPUMAP_TARGET *Target = Values[Index].Target;
+
+        //
+        // The claim: the DPC's affinity is the CPU the entry named, for every
+        // entry, not just for whichever CPU happens to be zero.
+        //
+        XDPCPUMAP_TEST_ASSERT(Target->AbsoluteCpu == Cpus[Index]);
+        XDPCPUMAP_TEST_ASSERT(Target->Dpc->Targeted);
+        XDPCPUMAP_TEST_ASSERT(Target->Dpc->Target.Group == 0);
+        XDPCPUMAP_TEST_ASSERT(Target->Dpc->Target.Number == (UCHAR)Cpus[Index]);
+
+        //
+        // And the DPC carries its own target as the deferred context, which is
+        // what makes the drain run against the right ring on that CPU.
+        //
+        XDPCPUMAP_TEST_ASSERT(Target->Dpc->Context == (VOID *)Target);
+    }
+
+    //
+    // Distinct CPUs are distinct targets with distinct DPCs and rings. A single
+    // shared DPC would satisfy the affinity assertions above for whichever CPU
+    // was configured last.
+    //
+    XDPCPUMAP_TEST_ASSERT(Values[0].Target != Values[1].Target);
+    XDPCPUMAP_TEST_ASSERT(Values[1].Target != Values[2].Target);
+    XDPCPUMAP_TEST_ASSERT(Values[0].Target->Dpc != Values[1].Target->Dpc);
+    XDPCPUMAP_TEST_ASSERT(Values[1].Target->Dpc != Values[2].Target->Dpc);
+    XDPCPUMAP_TEST_ASSERT(Values[0].Target->Ring != Values[1].Target->Ring);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->TargetCount == RTL_NUMBER_OF(Cpus));
+
+    for (Index = 0; Index < RTL_NUMBER_OF(Cpus); Index++) {
+        XdpCpuMapTestRelease(CpuMap, &Values[Index]);
+    }
+
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
 // Section 7 steps 5 and 6, and the "once per target group" rule.
 //
 // Step 5 queues the DPC while the flush group STILL holds every helper-acquired
@@ -4306,6 +4394,7 @@ main(
     XdpCpuMapTestCommitFrameReuse();
     XdpCpuMapTestCommitDeepCopyUnsupportedDrop();
     XdpCpuMapTestCommitGroupUnusedIsFree();
+    XdpCpuMapTestTargetDpcAffinity();
     XdpCpuMapTestEnqueueInsertOrdering();
     XdpCpuMapTestEnqueueTargetInactive();
     XdpCpuMapTestEnqueueRingFull();
