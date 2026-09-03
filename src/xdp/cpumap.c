@@ -99,12 +99,43 @@ static XDP_WORK_QUEUE *XdpCpuMapRetireQueue;
 // These counters exist so that bound can be MEASURED rather than asserted; they
 // are traced at the end of every quiesce.
 //
-
-//
-// Quiesce instrumentation; the counter block is declared in cpumap.h so tests
-// and diagnostics can read it.
+// The counter block is declared in cpumap.h so tests and diagnostics can read
+// it.
 //
 static XDP_CPUMAP_QUIESCE_STATS XdpCpuMapQuiesceStats;
+
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapRecordMax(
+    _Inout_ volatile LONG64 *Maximum,
+    _In_ LONG64 Value
+    )
+{
+    for (;;) {
+        LONG64 Current = *Maximum;
+
+        if (Value <= Current ||
+            InterlockedCompareExchange64(Maximum, Value, Current) == Current) {
+            break;
+        }
+    }
+}
+
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+LONG64
+XdpCpuMapElapsedUs(
+    _In_ LONG64 Ticks,
+    _In_ LONG64 Frequency
+    )
+{
+    //
+    // A pause event is milliseconds, so the numerator cannot overflow at any
+    // plausible performance-counter frequency.
+    //
+    return Frequency != 0 ? (Ticks * 1000000) / Frequency : 0;
+}
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -137,6 +168,15 @@ typedef struct _XDP_CPUMAP_SWEEP_STATS {
 } XDP_CPUMAP_SWEEP_STATS;
 
 static XDP_CPUMAP_SWEEP_STATS XdpCpuMapSweepStats;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+LONG64
+XdpCpuMapQueryRetireDropCount(
+    VOID
+    )
+{
+    return XdpCpuMapSweepStats.RetireDropCount;
+}
 
 //
 // Helper fallback diagnostics. These per-map counters are fallback reasons:
@@ -2989,14 +3029,18 @@ XdpCpuMapQuiesceScope(
     )
 {
     LARGE_INTEGER Start;
+    LARGE_INTEGER ScanEnd;
     LARGE_INTEGER End;
     LARGE_INTEGER Frequency;
     UINT32 Passes = 0;
     UINT32 Matched;
+    BOOLEAN Exhausted;
     LONG64 MapsVisited = 0;
     LONG64 TargetsVisited = 0;
     LONG64 EntriesScanned = 0;
     LONG64 Tombstoned = 0;
+    LONG64 ScanDurationUs;
+    LONG64 FlushDurationUs;
     LONG64 DurationUs;
 
     ASSERT((RxQueueOwner != NULL) != (GenericOwner != NULL));
@@ -3041,9 +3085,20 @@ XdpCpuMapQuiesceScope(
                 if (Target != NULL) {
                     //
                     // Pin the target with the same rundown the data path uses,
-                    // so retire cannot free the ring underneath this pass. A
-                    // failed acquire means the target is already retiring and
-                    // its own sweep drains the ring synchronously.
+                    // so retire cannot free the ring underneath this pass.
+                    //
+                    // This acquire cannot currently fail. The sweep clears the
+                    // target-table slot under ConfigLock EXCLUSIVE before it
+                    // runs the rundown down, so reading the slot and acquiring
+                    // inside one SHARED hold of that lock yields either NULL or
+                    // a live rundown -- a retiring target is never observed
+                    // here. The acquire is retained because it is what pins the
+                    // ring for the pass, and because it is the guard that would
+                    // remain correct if that unlink-first ordering ever changed.
+                    // It is NOT a skip path: an earlier revision described it as
+                    // one, and a counter added to distinguish "skipped" from
+                    // "nothing to tombstone" was removed after being proved
+                    // unreachable by deletion criterion.
                     //
                     Held = ExAcquireRundownProtection(&Target->PacketRundown);
                 }
@@ -3051,6 +3106,34 @@ XdpCpuMapQuiesceScope(
                 RtlReleasePushLockShared(&CpuMap->ConfigLock);
 
                 if (Target == NULL || !Held) {
+                    //
+                    // NOT currently reachable via !Held, and deliberately kept.
+                    //
+                    // The acquire cannot fail: the sweep publishes
+                    // Target->Active = FALSE and clears the target
+                    // table slot under ConfigLock EXCLUSIVE, and only releases
+                    // that lock before XdpCpuMapRetireTarget runs the rundown
+                    // down. This loop reads the slot and acquires the rundown
+                    // inside one SHARED hold of the same lock, so it observes
+                    // either NULL or a target whose rundown is still live.
+                    //
+                    // The branch stays because the acquire is what pins the ring
+                    // for the pass, and a future change that retires without
+                    // unlinking first would make the failure real. What does not
+                    // stay is a counter claiming to distinguish it: an earlier
+                    // revision of this increment added TargetsSkipped here, and
+                    // deleting the increment did not fail a single test, because
+                    // nothing can reach it.
+                    //
+                    // The condition that DOES arise -- a ring the sweep unlinked
+                    // between pause publication and this scan, which quiesce
+                    // never sees -- is disposed of correctly by the retire
+                    // drain, which counts RetireDropCount. Note that this does
+                    // NOT make the condition observable: every retirement
+                    // increments that counter, so it cannot separate this case
+                    // from ordinary retirement. Isolating it would need a
+                    // counter on that specific path, which does not exist.
+                    //
                     continue;
                 }
 
@@ -3147,12 +3230,22 @@ XdpCpuMapQuiesceScope(
     // Exactly once, after the loop. Its cost is O(processor count) and outside
     // every CPUMAP cap, so bounding the call count at one bounds it absolutely.
     //
+    // Timed separately from the scan. Section 14's remediation for an excessive
+    // pause -- reduce the global ring-entry cap, then the live-map cap -- acts
+    // on the scan alone, so a total that is dominated by this call is a result
+    // neither constant can move.
+    //
+    ScanEnd = KeQueryPerformanceCounter(NULL);
+
     KeFlushQueuedDpcs();
 
     End = KeQueryPerformanceCounter(NULL);
-    DurationUs =
-        Frequency.QuadPart != 0 ?
-            ((End.QuadPart - Start.QuadPart) * 1000000) / Frequency.QuadPart : 0;
+
+    ScanDurationUs = XdpCpuMapElapsedUs(ScanEnd.QuadPart - Start.QuadPart, Frequency.QuadPart);
+    FlushDurationUs = XdpCpuMapElapsedUs(End.QuadPart - ScanEnd.QuadPart, Frequency.QuadPart);
+    DurationUs = XdpCpuMapElapsedUs(End.QuadPart - Start.QuadPart, Frequency.QuadPart);
+
+    Exhausted = (Passes >= XDP_CPUMAP_QUIESCE_MAX_PASSES && Matched > 0);
 
     InterlockedIncrement64(&XdpCpuMapQuiesceStats.Count);
     InterlockedAdd64(&XdpCpuMapQuiesceStats.MapsVisited, MapsVisited);
@@ -3161,16 +3254,12 @@ XdpCpuMapQuiesceScope(
     InterlockedAdd64(&XdpCpuMapQuiesceStats.Tombstoned, Tombstoned);
     InterlockedAdd64(&XdpCpuMapQuiesceStats.PassesTotal, Passes);
     InterlockedExchange64(&XdpCpuMapQuiesceStats.LastDurationUs, DurationUs);
-    for (;;) {
-        LONG64 Max = XdpCpuMapQuiesceStats.MaxDurationUs;
-
-        if (DurationUs <= Max ||
-            InterlockedCompareExchange64(
-                &XdpCpuMapQuiesceStats.MaxDurationUs, DurationUs, Max) == Max) {
-            break;
-        }
-    }
-    if (Passes >= XDP_CPUMAP_QUIESCE_MAX_PASSES && Matched > 0) {
+    InterlockedExchange64(&XdpCpuMapQuiesceStats.LastScanDurationUs, ScanDurationUs);
+    InterlockedExchange64(&XdpCpuMapQuiesceStats.LastFlushDurationUs, FlushDurationUs);
+    XdpCpuMapRecordMax(&XdpCpuMapQuiesceStats.MaxDurationUs, DurationUs);
+    XdpCpuMapRecordMax(&XdpCpuMapQuiesceStats.MaxScanDurationUs, ScanDurationUs);
+    XdpCpuMapRecordMax(&XdpCpuMapQuiesceStats.MaxFlushDurationUs, FlushDurationUs);
+    if (Exhausted) {
         InterlockedIncrement64(&XdpCpuMapQuiesceStats.MaxPassesExhausted);
     }
 
@@ -3179,12 +3268,50 @@ XdpCpuMapQuiesceScope(
     // latency bound. Capture it with a WPP/ETW session while pausing an interface
     // at maximum queue count.
     //
+    // It carries every field the section 14 calibration row requires to be
+    // recorded per pause event. The aggregates above cannot serve that purpose
+    // -- MaxPassesExhausted in particular is a count of events, so an aggregate
+    // read after a run cannot say which pause exhausted the budget -- and there
+    // is no user-mode query path for CPUMAP statistics (issue #22).
+    //
     TraceInfo(
         TRACE_CORE,
-        "CPUMAP quiesce Scope=%s Maps=%I64d Targets=%I64d Scanned=%I64d "
-        "Tombstoned=%I64d Passes=%u DurationUs=%I64d",
+        "CPUMAP quiesce Scope=%s Maps=%I64d Targets=%I64d "
+        "Scanned=%I64d Tombstoned=%I64d Passes=%u Exhausted=%u ScanUs=%I64d "
+        "FlushUs=%I64d DurationUs=%I64d",
         RxQueueOwner != NULL ? "RxQueue" : "Interface",
-        MapsVisited, TargetsVisited, EntriesScanned, Tombstoned, Passes, DurationUs);
+        MapsVisited, TargetsVisited, EntriesScanned, Tombstoned,
+        Passes, (UINT32)Exhausted, ScanDurationUs, FlushDurationUs, DurationUs);
+
+    if (Exhausted) {
+        //
+        // This is a DEFECT SIGNAL, not a tuning signal, which is why it is at
+        // error level and why raising the pass budget is the wrong response.
+        //
+        // Section 8.4's termination argument is that once Flags.Paused is
+        // published on every queue in scope, the set of producers that can still
+        // commit CPUMAP ownership for that scope is finite and does not grow. A
+        // pass that matches nothing proves none remain. Eight consecutive passes
+        // that each match therefore cannot be offered load: something enqueued
+        // AFTER publication, so the commit gate leaked.
+        //
+        // The consequence is what makes it serious rather than untidy. Quiesce
+        // returns with entries still queued, and the pre-existing
+        // ExWaitForRundownProtectionRelease then has to wait for the drain DPC
+        // to release their NblRundown references -- which reintroduces
+        // dependence on the target CPU being able to run, the exact dependency
+        // the round-3 fix removed from the retire path.
+        //
+        // Deliberately NOT an assertion: a checked build must not bugcheck on a
+        // condition a producer outside this driver could in principle cause.
+        //
+        TraceError(
+            TRACE_CORE,
+            "CPUMAP quiesce pass budget exhausted Scope=%s Tombstoned=%I64d "
+            "Passes=%u -- the commit pause gate leaked; the rundown wait now "
+            "depends on the target CPU draining",
+            RxQueueOwner != NULL ? "RxQueue" : "Interface", Tombstoned, Passes);
+    }
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
