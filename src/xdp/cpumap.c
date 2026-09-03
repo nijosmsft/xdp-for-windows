@@ -465,9 +465,14 @@ XdpCpuMapDeepCopyIsCarriedSlot(
 static
 BOOLEAN
 XdpCpuMapDeepCopyIsDescriptorClean(
-    _In_ const NET_BUFFER_LIST *Nbl
+    _In_ const NET_BUFFER_LIST *Nbl,
+    _Out_opt_ ULONG *DirtySlot
     )
 {
+    if (DirtySlot != NULL) {
+        *DirtySlot = MaxNetBufferListInfo;
+    }
+
     for (ULONG Slot = 0; Slot < MaxNetBufferListInfo; Slot++) {
         if (XdpCpuMapDeepCopyIsCarriedSlot(Slot)) {
             //
@@ -478,6 +483,14 @@ XdpCpuMapDeepCopyIsDescriptorClean(
         }
 
         if (Nbl->NetBufferListInfo[Slot] != NULL) {
+            //
+            // Report WHICH slot, for the same reason the metadata refusal does:
+            // "a descriptor was dirty" says something broke, "slot N was dirty"
+            // says what to go and look at.
+            //
+            if (DirtySlot != NULL) {
+                *DirtySlot = Slot;
+            }
             return FALSE;
         }
     }
@@ -506,6 +519,7 @@ XdpCpuMapDeepCopyAllocate(
     NET_BUFFER *SourceNb = NET_BUFFER_LIST_FIRST_NB(Original);
     NET_BUFFER *CopyNb;
     ULONG DataLength;
+    ULONG DirtySlot = MaxNetBufferListInfo;
 
     //
     // A low-resource indication carries one NB, and the receive path asserts it
@@ -571,6 +585,18 @@ XdpCpuMapDeepCopyAllocate(
 
         if (Original->NetBufferListInfo[Slot] != NULL) {
             Stats->DeepCopyMetadataUnsupported++;
+
+            //
+            // Section 12 observability. The offending SLOT is the whole point:
+            // section 12 says a non-zero DeepCopyMetadataUnsupported means the
+            // carried set needs revisiting, and that guidance is unusable
+            // without knowing WHICH slot forced the refusal. Logging the count
+            // alone would say something is wrong but not what to change.
+            //
+            TraceVerbose(
+                TRACE_CORE,
+                "DeepCopy refuse Original=%p Reason=MetadataUnsupported Slot=%u",
+                Original, Slot);
             return NULL;
         }
     }
@@ -608,7 +634,7 @@ XdpCpuMapDeepCopyAllocate(
         Copy = Pool->LocalList;
         Pool->LocalList = Copy->Next;
 
-        if (XdpCpuMapDeepCopyIsDescriptorClean(Copy)) {
+        if (XdpCpuMapDeepCopyIsDescriptorClean(Copy, NULL)) {
             goto Found;
         }
 
@@ -635,11 +661,28 @@ XdpCpuMapDeepCopyAllocate(
         // allocator assumption above has broken and we want a counter saying so,
         // not a spin.
         //
-        if (!XdpCpuMapDeepCopyIsDescriptorClean(Copy)) {
+        if (!XdpCpuMapDeepCopyIsDescriptorClean(Copy, &DirtySlot)) {
             Copy->Next = NULL;
             NdisFreeNetBufferList(Copy);
             Pool->CacheCount--;
             Stats->DeepCopyDescriptorResidue++;
+
+            //
+            // Section 12 observability. Distinct from the refusal above and
+            // deliberately so: this says the ALLOCATOR handed back a descriptor
+            // with residue, which means the assumption behind the uniform
+            // cleanliness check has broken. The response is to investigate that,
+            // never to widen the carried set, so the two must be
+            // distinguishable in a trace and not just in a counter.
+            //
+            // The dirty slot is reported for the same reason the metadata
+            // refusal reports its offending slot: the counter says something
+            // broke, the slot says where to look.
+            //
+            TraceVerbose(
+                TRACE_CORE,
+                "DeepCopy refuse Original=%p Copy=%p Reason=DescriptorResidue Slot=%u Pool=%p",
+                Original, Copy, DirtySlot, Pool);
             return NULL;
         }
     } else {
@@ -809,9 +852,12 @@ XdpCpuMapFlushBatch(
             XDP_CPUMAP_BATCH_ENTRY *BatchEntry = &Group->Entries[Index];
             XDP_CPUMAP_HELPER_STATS *Stats;
             NET_BUFFER_LIST *Copy = NULL;
+            NET_BUFFER_LIST *Original;
 
             ASSERT(BatchEntry->Target != NULL);
             ASSERT(BatchEntry->Nbl != NULL);
+
+            Original = BatchEntry->Nbl;
 
             Stats = XdpCpuMapGetCurrentHelperStats(BatchEntry->CpuMap);
 
@@ -822,6 +868,21 @@ XdpCpuMapFlushBatch(
             if (Copy != NULL) {
                 BatchEntry->Nbl = Copy;
                 Stats->DeepCopyBuildCount++;
+
+                //
+                // Section 12 observability. The deep-copy path is exceptional --
+                // one NB per low-resource indication -- so per-copy verbose
+                // tracing adds no volume on the normal path, and it is the only
+                // way to correlate the original with the copy from outside the
+                // driver. Original and copy are both logged because "O != C" is
+                // the property the design turns on: the original goes home to
+                // the miniport while the copy travels to another CPU.
+                //
+                TraceVerbose(
+                    TRACE_CORE,
+                    "CpuMapId=%u DeepCopy build Original=%p Copy=%p Pool=%p TargetCpu=%u",
+                    BatchEntry->CpuMap->CpuMapId, Original, Copy, Group->DeepCopyPool,
+                    BatchEntry->Target->AbsoluteCpu);
                 continue;
             }
 
@@ -990,6 +1051,18 @@ XdpCpuMapFlushBatch(
             NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(DeepCopyRejects);
 
             ASSERT(Group->DeepCopyPool != NULL);
+
+            //
+            // Section 12 observability. A ring-rejected copy is the case most
+            // easily confused with a leak from outside the driver: it was built,
+            // never indicated, and never returned to the miniport. Tracing it
+            // with an explicit disposition is what distinguishes "recycled
+            // correctly" from "lost".
+            //
+            TraceVerbose(
+                TRACE_CORE, "DeepCopy recycle Head=%p Count=1 Pool=%p Disposition=RingRejected",
+                DeepCopyRejects, Group->DeepCopyPool);
+
             XdpCpuMapDeepCopyRecycle(Group->DeepCopyPool, DeepCopyRejects);
             DeepCopyRejects = Next;
         }
@@ -1521,7 +1594,8 @@ static
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 XdpCpuMapChainRecycleDeepCopies(
-    _Inout_ XDP_CPUMAP_NBL_CHAIN *Chain
+    _Inout_ XDP_CPUMAP_NBL_CHAIN *Chain,
+    _In_ const CHAR *Disposition
     )
 {
     NET_BUFFER_LIST *First = Chain->Head;
@@ -1531,6 +1605,19 @@ XdpCpuMapChainRecycleDeepCopies(
     ASSERT(Chain->DeepCopyPool != NULL);
     ASSERT(First != NULL);
     ASSERT(Chain->Tail != NULL);
+
+    //
+    // Section 12 observability. Disposition is a parameter rather than inferred
+    // because the three ways a copy leaves the data path -- delivered and
+    // returned by the stack, refused by the ring, or discarded at teardown --
+    // are indistinguishable from here, and they are exactly what a reader needs
+    // to tell apart. Every one of them ends in the SAME pool the copy came from,
+    // which is the property this trace exists to make checkable.
+    //
+    TraceVerbose(
+        TRACE_CORE, "DeepCopy recycle Head=%p Count=%u Pool=%p Disposition=%s",
+        First, Chain->Count, Chain->DeepCopyPool, Disposition);
+    UNREFERENCED_PARAMETER(Disposition);
 
     while (Nbl != NULL) {
         NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(Nbl);
@@ -1594,8 +1681,23 @@ XdpCpuMapChainSetIndicate(
             Chain->FilterHandle, Chain->Head, Chain->PortNumber, Chain->Count,
             ReceiveFlags);
 
+        //
+        // Section 12 observability. ReceiveFlags is logged as ACTUALLY PASSED,
+        // not as intended: the RESOURCES bit is what forces the stack to consume
+        // the copy inline, and the whole recycle lifetime argument rests on it,
+        // so it must be observable rather than inferred from IsDeepCopy. The
+        // executing CPU is logged because the point of the feature is that this
+        // is the map-selected CPU and not the arrival CPU.
+        //
         if (Chain->IsDeepCopy) {
-            XdpCpuMapChainRecycleDeepCopies(Chain);
+            TraceVerbose(
+                TRACE_CORE,
+                "DeepCopy indicate Head=%p Count=%u ReceiveFlags=%x Cpu=%u",
+                Chain->Head, Chain->Count, ReceiveFlags, KeGetCurrentProcessorIndex());
+        }
+
+        if (Chain->IsDeepCopy) {
+            XdpCpuMapChainRecycleDeepCopies(Chain, "Indicated");
         }
 
         XdpCpuMapChainRelease(Chain);
@@ -1627,7 +1729,7 @@ XdpCpuMapChainSetReturn(
         // would hand the miniport a buffer allocated from our own pool.
         //
         if (Chain->IsDeepCopy) {
-            XdpCpuMapChainRecycleDeepCopies(Chain);
+            XdpCpuMapChainRecycleDeepCopies(Chain, "Teardown");
         } else {
             NdisFReturnNetBufferLists(Chain->FilterHandle, Chain->Head, 0);
         }
@@ -2489,6 +2591,31 @@ XdpCpuMapDestroy(
     ASSERT(CpuMap->ChargedNonPagedBytes == CpuMap->HelperStatsBytes);
 
     if (CpuMap->HelperStats != NULL) {
+        //
+        // Section 12 observability: the ONLY way these counters leave the
+        // driver. They are per-CPU and map-scoped, so this aggregates them here,
+        // at map destruction, which is the last moment the array is valid and
+        // the only point at which the totals are final. Queue teardown would be
+        // the wrong scope -- a map outlives any one queue.
+        //
+        // This exists because the section 12 guidance is operational: a non-zero
+        // MetadataUnsupported means revisit the carried set, a non-zero
+        // DescriptorResidue means the allocator assumption broke. Guidance about
+        // counters nobody can read is not guidance, and shipping it that way is
+        // what made this trace necessary.
+        //
+        XDP_CPUMAP_HELPER_STATS Totals;
+
+        XdpCpuMapQueryHelperStats(CpuMap, &Totals);
+
+        TraceInfo(
+            TRACE_CORE,
+            "CpuMapId=%u DeepCopy summary Build=%llu Fail=%llu MetadataUnsupported=%llu "
+            "DescriptorResidue=%llu RingFull=%llu EnqueueTargetInactive=%llu",
+            CpuMap->CpuMapId, Totals.DeepCopyBuildCount, Totals.DeepCopyFailCount,
+            Totals.DeepCopyMetadataUnsupported, Totals.DeepCopyDescriptorResidue,
+            Totals.RingFullCount, Totals.EnqueueTargetInactive);
+
         ExFreePoolWithTag(CpuMap->HelperStats, XDP_POOLTAG_CPUMAP);
         CpuMap->HelperStats = NULL;
     }
