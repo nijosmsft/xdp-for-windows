@@ -773,14 +773,50 @@ KeAcquireInStackQueuedSpinLock(
     Handle->Lock = SpinLock;
 }
 
+//
+// TEST-ONLY PRODUCER INJECTION, AND THE ONLY HOOK IN THIS HARNESS.
+//
+// Two section 14 rows -- quiesce tail snapshot and quiesce pass budget -- are
+// about what a producer does WHILE a quiesce scan is running. Quiesce releases
+// the ring lock between chunks precisely so producers can run there, so the
+// release is the faithful injection point and the only one a single-threaded
+// harness has.
+//
+// WHAT MAY USE IT: XdpCpuMapTestQuiesceTailSnapshot and
+// XdpCpuMapTestQuiescePassBudget, and nothing else. Both arm it immediately
+// before calling quiesce and assert afterwards that it disarmed itself.
+//
+// WHAT MUST NOT: any test that merely wants a producer to run at some other
+// point. Every other production entry point returns to the test between
+// operations, so such a test should call the producer directly. A hook that
+// grows extra call sites becomes load-bearing for tests that never needed it,
+// and then the harness -- not the driver -- decides what is reachable.
+//
+// The pointer is detached across the call so a hook that itself takes the ring
+// lock cannot recurse into itself. The hook returns TRUE to stay armed and
+// FALSE to disarm; disarming is how a test stops injecting once the condition
+// it cares about has passed, without the stub second-guessing it.
+//
+extern BOOLEAN (*XdpCpuMapTestRingLockReleaseHook)(VOID);
+
 FORCEINLINE
 VOID
 KeReleaseInStackQueuedSpinLock(
     _In_ KLOCK_QUEUE_HANDLE *Handle
     )
 {
+    BOOLEAN (*Hook)(VOID);
+
     XDPCPUMAP_TEST_ASSERT(*Handle->Lock == 1);
     *Handle->Lock = 0;
+
+    Hook = XdpCpuMapTestRingLockReleaseHook;
+    if (Hook != NULL) {
+        XdpCpuMapTestRingLockReleaseHook = NULL;
+        if (Hook()) {
+            XdpCpuMapTestRingLockReleaseHook = Hook;
+        }
+    }
 }
 
 //

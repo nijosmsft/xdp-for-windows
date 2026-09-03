@@ -58,6 +58,26 @@
 //                                defeated
 //   RetireDrainReturns           a retiring target RETURNS queued packets rather
 //                                than indicating them
+//   RetireSuppressedTargetDpc    a target whose CPU never runs its DPC still
+//                                retires: retire cancels the queued instance and
+//                                drains the ring on the worker thread
+//   QuiesceScoping               quiesce reaches every ring of every live map,
+//                                collects only the pausing queue's entries, and
+//                                releases its per-map reference
+//   QuiesceInterfaceScope        interface pause matches by GENERIC, so every
+//                                queue on that interface is collected and no
+//                                queue on another one is
+//   QuiesceTailSnapshot          one pass is bounded by the tail it snapshotted,
+//                                not by a tail a producer keeps advancing
+//   QuiescePassBudget            the pass loop terminates at the budget, counts
+//                                the exhaustion, and leaves the rundown wait
+//                                able to complete
+//   QuiesceTombstoneBalance      the section 8.1a audit table, row by row, on a
+//                                ring mixing a deep copy, originals and a peer
+//   QuiesceDurationAttribution   ScanUs is the scan and FlushUs is the flush,
+//                                proved in both directions -- their SUM being
+//                                right is satisfied by a build that transposes
+//                                them
 //
 // Every case asserts the live allocation count returns to its starting value, so
 // any unwind path that forgets a free fails here rather than in a driver.
@@ -103,6 +123,12 @@ XdpCpuMapTestAssert(
         XdpCpuMapTestFailures++;
     }
 }
+
+//
+// See stubs/ntos.h for what this is and, more importantly, for what may not use
+// it. NULL except while one of the two quiesce concurrency tests is running.
+//
+BOOLEAN (*XdpCpuMapTestRingLockReleaseHook)(VOID);
 
 VOID
 XdpCpuMapTestResetAllocator(
@@ -836,7 +862,8 @@ XdpCpuMapTestDrainSweeps(
     XdpCpuMapTestRun++; \
     XdpCpuMapTestResetAllocator(); \
     XdpCpuMapTestResetNdis(); \
-    XdpCpuMapTestResetDpcs()
+    XdpCpuMapTestResetDpcs(); \
+    XdpCpuMapTestRingLockReleaseHook = NULL
 
 //
 // Tests.
@@ -1813,6 +1840,26 @@ XdpCpuMapTestQuiesceScanCost(
     XDPCPUMAP_TEST_ASSERT(SparseTargets == FullTargets);
     XDPCPUMAP_TEST_ASSERT(FullTombstoned == 0);
     XDPCPUMAP_TEST_ASSERT(SparseTombstoned == 0);
+
+    //
+    // The scan/flush split is measured from ONE clock reading pair, so the two
+    // parts account for the whole: each is a floor division of the same
+    // frequency, and a sum of two floors is the floor of the sum or one less.
+    //
+    // The SUM is all this proves. Which term is which is proved by
+    // XdpCpuMapTestQuiesceDurationAttribution, because a build that transposed
+    // them would satisfy every assertion here.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        StatsAfter.LastScanDurationUs + StatsAfter.LastFlushDurationUs <=
+            StatsAfter.LastDurationUs);
+    XDPCPUMAP_TEST_ASSERT(
+        StatsAfter.LastDurationUs <=
+            StatsAfter.LastScanDurationUs + StatsAfter.LastFlushDurationUs + 1);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.MaxDurationUs >= StatsAfter.LastDurationUs);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.MaxScanDurationUs >= StatsAfter.LastScanDurationUs);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.MaxFlushDurationUs >= StatsAfter.LastFlushDurationUs);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.MaxPassesExhausted == StatsBefore.MaxPassesExhausted);
 
     //
     // Drain the synthetic entries before teardown: they hold no real references,
@@ -6054,6 +6101,1357 @@ XdpCpuMapTestRetireDrainReturns(
     XdpCpuMapStop();
 }
 
+//
+// Commits one zero-copy packet on a named queue. Increment 9's quiesce cases all
+// need several distinct (queue, generic, filter) identities in one ring, which
+// XdpCpuMapTestInitGroup cannot express because it hardcodes queue A.
+//
+static
+VOID
+XdpCpuMapTestCommitOnQueue(
+    _Inout_ XDP_CPUMAP *CpuMap,
+    _Inout_ XDP_CPUMAP_TARGET *Target,
+    _Inout_ NET_BUFFER_LIST *Nbl,
+    _In_ EX_RUNDOWN_REF *NblRundown,
+    _In_ NDIS_HANDLE FilterHandle,
+    _In_ const VOID *RxQueueOwner,
+    _In_ const VOID *GenericOwner
+    )
+{
+    XDP_CPUMAP_COMMIT_GROUP Group;
+
+    XdpCpuMapCommitGroupInit(
+        &Group, NblRundown, FilterHandle, 0, RxQueueOwner, GenericOwner, FALSE, FALSE, NULL);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestCommit(CpuMap, Target, Nbl, &Group));
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&Group) == 0);
+}
+
+//
+// The producer that runs WHILE a quiesce scan is in progress. Driven by the
+// single ring-lock-release hook in stubs/ntos.h; see that file for why the hook
+// exists and what may not use it.
+//
+typedef struct _XDPCPUMAP_TEST_INJECTOR {
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_TARGET *Target;
+    EX_RUNDOWN_REF *NblRundown;
+    NET_BUFFER_LIST *Nbls;
+    UINT32 Capacity;
+    UINT32 Injected;
+    const VOID *RxQueueOwner;
+    const VOID *GenericOwner;
+
+    //
+    // TRUE if the injector was still armed and still had budget when the ring
+    // started draining -- that is, it stopped because the experiment ended, not
+    // because it ran out. Both cases below assert it, because without it
+    // "quiesce stopped" could mean "the producer stopped first", which is the
+    // wrong reason for either result.
+    //
+    BOOLEAN StoppedByDrain;
+} XDPCPUMAP_TEST_INJECTOR;
+
+static XDPCPUMAP_TEST_INJECTOR XdpCpuMapTestInjector;
+
+static
+BOOLEAN
+XdpCpuMapTestInjectProducer(
+    VOID
+    )
+{
+    XDPCPUMAP_TEST_INJECTOR *Injector = &XdpCpuMapTestInjector;
+
+    //
+    // Stop as soon as the ring starts draining. Quiesce tombstones in place and
+    // never touches Head, so Head can only have moved because quiesce's final
+    // KeFlushQueuedDpcs has begun running the drain -- and the drain's loop
+    // exits on an empty ring, so a producer that kept injecting into it would
+    // never let it finish.
+    //
+    if (Injector->Target->Ring->Head != 0) {
+        Injector->StoppedByDrain = TRUE;
+        return FALSE;
+    }
+
+    if (Injector->Injected == Injector->Capacity) {
+        return FALSE;
+    }
+
+    XdpCpuMapTestCommitOnQueue(
+        Injector->CpuMap, Injector->Target, &Injector->Nbls[Injector->Injected],
+        Injector->NblRundown, XDPCPUMAP_TEST_FILTER_B, Injector->RxQueueOwner,
+        Injector->GenericOwner);
+    Injector->Injected++;
+
+    return TRUE;
+}
+
+//
+// Quiesce scoping across EVERY live map (section 14, "Quiesce scoping").
+//
+// Invariant: pausing one receive queue returns every entry that queue owns, in
+// every ring of every live map, and ZERO entries owned by a peer queue; the peer
+// keeps forwarding afterwards because nothing of the peer's was torn down.
+//
+// What this adds over DrainTombstoneSkip, which already interleaves two queues
+// in ONE ring, is BREADTH. Quiesce has no map-to-interface association, so its
+// correctness rests on walking the whole registry and each map's whole target
+// table, taking and releasing a backing reference per map. Nothing asserted that
+// before: QuiesceScanCost walks four maps but with no matching entry, so a
+// quiesce that left every per-map reference held, or that stopped after the
+// first map, would have passed it.
+//
+// Deletion criterion (a): in XdpCpuMapQuiesceScope, delete the
+// XdpCpuMapReleaseBacking(CpuMap) that ends each map's iteration. The operation
+// removed is "quiesce releases the reference it took to pin the map". Every NBL
+// is still disposed of correctly and every rundown still balances, so no
+// disposition assertion anywhere can see it -- it is caught only by reference
+// and allocation accounting, which is broad rather than local.
+//
+// Full radius, all 47 cases run in isolation: 10 detected --
+// QuiesceScoping fails 6, QuiesceScanCost 4, QuiesceInterfaceScope 3,
+// QuiesceTombstoneBalance 3, DrainTombstoneSkip 2, QuiescePassBudget 2,
+// QuiesceTailSnapshot 2, ZeroCopyTeardownDisposal 2,
+// QuiesceDurationAttribution 2, QuiesceEmpty 1; the other 37 pass. This case
+// fails the most, and on the per-map RefCount assertion -- the only one that
+// names the leaked reference directly. Everywhere else it surfaces as destroy
+// never completing its RefCountZero wait, which is the consequence rather than
+// the cause.
+//
+// Deletion criterion (b): in the same function, delete the "Matched++" in the
+// take branch. The operation removed is "a pass that matched entries requires
+// another pass", which is section 8.4's termination argument: a pass matching
+// nothing is the proof that no pre-publication producer remains. Every entry
+// here is reachable in pass one, so every disposition assertion still passes;
+// only the PassesTotal and EntriesScanned assertions can see it.
+//
+// Full radius, all 47 cases run in isolation: 3 detected -- QuiesceScoping
+// fails 4, QuiesceInterfaceScope 2, QuiescePassBudget 2; the other 44 pass.
+//
+static
+VOID
+XdpCpuMapTestQuiesceScoping(
+    VOID
+    )
+{
+#define XDPCPUMAP_TEST_SCOPE_MAPS 2
+#define XDPCPUMAP_TEST_SCOPE_CPUS 2
+#define XDPCPUMAP_TEST_SCOPE_PER_RING 2
+
+    XDP_CPUMAP *CpuMaps[XDPCPUMAP_TEST_SCOPE_MAPS];
+    XDP_CPUMAP_PROVIDER_VALUE Values[XDPCPUMAP_TEST_SCOPE_MAPS][XDPCPUMAP_TEST_SCOPE_CPUS];
+    NET_BUFFER_LIST NblsA[XDPCPUMAP_TEST_SCOPE_MAPS][XDPCPUMAP_TEST_SCOPE_CPUS]
+                         [XDPCPUMAP_TEST_SCOPE_PER_RING] = {0};
+    NET_BUFFER_LIST NblsB[XDPCPUMAP_TEST_SCOPE_MAPS][XDPCPUMAP_TEST_SCOPE_CPUS]
+                         [XDPCPUMAP_TEST_SCOPE_PER_RING] = {0};
+    NET_BUFFER_LIST NblsLate[XDPCPUMAP_TEST_SCOPE_MAPS][XDPCPUMAP_TEST_SCOPE_CPUS] = {0};
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF RundownA;
+    EX_RUNDOWN_REF RundownB;
+    XDP_CPUMAP_QUIESCE_STATS StatsBefore;
+    XDP_CPUMAP_QUIESCE_STATS StatsAfter;
+    const LONG64 Rings = XDPCPUMAP_TEST_SCOPE_MAPS * XDPCPUMAP_TEST_SCOPE_CPUS;
+    const LONG64 PerQueue = Rings * XDPCPUMAP_TEST_SCOPE_PER_RING;
+    const LONG64 Occupancy = PerQueue * 2;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("QuiesceScoping");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+
+    ExInitializeRundownProtection(&RundownA);
+    ExInitializeRundownProtection(&RundownB);
+
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_SCOPE_MAPS; M++) {
+        XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMaps[M])));
+
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_SCOPE_CPUS; C++) {
+            Entry = XdpCpuMapTestEntry(C, 0, 0);
+            XDPCPUMAP_TEST_ASSERT(
+                NT_SUCCESS(XdpCpuMapTestResolve(CpuMaps[M], &Entry, &Values[M][C])));
+        }
+    }
+
+    //
+    // Both queues into every ring of every map, interleaved, so no scan can pass
+    // by matching a contiguous run.
+    //
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_SCOPE_MAPS; M++) {
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_SCOPE_CPUS; C++) {
+            for (UINT32 I = 0; I < XDPCPUMAP_TEST_SCOPE_PER_RING; I++) {
+                XdpCpuMapTestCommitOnQueue(
+                    CpuMaps[M], Values[M][C].Target, &NblsA[M][C][I], &RundownA,
+                    XDPCPUMAP_TEST_FILTER_A, &XdpCpuMapTestRxQueueA, &XdpCpuMapTestGenericA);
+                XdpCpuMapTestCommitOnQueue(
+                    CpuMaps[M], Values[M][C].Target, &NblsB[M][C][I], &RundownB,
+                    XDPCPUMAP_TEST_FILTER_B, &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+            }
+
+            //
+            // Cancel the drain so quiesce owns disposal rather than the DPC.
+            //
+            XdpCpuMapTestRemoveQueueDpc(Values[M][C].Target->Dpc);
+        }
+    }
+
+    XDPCPUMAP_TEST_ASSERT(RundownA.Count == (LONG)PerQueue);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == (LONG)PerQueue);
+
+    XdpCpuMapQueryQuiesceStats(&StatsBefore);
+    XdpCpuMapQuiesceRxQueue(&XdpCpuMapTestRxQueueA);
+    XdpCpuMapQueryQuiesceStats(&StatsAfter);
+
+    //
+    // The scan reached every map and every target, on both passes. TargetsVisited
+    // counts only targets whose ring was actually pinned and walked, so a scan
+    // that stopped after the first map or the first target reads low here.
+    //
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.PassesTotal - StatsBefore.PassesTotal == 2);
+    XDPCPUMAP_TEST_ASSERT(
+        StatsAfter.MapsVisited - StatsBefore.MapsVisited == XDPCPUMAP_TEST_SCOPE_MAPS * 2);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.TargetsVisited - StatsBefore.TargetsVisited == Rings * 2);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.EntriesScanned - StatsBefore.EntriesScanned == Occupancy * 2);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.Tombstoned - StatsBefore.Tombstoned == PerQueue);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.MaxPassesExhausted == StatsBefore.MaxPassesExhausted);
+
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_SCOPE_MAPS; M++) {
+        //
+        // The owner reference plus one per surviving peer entry. A quiesce that
+        // kept its per-map pin would read one higher.
+        //
+        XDPCPUMAP_TEST_ASSERT(
+            CpuMaps[M]->RefCount ==
+                1 + XDPCPUMAP_TEST_SCOPE_CPUS * XDPCPUMAP_TEST_SCOPE_PER_RING);
+
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_SCOPE_CPUS; C++) {
+            const XDP_CPUMAP_RING *Ring = Values[M][C].Target->Ring;
+
+            for (UINT32 I = 0; I < XDPCPUMAP_TEST_SCOPE_PER_RING; I++) {
+                XDPCPUMAP_TEST_NBL_DISPOSITION Disposition;
+
+                Disposition = XdpCpuMapTestNblDisposition(&NblsA[M][C][I]);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+
+                Disposition = XdpCpuMapTestNblDisposition(&NblsB[M][C][I]);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+
+                //
+                // Slot contents, not just totals: the peer's entries must be
+                // untouched IN PLACE, and Head/Tail unmoved, because quiesce
+                // compacts nothing.
+                //
+                XDPCPUMAP_TEST_ASSERT(Ring->Entries[I * 2 + 0].Nbl == NULL);
+                XDPCPUMAP_TEST_ASSERT(Ring->Entries[I * 2 + 0].BackingRef == NULL);
+                XDPCPUMAP_TEST_ASSERT(Ring->Entries[I * 2 + 0].NblRundown == NULL);
+                XDPCPUMAP_TEST_ASSERT(Ring->Entries[I * 2 + 1].Nbl == &NblsB[M][C][I]);
+                XDPCPUMAP_TEST_ASSERT(Ring->Entries[I * 2 + 1].BackingRef == CpuMaps[M]);
+                XDPCPUMAP_TEST_ASSERT(Ring->Entries[I * 2 + 1].NblRundown == &RundownB);
+            }
+
+            XDPCPUMAP_TEST_ASSERT(Ring->Head == 0);
+            XDPCPUMAP_TEST_ASSERT(
+                Ring->Tail == XDPCPUMAP_TEST_SCOPE_PER_RING * 2);
+        }
+    }
+
+    XDPCPUMAP_TEST_ASSERT(RundownA.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == (LONG)PerQueue);
+
+    //
+    // The peer keeps forwarding. A fresh commit on queue B enqueues normally and
+    // delivers, together with everything quiesce left in place.
+    //
+    // N.B. this is forwarding AFTER the quiesce returns, not concurrent with the
+    // scan. A single-threaded harness cannot run a peer receive indication
+    // during a quiesce pass, and the one hook that could is deliberately
+    // reserved for the two cases that have no alternative. Concurrent peer
+    // forwarding is the functional row's job.
+    //
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_SCOPE_MAPS; M++) {
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_SCOPE_CPUS; C++) {
+            XdpCpuMapTestCommitOnQueue(
+                CpuMaps[M], Values[M][C].Target, &NblsLate[M][C], &RundownB,
+                XDPCPUMAP_TEST_FILTER_B, &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+        }
+    }
+
+    XdpCpuMapTestRunQueuedDpcs();
+
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_SCOPE_MAPS; M++) {
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_SCOPE_CPUS; C++) {
+            XDPCPUMAP_TEST_NBL_DISPOSITION Disposition;
+
+            for (UINT32 I = 0; I < XDPCPUMAP_TEST_SCOPE_PER_RING; I++) {
+                Disposition = XdpCpuMapTestNblDisposition(&NblsB[M][C][I]);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 1);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+
+                //
+                // And the paused queue's packets were not resurrected by the
+                // drain that ran after it.
+                //
+                Disposition = XdpCpuMapTestNblDisposition(&NblsA[M][C][I]);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+                XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+            }
+
+            Disposition = XdpCpuMapTestNblDisposition(&NblsLate[M][C]);
+            XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 1);
+            XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+        }
+    }
+
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 0);
+
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_SCOPE_MAPS; M++) {
+        XDPCPUMAP_TEST_ASSERT(CpuMaps[M]->RefCount == 1);
+
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_SCOPE_CPUS; C++) {
+            XdpCpuMapTestRelease(CpuMaps[M], &Values[M][C]);
+        }
+    }
+
+    XdpCpuMapTestDrainSweeps();
+
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_SCOPE_MAPS; M++) {
+        XdpCpuMapTestDestroyMap(CpuMaps[M]);
+    }
+
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Interface-scoped quiesce (section 8.4, "XdpCpuMapQuiesceInterface").
+//
+// Invariant: an interface pause matches by GENERIC, so every receive queue on
+// the pausing interface is collected -- including queues the caller never named
+// -- and no queue on another interface is.
+//
+// This predicate has never been exercised against a match. QuiesceEmpty runs it
+// on empty rings, QuiesceScanCost runs it with tokens chosen NOT to match, and
+// every tombstone test uses the queue-scoped entry point. A build whose
+// interface scope matched nothing at all would have passed the whole suite,
+// which would leave interface pause returning none of its own NBLs.
+//
+// Deletion criterion: in XdpCpuMapQuiesceScope's match predicate, delete the
+// GenericOwner disjunct, leaving only the RxQueueOwner test. The operation
+// removed is "interface scope matches by owning interface". It compiles --
+// GenericOwner is still read by the entry assertion and the trace -- and it is
+// invisible to every queue-scoped test.
+//
+// Full radius, all 47 cases run in isolation: 1 detected -- this case fails 14,
+// beginning with the Tombstoned outcome; the other 46 pass. That is the point:
+// before this case existed, the operation had no coverage at all.
+//
+static
+VOID
+XdpCpuMapTestQuiesceInterfaceScope(
+    VOID
+    )
+{
+    NET_BUFFER_LIST NblsA1[2] = {0};
+    NET_BUFFER_LIST NblsA2[2] = {0};
+    NET_BUFFER_LIST NblsB[2] = {0};
+    NET_BUFFER_LIST LateNbl = {0};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF RundownA1;
+    EX_RUNDOWN_REF RundownA2;
+    EX_RUNDOWN_REF RundownB;
+    XDP_CPUMAP_QUIESCE_STATS StatsBefore;
+    XDP_CPUMAP_QUIESCE_STATS StatsAfter;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("QuiesceInterfaceScope");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    ExInitializeRundownProtection(&RundownA1);
+    ExInitializeRundownProtection(&RundownA2);
+    ExInitializeRundownProtection(&RundownB);
+
+    //
+    // Two DISTINCT receive queues on interface A, plus one on interface B, all
+    // interleaved in one ring.
+    //
+    for (UINT32 Index = 0; Index < 2; Index++) {
+        XdpCpuMapTestCommitOnQueue(
+            CpuMap, Value.Target, &NblsA1[Index], &RundownA1, XDPCPUMAP_TEST_FILTER_A,
+            &XdpCpuMapTestRxQueueA, &XdpCpuMapTestGenericA);
+        XdpCpuMapTestCommitOnQueue(
+            CpuMap, Value.Target, &NblsA2[Index], &RundownA2, XDPCPUMAP_TEST_FILTER_A,
+            &XdpCpuMapTestRxQueueA2, &XdpCpuMapTestGenericA);
+        XdpCpuMapTestCommitOnQueue(
+            CpuMap, Value.Target, &NblsB[Index], &RundownB, XDPCPUMAP_TEST_FILTER_B,
+            &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+    }
+
+    XdpCpuMapTestRemoveQueueDpc(Value.Target->Dpc);
+
+    XdpCpuMapQueryQuiesceStats(&StatsBefore);
+    XdpCpuMapQuiesceInterface(&XdpCpuMapTestGenericA);
+    XdpCpuMapQueryQuiesceStats(&StatsAfter);
+
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.Tombstoned - StatsBefore.Tombstoned == 4);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.PassesTotal - StatsBefore.PassesTotal == 2);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.EntriesScanned - StatsBefore.EntriesScanned == 12);
+
+    //
+    // BOTH of interface A's queues were collected, and interface B's was not.
+    //
+    for (UINT32 Index = 0; Index < 2; Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition;
+
+        Disposition = XdpCpuMapTestNblDisposition(&NblsA1[Index]);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+
+        Disposition = XdpCpuMapTestNblDisposition(&NblsA2[Index]);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+
+        Disposition = XdpCpuMapTestNblDisposition(&NblsB[Index]);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 0);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(RundownA1.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownA2.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 2);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 3);
+
+    //
+    // The peer interface keeps forwarding: nothing of its was consumed, and a
+    // fresh commit re-arms the drain, which walks over interface A's tombstones
+    // and indicates every one of interface B's packets exactly once.
+    //
+    XdpCpuMapTestRunQueuedDpcs();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+
+    XdpCpuMapTestCommitOnQueue(
+        CpuMap, Value.Target, &LateNbl, &RundownB, XDPCPUMAP_TEST_FILTER_B,
+        &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+    XdpCpuMapTestRunQueuedDpcs();
+
+    for (UINT32 Index = 0; Index < 2; Index++) {
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&NblsB[Index]).Indicated == 1);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&NblsB[Index]).Returned == 0);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&NblsA1[Index]).Indicated == 0);
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&NblsA2[Index]).Indicated == 0);
+    }
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&LateNbl).Indicated == 1);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Quiesce tail snapshot (section 14, "Quiesce tail snapshot").
+//
+// Invariant: one pass over one ring terminates after at most the occupancy
+// present when the pass started. Ring capacity bounds occupancy but NOT
+// cumulative scanning, so a scan that followed a live tail could be extended
+// indefinitely by a peer producer -- which is section 8.4's first correction and
+// the reason the pause bound is a bound at all.
+//
+// The producer runs from the ring-lock-release hook, because that release is
+// exactly where quiesce lets producers in and it is the only place a
+// single-threaded harness can model one. The entries it injects belong to a
+// queue the scan is NOT scoped to, so nothing matches, the pass count stays at
+// one, and the assertion is on scanning alone.
+//
+// Deletion criterion: in XdpCpuMapQuiesceScope, delete the TailSnapshot capture
+// -- remove the local and its assignment and let the two loop conditions read
+// Ring->Tail directly. The operation removed is "the pass is bounded by the tail
+// as it was, not as it becomes". It compiles, and the injected entries are still
+// disposed of correctly, so only the EntriesScanned assertion can see it.
+//
+// Full radius, all 47 cases run in isolation: 2 detected -- this case fails 4,
+// beginning with the EntriesScanned outcome, and QuiescePassBudget fails 5
+// because following a live tail changes that case's pass arithmetic too; the
+// other 45 pass.
+//
+static
+VOID
+XdpCpuMapTestQuiesceTailSnapshot(
+    VOID
+    )
+{
+#define XDPCPUMAP_TEST_SNAPSHOT_DEPTH 64u
+#define XDPCPUMAP_TEST_SNAPSHOT_BATCH 4u
+#define XDPCPUMAP_TEST_SNAPSHOT_FILL 16u
+
+    NET_BUFFER_LIST Nbls[XDPCPUMAP_TEST_SNAPSHOT_FILL] = {0};
+    NET_BUFFER_LIST Injected[8] = {0};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF Rundown;
+    XDP_CPUMAP_QUIESCE_STATS StatsBefore;
+    XDP_CPUMAP_QUIESCE_STATS StatsAfter;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("QuiesceTailSnapshot");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry =
+        XdpCpuMapTestEntry(
+            0, XDPCPUMAP_TEST_SNAPSHOT_DEPTH, XDPCPUMAP_TEST_SNAPSHOT_BATCH);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+    XDPCPUMAP_TEST_ASSERT(CpuMap->EffectiveDrainBatchSize == XDPCPUMAP_TEST_SNAPSHOT_BATCH);
+
+    ExInitializeRundownProtection(&Rundown);
+
+    for (UINT32 Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XdpCpuMapTestCommitOnQueue(
+            CpuMap, Value.Target, &Nbls[Index], &Rundown, XDPCPUMAP_TEST_FILTER_B,
+            &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+    }
+
+    XdpCpuMapTestRemoveQueueDpc(Value.Target->Dpc);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Head == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Tail == XDPCPUMAP_TEST_SNAPSHOT_FILL);
+
+    RtlZeroMemory(&XdpCpuMapTestInjector, sizeof(XdpCpuMapTestInjector));
+    XdpCpuMapTestInjector.CpuMap = CpuMap;
+    XdpCpuMapTestInjector.Target = Value.Target;
+    XdpCpuMapTestInjector.NblRundown = &Rundown;
+    XdpCpuMapTestInjector.Nbls = Injected;
+    XdpCpuMapTestInjector.Capacity = RTL_NUMBER_OF(Injected);
+    XdpCpuMapTestInjector.RxQueueOwner = &XdpCpuMapTestRxQueueB;
+    XdpCpuMapTestInjector.GenericOwner = &XdpCpuMapTestGenericB;
+    XdpCpuMapTestRingLockReleaseHook = XdpCpuMapTestInjectProducer;
+
+    XdpCpuMapQueryQuiesceStats(&StatsBefore);
+    XdpCpuMapQuiesceRxQueue(&XdpCpuMapTestRxQueueA);
+    XdpCpuMapQueryQuiesceStats(&StatsAfter);
+
+    XdpCpuMapTestRingLockReleaseHook = NULL;
+
+    //
+    // THE OUTCOME: the pass scanned the occupancy it snapshotted, and not one
+    // slot the producer added afterwards.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        StatsAfter.EntriesScanned - StatsBefore.EntriesScanned ==
+            XDPCPUMAP_TEST_SNAPSHOT_FILL);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.PassesTotal - StatsBefore.PassesTotal == 1);
+    XDPCPUMAP_TEST_ASSERT(StatsAfter.Tombstoned == StatsBefore.Tombstoned);
+
+    //
+    // SUPPORTING, and load-bearing for mutation rule 4: the tail really did
+    // advance while the scan was running. Without these the outcome assertion
+    // would hold just as well against a scan no producer ever raced, and the
+    // criterion above would be detected for the wrong reason -- or not at all.
+    //
+    // One injection per ring-lock release the scan performs, which is one for
+    // the acquisition that snapshots Head and Tail, plus one per chunk. The
+    // snapshot release lands AFTER the snapshot is taken, so its entry is
+    // already outside the pass's bound.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestInjector.Injected ==
+            1 + XDPCPUMAP_TEST_SNAPSHOT_FILL / XDPCPUMAP_TEST_SNAPSHOT_BATCH);
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestInjector.Injected < XdpCpuMapTestInjector.Capacity);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestInjector.StoppedByDrain);
+    XDPCPUMAP_TEST_ASSERT(
+        Value.Target->Ring->Tail ==
+            XDPCPUMAP_TEST_SNAPSHOT_FILL + XdpCpuMapTestInjector.Injected);
+
+    //
+    // Everything the producer added was still delivered by the drain quiesce
+    // flushed, so the bound costs no packet.
+    //
+    XdpCpuMapTestRunQueuedDpcs();
+    for (UINT32 Index = 0; Index < XdpCpuMapTestInjector.Injected; Index++) {
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&Injected[Index]).Indicated == 1);
+    }
+    for (UINT32 Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&Nbls[Index]).Indicated == 1);
+    }
+    XDPCPUMAP_TEST_ASSERT(Rundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Quiesce pass budget (section 14, "Quiesce pass budget").
+//
+// Invariant: the pass loop terminates at XDP_CPUMAP_QUIESCE_MAX_PASSES even
+// against a producer that never stops, counts the exhaustion, and leaves the
+// pre-existing rundown wait able to complete.
+//
+// The producer here injects entries the scan DOES match, so every pass finds
+// work and only the budget can stop it. Exhaustion is a defect signal, not a
+// tuning one -- section 8.4's termination argument says a gated producer set
+// cannot survive one clean pass -- so this test deliberately produces the
+// pathological case rather than pretending it is unreachable.
+//
+// Deletion criterion (a): delete "&& Passes < XDP_CPUMAP_QUIESCE_MAX_PASSES"
+// from the do/while condition. The operation removed is the budget itself. The
+// loop then runs until the injector exhausts its own capacity, which is what the
+// capacity is for: without it this criterion would be observed as a hang rather
+// than as an assertion failure, and a hang says nothing about which assertion
+// found it.
+//
+// Full radius, all 47 cases run in isolation: 1 detected -- this case fails 5,
+// beginning with both outcome assertions, and terminates rather than hanging;
+// the other 46 pass.
+//
+// Deletion criterion (b): delete the "Matched++" in the take branch. The
+// operation removed is "a pass that matched requires another pass". The loop
+// then exits after pass one with the injected entries still queued, so
+// PassesTotal is 1 and nothing is counted as exhausted. Radius is recorded on
+// XdpCpuMapTestQuiesceScoping, which fails the most assertions against it.
+//
+static
+VOID
+XdpCpuMapTestQuiescePassBudget(
+    VOID
+    )
+{
+#define XDPCPUMAP_TEST_BUDGET_DEPTH 128u
+#define XDPCPUMAP_TEST_BUDGET_BATCH 4u
+#define XDPCPUMAP_TEST_BUDGET_FILL 4u
+
+    NET_BUFFER_LIST Nbls[XDPCPUMAP_TEST_BUDGET_FILL] = {0};
+    NET_BUFFER_LIST Injected[64] = {0};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF Rundown;
+    XDP_CPUMAP_QUIESCE_STATS StatsBefore;
+    XDP_CPUMAP_QUIESCE_STATS StatsAfter;
+    UINT32 Delivered = 0;
+    UINT32 Dropped = 0;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("QuiescePassBudget");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, XDPCPUMAP_TEST_BUDGET_DEPTH, XDPCPUMAP_TEST_BUDGET_BATCH);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    ExInitializeRundownProtection(&Rundown);
+
+    for (UINT32 Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XdpCpuMapTestCommitOnQueue(
+            CpuMap, Value.Target, &Nbls[Index], &Rundown, XDPCPUMAP_TEST_FILTER_B,
+            &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+    }
+
+    XdpCpuMapTestRemoveQueueDpc(Value.Target->Dpc);
+
+    RtlZeroMemory(&XdpCpuMapTestInjector, sizeof(XdpCpuMapTestInjector));
+    XdpCpuMapTestInjector.CpuMap = CpuMap;
+    XdpCpuMapTestInjector.Target = Value.Target;
+    XdpCpuMapTestInjector.NblRundown = &Rundown;
+    XdpCpuMapTestInjector.Nbls = Injected;
+    XdpCpuMapTestInjector.Capacity = RTL_NUMBER_OF(Injected);
+    XdpCpuMapTestInjector.RxQueueOwner = &XdpCpuMapTestRxQueueB;
+    XdpCpuMapTestInjector.GenericOwner = &XdpCpuMapTestGenericB;
+    XdpCpuMapTestRingLockReleaseHook = XdpCpuMapTestInjectProducer;
+
+    XdpCpuMapQueryQuiesceStats(&StatsBefore);
+    XdpCpuMapQuiesceRxQueue(&XdpCpuMapTestRxQueueB);
+    XdpCpuMapQueryQuiesceStats(&StatsAfter);
+
+    XdpCpuMapTestRingLockReleaseHook = NULL;
+
+    //
+    // THE OUTCOME.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        StatsAfter.PassesTotal - StatsBefore.PassesTotal == XDP_CPUMAP_QUIESCE_MAX_PASSES);
+    XDPCPUMAP_TEST_ASSERT(
+        StatsAfter.MaxPassesExhausted - StatsBefore.MaxPassesExhausted == 1);
+
+    //
+    // SUPPORTING, for mutation rule 4: the loop stopped because the BUDGET ran
+    // out, not because the producer did. StoppedByDrain is only set when the
+    // injector still had budget at the moment the ring began draining, which is
+    // after the loop has already returned.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestInjector.Injected > 0);
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapTestInjector.Injected < XdpCpuMapTestInjector.Capacity);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestInjector.StoppedByDrain);
+
+    //
+    // The fallback still works. Section 8.4: on exhaustion quiesce returns and
+    // the pre-existing ExWaitForRundownProtectionRelease waits for the DPCs. In
+    // this harness that wait is exactly "the rundown reaches zero", and it does
+    // -- every packet was either tombstoned and returned or drained and
+    // indicated, each exactly once.
+    //
+    XDPCPUMAP_TEST_ASSERT(Rundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    for (UINT32 Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&Nbls[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated + Disposition.Returned == 1);
+        Delivered += Disposition.Indicated;
+        Dropped += Disposition.Returned;
+    }
+    for (UINT32 Index = 0; Index < XdpCpuMapTestInjector.Injected; Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&Injected[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated + Disposition.Returned == 1);
+        Delivered += Disposition.Indicated;
+        Dropped += Disposition.Returned;
+    }
+
+    XDPCPUMAP_TEST_ASSERT(
+        Delivered + Dropped == RTL_NUMBER_OF(Nbls) + XdpCpuMapTestInjector.Injected);
+
+    //
+    // And the exhaustion was real: entries survived the loop, which is the whole
+    // condition the counter names.
+    //
+    XDPCPUMAP_TEST_ASSERT(Delivered > 0);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// Tombstone reference balance, against the section 8.1a audit table (section 14,
+// "Tombstone reference balance").
+//
+// A slot owns exactly three things -- the NBL, one CPUMAP backing reference, one
+// receive-queue NBL rundown reference -- and NO target rundown reference. This
+// case walks that table row by row, on a ring holding a zero-copy entry, a DEEP
+// COPY, and a peer's entry at once, because the mixed case is where the audit's
+// two NBL rows (9a, 9b) diverge and nothing exercised them together.
+//
+// Row 1/3, "no ring entry holds a target rundown reference", is asserted with
+// the ring OCCUPIED. That is the round-3 deadlock condition: if a slot held one,
+// the retire wait could not complete without the target CPU running its DPC.
+// This assertion has no deletion criterion, because the operation it guards does
+// not exist -- XDP_CPUMAP_ENTRY has no rundown field. It is here to fail on the
+// day one is added, which is exactly how round 3 was reached.
+//
+// Deletion criterion: in XdpCpuMapChainSetTake, delete
+// "Candidate->IsDeepCopy == Entry->IsDeepCopy" from the chain-match conjunction.
+// The operation removed is "a deep copy and an original never share a
+// disposition chain". They then merge, and XdpCpuMapChainSetReturn applies ONE
+// disposition to both -- either handing the miniport a buffer from our own pool
+// or recycling the miniport's NBL into it. No other case mixes a deep copy and a
+// zero-copy entry from the same queue in one ring, so no other case can see it.
+//
+// Full radius, all 47 cases run in isolation: 1 detected -- this case fails 5;
+// the other 46 pass. The first failure is production's own checked-build
+// ASSERT(Chain->DeepCopyPool == Entry->DeepCopyPool), which the harness reports
+// as a failure; the recycle and page-accounting outcomes follow it, so the
+// result does not depend on assertions being enabled.
+//
+static
+VOID
+XdpCpuMapTestQuiesceTombstoneBalance(
+    VOID
+    )
+{
+    UCHAR Payload[64];
+    NET_BUFFER_LIST Zero[2] = {0};
+    NET_BUFFER_LIST PeerNbl = {0};
+    NET_BUFFER_LIST LateNbl = {0};
+    NET_BUFFER_LIST *Original;
+    NET_BUFFER_LIST *Copy;
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF RundownA;
+    EX_RUNDOWN_REF RundownB;
+    XDP_CPUMAP_COMMIT_GROUP CommitGroup;
+    XDP_CPUMAP_DEEPCOPY_POOL Pool;
+    XDP_FRAME_CPUMAP_REDIRECT_V1 Redirect;
+    XDP_CPUMAP_RING *Ring;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("QuiesceTombstoneBalance");
+
+    XdpCpuMapTestResetNdisPool();
+    for (UINT32 Index = 0; Index < sizeof(Payload); Index++) {
+        Payload[Index] = (UCHAR)(Index + 3);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    XDPCPUMAP_TEST_ASSERT(
+        NT_SUCCESS(XdpCpuMapDeepCopyPoolInitialize(&Pool, XDPCPUMAP_TEST_FILTER_A)));
+    ExInitializeRundownProtection(&RundownA);
+    ExInitializeRundownProtection(&RundownB);
+
+    Ring = Value.Target->Ring;
+
+    //
+    // Slot 0: queue A, zero copy. Slot 1: queue B, the peer. Slot 2: queue A,
+    // DEEP copy. Slot 3: queue A, zero copy.
+    //
+    XdpCpuMapTestCommitOnQueue(
+        CpuMap, Value.Target, &Zero[0], &RundownA, XDPCPUMAP_TEST_FILTER_A,
+        &XdpCpuMapTestRxQueueA, &XdpCpuMapTestGenericA);
+    XdpCpuMapTestCommitOnQueue(
+        CpuMap, Value.Target, &PeerNbl, &RundownB, XDPCPUMAP_TEST_FILTER_B,
+        &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+
+    XdpCpuMapTestInitDeepCopyGroup(&CommitGroup, &RundownA, &Pool);
+    Original = XdpCpuMapTestCreateSourceNbl(Payload, sizeof(Payload));
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTryAcquireTargetReference(CpuMap, Value.Target));
+    XdpCpuMapReferenceBacking(CpuMap);
+    Redirect = XdpCpuMapTestFrameRedirect(CpuMap, Value.Target, 0);
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapCommitRedirect(&Redirect, Original, FALSE, FALSE, &CommitGroup) ==
+            XdpCpuMapCommitDeepCopied);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestFinishGroup(&CommitGroup) == 0);
+    Copy = Ring->Entries[2].Nbl;
+    XDPCPUMAP_TEST_ASSERT(Copy != NULL && Copy != Original);
+    XDPCPUMAP_TEST_ASSERT(Ring->Entries[2].IsDeepCopy);
+    XDPCPUMAP_TEST_ASSERT(Ring->Entries[2].DeepCopyPool == &Pool);
+
+    XdpCpuMapTestCommitOnQueue(
+        CpuMap, Value.Target, &Zero[1], &RundownA, XDPCPUMAP_TEST_FILTER_A,
+        &XdpCpuMapTestRxQueueA, &XdpCpuMapTestGenericA);
+
+    XdpCpuMapTestRemoveQueueDpc(Value.Target->Dpc);
+
+    //
+    // Row 8: one NblRundown reference per RING ENTRY, which on the low-resource
+    // path is one per deep copy, not per original.
+    //
+    XDPCPUMAP_TEST_ASSERT(RundownA.Count == 3);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 1);
+
+    //
+    // Row 7: one backing reference per ring entry, plus the owner reference.
+    //
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 5);
+
+    //
+    // Rows 1 and 3, with the ring OCCUPIED: no slot holds a target rundown
+    // reference, so the retire wait never depends on the target CPU draining.
+    //
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+
+    //
+    // Row 9b: the original went home through the caller's DropList at commit,
+    // and only the copy is in the ring.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 1);
+    XDPCPUMAP_TEST_ASSERT(Pool.CacheCount == 1);
+
+    XdpCpuMapQuiesceRxQueue(&XdpCpuMapTestRxQueueA);
+
+    //
+    // Row 9a: originals RETURNED, exactly once, never indicated.
+    //
+    for (UINT32 Index = 0; Index < RTL_NUMBER_OF(Zero); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&Zero[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+    }
+
+    //
+    // Row 9b: the copy is RECYCLED into its originating pool, and the miniport
+    // hears nothing about it -- it never owned it. Its pages are back and its
+    // descriptor is cached, so it was neither returned nor leaked.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(Copy).Returned == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(Copy).Indicated == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(Original).Returned == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(Original).Indicated == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XDPCPUMAP_TEST_ASSERT(Pool.CacheCount == 1);
+
+    //
+    // Rows 7 and 8 again: every reference the tombstoned slots held was released
+    // exactly once, and the peer's are untouched.
+    //
+    XDPCPUMAP_TEST_ASSERT(RundownA.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 1);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 2);
+
+    //
+    // Row 3 again: quiesce's own target pin is balanced.
+    //
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+
+    //
+    // Row 10: a tombstone owns NOTHING, asserted on the slot rather than
+    // inferred from totals; the peer's slot is intact and Head/Tail unmoved.
+    //
+    for (UINT32 Index = 0; Index < 4; Index++) {
+        const XDP_CPUMAP_ENTRY *Slot = &Ring->Entries[Index];
+
+        if (Index == 1) {
+            XDPCPUMAP_TEST_ASSERT(Slot->Nbl == &PeerNbl);
+            XDPCPUMAP_TEST_ASSERT(Slot->BackingRef == CpuMap);
+            XDPCPUMAP_TEST_ASSERT(Slot->NblRundown == &RundownB);
+            continue;
+        }
+
+        XDPCPUMAP_TEST_ASSERT(Slot->Nbl == NULL);
+        XDPCPUMAP_TEST_ASSERT(Slot->BackingRef == NULL);
+        XDPCPUMAP_TEST_ASSERT(Slot->NblRundown == NULL);
+        XDPCPUMAP_TEST_ASSERT(Slot->DeepCopyPool == NULL);
+        XDPCPUMAP_TEST_ASSERT(!Slot->IsDeepCopy);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(Ring->Head == 0);
+    XDPCPUMAP_TEST_ASSERT(Ring->Tail == 4);
+
+    XdpCpuMapTestRunQueuedDpcs();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+
+    //
+    // The peer keeps forwarding. A fresh commit re-arms the drain, which walks
+    // over the tombstones and indicates only the peer's packets.
+    //
+    XdpCpuMapTestCommitOnQueue(
+        CpuMap, Value.Target, &LateNbl, &RundownB, XDPCPUMAP_TEST_FILTER_B,
+        &XdpCpuMapTestRxQueueB, &XdpCpuMapTestGenericB);
+    XdpCpuMapTestRunQueuedDpcs();
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&PeerNbl).Indicated == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(&LateNbl).Indicated == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblDisposition(Copy).Indicated == 0);
+    XDPCPUMAP_TEST_ASSERT(RundownB.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+
+    XdpCpuMapTestDeleteSourceNbl(Original);
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+
+    XdpCpuMapDeepCopyPoolCleanup(&Pool);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestNblLive == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestPageLive == 0);
+    XdpCpuMapStop();
+}
+
+//
+// Suppressed or unavailable target DPC (section 14, and the round-3 deadlock).
+//
+// Invariant: a target whose CPU never runs its DPC still retires. The rundown
+// wait completes because no ring entry holds a target rundown reference,
+// KeRemoveQueueDpc cancels the instance queued before the wait finished,
+// KeFlushQueuedDpcs returns, and the RING IS DRAINED SYNCHRONOUSLY BY THE WORKER
+// THREAD -- which is what makes the packets returned rather than indicated.
+//
+// RetireDrainReturns reaches the same drain, but it cancels the DPC ITSELF
+// beforehand, so it says nothing about whether retire would have cancelled it.
+// Here the DPC is left queued exactly as a real suppressed target's would be,
+// and retire has to deal with it.
+//
+// Deletion criterion: delete "KeRemoveQueueDpc(Target->Dpc);" from
+// XdpCpuMapRetireTarget. The operation removed is "retire cancels the queued
+// instance before flushing". The following KeFlushQueuedDpcs then RUNS that
+// instance, so the ring is drained by the DPC and the packets are INDICATED to a
+// target that is being retired -- the delivery-on-retire contract inverted. Both
+// the outcome assertions and the DpcRunCount supporting assertion see it.
+//
+// Full radius, all 47 cases run in isolation: 3 detected -- this case fails 11,
+// beginning with DpcRunCount, RetireDrainReturns 4, DeepCopyTeardownRecycle 4;
+// the other 44 pass. The two existing cases cancel the DPC themselves and so
+// detect it only through the changed disposition; this one detects the changed
+// EXECUTOR, which is what the section 14 row is actually about.
+//
+// Second deletion criterion: delete the
+// InterlockedAdd64(&XdpCpuMapSweepStats.RetireDropCount, ...) in
+// XdpCpuMapDrainRing. The operation removed is "packets dropped on retire are
+// counted". Every disposition still happens exactly once, so only the
+// RetireDropCount assertion below can see it -- which is the point of adding a
+// read path for a counter that had none.
+//
+// Full radius, all 47 cases run in isolation: 1 detected -- this case fails 1,
+// on that assertion; the other 46 pass.
+//
+static
+VOID
+XdpCpuMapTestRetireSuppressedTargetDpc(
+    VOID
+    )
+{
+    NET_BUFFER_LIST Nbls[3] = {0};
+    XDP_CPUMAP *CpuMap;
+    XDP_CPUMAP_PROVIDER_VALUE Value;
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    EX_RUNDOWN_REF Rundown;
+    KDPC *TargetDpc;
+    ULONG RunsBefore;
+    LONG64 RetireDropsBefore;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("RetireSuppressedTargetDpc");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(16, &CpuMap)));
+    Entry = XdpCpuMapTestEntry(0, 0, 0);
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestResolve(CpuMap, &Entry, &Value)));
+
+    ExInitializeRundownProtection(&Rundown);
+    TargetDpc = Value.Target->Dpc;
+
+    for (UINT32 Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XdpCpuMapTestCommitOnQueue(
+            CpuMap, Value.Target, &Nbls[Index], &Rundown, XDPCPUMAP_TEST_FILTER_A,
+            &XdpCpuMapTestRxQueueA, &XdpCpuMapTestGenericA);
+    }
+
+    //
+    // The DPC is queued and the target CPU never runs it. This is the suppressed
+    // or offlined target; nothing here cancels it, because that is retire's job.
+    //
+    XDPCPUMAP_TEST_ASSERT(TargetDpc->Queued);
+    RunsBefore = XdpCpuMapTestDpcRunCount;
+
+    //
+    // The round-3 precondition, asserted with the ring OCCUPIED: the only
+    // holders of the target rundown are producers, DPC self-requeue windows and
+    // quiesce passes, none of which needs the target CPU to make progress. If a
+    // ring entry held one, the wait below could never complete.
+    //
+    XDPCPUMAP_TEST_ASSERT(Value.Target->PacketRundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(Value.Target->Ring->Tail - Value.Target->Ring->Head == 3);
+
+    RetireDropsBefore = XdpCpuMapQueryRetireDropCount();
+
+    XdpCpuMapTestRelease(CpuMap, &Value);
+    XdpCpuMapTestDrainSweeps();
+
+    //
+    // The DPC never ran: retire cancelled it, and the worker drained the ring on
+    // its own thread.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestDpcRunCount == RunsBefore);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestIndicationCount == 0);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturnCount == 1);
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestReturns[0].NblCount == RTL_NUMBER_OF(Nbls));
+
+    for (UINT32 Index = 0; Index < RTL_NUMBER_OF(Nbls); Index++) {
+        XDPCPUMAP_TEST_NBL_DISPOSITION Disposition =
+            XdpCpuMapTestNblDisposition(&Nbls[Index]);
+
+        XDPCPUMAP_TEST_ASSERT(Disposition.Returned == 1);
+        XDPCPUMAP_TEST_ASSERT(Disposition.Indicated == 0);
+    }
+
+    XDPCPUMAP_TEST_ASSERT(Rundown.Count == 0);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->RefCount == 1);
+    XDPCPUMAP_TEST_ASSERT(CpuMap->TargetCount == 0);
+
+    //
+    // Counted as a retire drop, one per packet. This is the ONLY observable for
+    // "these packets were disposed of by the retire path rather than by the
+    // pause", which matters because quiesce cannot see a ring whose target the
+    // sweep already unlinked -- the acquire it is documented to fail on cannot
+    // fail, since the unlink is published under ConfigLock before the rundown is
+    // run down. RetireDropCount had no read path at all before this increment.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        XdpCpuMapQueryRetireDropCount() - RetireDropsBefore == RTL_NUMBER_OF(Nbls));
+
+    XdpCpuMapTestDestroyMap(CpuMap);
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
+//
+// A DPC that is NOT a CPUMAP DPC, burning a controlled interval when the flush
+// runs it. Used only by XdpCpuMapTestQuiesceDurationAttribution.
+//
+// KeInsertQueueDpc's stub asserts the target rundown depth for CPUMAP DPCs via
+// Dpc->Context; this one is queued with a NULL context precisely because it
+// belongs to nothing in this driver, which is the point -- KeFlushQueuedDpcs
+// waits for unrelated DPCs, and that is the term no CPUMAP cap can shrink.
+//
+static UINT32 XdpCpuMapTestBurnDpcMicroseconds;
+static UINT32 XdpCpuMapTestBurnDpcRuns;
+
+static
+VOID
+XdpCpuMapTestBurnDpcRoutine(
+    _In_ KDPC *Dpc,
+    _In_opt_ VOID *DeferredContext,
+    _In_opt_ VOID *SystemArgument1,
+    _In_opt_ VOID *SystemArgument2
+    )
+{
+    LARGE_INTEGER Frequency;
+    LARGE_INTEGER Start;
+    LARGE_INTEGER Now;
+    LONG64 Target;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    QueryPerformanceFrequency(&Frequency);
+    QueryPerformanceCounter(&Start);
+    Target = (Frequency.QuadPart * XdpCpuMapTestBurnDpcMicroseconds) / 1000000;
+
+    //
+    // Busy-wait to a wall-clock target rather than spinning a counter: the
+    // duration has to be a controlled INPUT to the assertion, not whatever the
+    // optimizer leaves of a loop.
+    //
+    do {
+        QueryPerformanceCounter(&Now);
+    } while (Now.QuadPart - Start.QuadPart < Target);
+
+    XdpCpuMapTestBurnDpcRuns++;
+}
+
+//
+// Scan/flush attribution (section 14, pause-latency calibration).
+//
+// Invariant: ScanUs is the ring scan and FlushUs is KeFlushQueuedDpcs -- not
+// merely that the two sum to DurationUs.
+//
+// Attribution is the entire value of the split. Section 14's remediation --
+// reduce XDP_CPUMAP_GLOBAL_MAX_RING_ENTRIES, then XDP_CPUMAP_MAX_LIVE_MAPS --
+// acts on the scan alone, while KeFlushQueuedDpcs costs O(processor count) and
+// sits outside every CPUMAP cap. A build that transposed the two would send
+// someone to shrink a constant that cannot move the term that is actually large.
+// The sum assertion on XdpCpuMapTestQuiesceScanCost cannot see that, and did
+// not: transposing the two assignments passed the whole suite.
+//
+// Both directions are asserted, because one alone is satisfiable by a constant
+// offset rather than by attribution.
+//
+//   (a) scan-heavy, flush-empty: rings full of entries the scope does not match,
+//       and NO DPC queued, so the flush has nothing to run.
+//   (b) scan-trivial, flush-heavy: no live maps at all, and one queued DPC that
+//       is not a CPUMAP DPC and burns a controlled interval. That is a faithful
+//       model rather than a convenience -- the production concern is precisely
+//       that KeFlushQueuedDpcs waits on UNRELATED DPCs, which is why an idle
+//       machine understates it.
+//
+// Deletion criterion (a): delete the
+// InterlockedExchange64(&...LastScanDurationUs, ScanDurationUs). ScanDurationUs
+// still feeds MaxScanDurationUs and the trace, so it compiles. Direction (a)'s
+// ordering assertion then compares zero against a real flush figure and fails.
+//
+// Full radius, all 47 cases run in isolation: 2 detected -- this case fails 3,
+// QuiesceScanCost 1 on its sum assertion; the other 45 pass.
+//
+// Deletion criterion (b): delete the corresponding LastFlushDurationUs exchange.
+// Direction (b)'s ordering and controlled-floor assertions fail.
+//
+// Full radius, all 47 cases run in isolation: 1 detected -- this case fails 3;
+// the other 46 pass. Nothing else in the suite reads that field for anything
+// but its sum, which is exactly why this case had to exist.
+//
+// Transposition criterion (c): swap the two exchanges, so LastScanDurationUs
+// receives FlushDurationUs and vice versa. This is NOT a deletion and is
+// recorded as such -- it removes no operation. It is included because it is the
+// specific defect the sum assertion admits, and both directions must fail it or
+// the split is decoration.
+//
+// Full radius, all 47 cases run in isolation: 2 detected -- this case fails 3,
+// which is BOTH directions (direction (b)'s ordering and controlled floor, and
+// direction (a)'s ordering), and QuiesceScanCost fails 1 incidentally on its
+// Max-versus-Last assertion; the other 45 pass. Before this case existed the
+// same transposition passed all 46.
+//
+static
+VOID
+XdpCpuMapTestQuiesceDurationAttribution(
+    VOID
+    )
+{
+#define XDPCPUMAP_TEST_ATTRIB_MAPS 2
+#define XDPCPUMAP_TEST_ATTRIB_CPUS 8
+#define XDPCPUMAP_TEST_ATTRIB_BURN_US 2000
+
+    XDP_CPUMAP *CpuMaps[XDPCPUMAP_TEST_ATTRIB_MAPS];
+    XDP_CPUMAP_PROVIDER_VALUE Values[XDPCPUMAP_TEST_ATTRIB_MAPS][XDPCPUMAP_TEST_ATTRIB_CPUS];
+    XDP_CPUMAP_ENTRY_V1 Entry;
+    NET_BUFFER_LIST *Sentinel = (NET_BUFFER_LIST *)(ULONG_PTR)0xF00DF00D;
+    const UINT32 QuiescingToken = 0;
+    const UINT32 OtherToken = 0;
+    const UINT32 RingDepth = XDP_CPUMAP_RING_DEPTH_DEFAULT;
+    XDP_CPUMAP_QUIESCE_STATS Before;
+    XDP_CPUMAP_QUIESCE_STATS Stats;
+    KDPC BurnDpc;
+    LONG Baseline;
+
+    XDPCPUMAP_TEST_BEGIN("QuiesceDurationAttribution");
+
+    XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapStart()));
+    Baseline = XdpCpuMapTestLiveAllocations;
+
+    //
+    // Direction (b) first, while the registry is still empty: the scan has
+    // nothing at all to walk, so anything ScanUs reports beyond noise came from
+    // somewhere it should not have.
+    //
+    XdpCpuMapTestBurnDpcMicroseconds = XDPCPUMAP_TEST_ATTRIB_BURN_US;
+    XdpCpuMapTestBurnDpcRuns = 0;
+    KeInitializeDpc(&BurnDpc, XdpCpuMapTestBurnDpcRoutine, NULL);
+    XDPCPUMAP_TEST_ASSERT(KeInsertQueueDpc(&BurnDpc, NULL, NULL));
+
+    XdpCpuMapQueryQuiesceStats(&Before);
+    XdpCpuMapQuiesceInterface(&QuiescingToken);
+    XdpCpuMapQueryQuiesceStats(&Stats);
+
+    //
+    // MapsVisited and EntriesScanned are process-wide aggregates, so they are
+    // only meaningful as deltas. The three duration fields are per-event
+    // exchanges and are read directly.
+    //
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestBurnDpcRuns == 1);
+    XDPCPUMAP_TEST_ASSERT(Stats.MapsVisited - Before.MapsVisited == 0);
+    XDPCPUMAP_TEST_ASSERT(Stats.EntriesScanned - Before.EntriesScanned == 0);
+
+    //
+    // THE OUTCOME for (b): the cost was in the flush, and it is at least the
+    // controlled interval the DPC was told to burn -- an ordering assertion
+    // alone would admit a fixed offset.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.LastFlushDurationUs > Stats.LastScanDurationUs);
+    XDPCPUMAP_TEST_ASSERT(
+        Stats.LastFlushDurationUs >= XDPCPUMAP_TEST_ATTRIB_BURN_US / 2);
+    XDPCPUMAP_TEST_ASSERT(
+        Stats.LastScanDurationUs + Stats.LastFlushDurationUs <= Stats.LastDurationUs);
+    XDPCPUMAP_TEST_ASSERT(
+        Stats.LastDurationUs <=
+            Stats.LastScanDurationUs + Stats.LastFlushDurationUs + 1);
+
+    //
+    // Direction (a). Rings full of entries whose owner tokens deliberately do
+    // NOT match, so every slot is compared, nothing is transferred, and no DPC
+    // is ever queued -- the flush therefore runs nothing.
+    //
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_ATTRIB_MAPS; M++) {
+        XDPCPUMAP_TEST_ASSERT(NT_SUCCESS(XdpCpuMapTestCreateMap(64, &CpuMaps[M])));
+
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_ATTRIB_CPUS; C++) {
+            XDP_CPUMAP_RING *Ring;
+
+            Entry = XdpCpuMapTestEntry(C, RingDepth, 0);
+            XDPCPUMAP_TEST_ASSERT(
+                NT_SUCCESS(XdpCpuMapTestResolve(CpuMaps[M], &Entry, &Values[M][C])));
+
+            Ring = Values[M][C].Target->Ring;
+            for (UINT32 I = 0; I < RingDepth; I++) {
+                Ring->Entries[I].Nbl = Sentinel;
+                Ring->Entries[I].RxQueueOwner = &OtherToken;
+                Ring->Entries[I].GenericOwner = &OtherToken;
+            }
+            Ring->Head = 0;
+            Ring->Tail = RingDepth;
+        }
+    }
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestQueuedDpcCount == 0);
+
+    XdpCpuMapQueryQuiesceStats(&Before);
+    XdpCpuMapQuiesceInterface(&QuiescingToken);
+    XdpCpuMapQueryQuiesceStats(&Stats);
+
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestBurnDpcRuns == 1);
+
+    //
+    // THE OUTCOME for (a). A strict comparison, so it holds no escape for a
+    // build that deleted the scan entirely: both terms would then be zero and
+    // zero is not greater than zero.
+    //
+    XDPCPUMAP_TEST_ASSERT(Stats.LastScanDurationUs > Stats.LastFlushDurationUs);
+    XDPCPUMAP_TEST_ASSERT(
+        Stats.LastScanDurationUs + Stats.LastFlushDurationUs <= Stats.LastDurationUs);
+    XDPCPUMAP_TEST_ASSERT(
+        Stats.LastDurationUs <=
+            Stats.LastScanDurationUs + Stats.LastFlushDurationUs + 1);
+
+    //
+    // SUPPORTING, for mutation rule 4: the scan really did the work this
+    // direction attributes to it, rather than the ordering falling out of two
+    // near-zero numbers.
+    //
+    XDPCPUMAP_TEST_ASSERT(
+        Stats.EntriesScanned - Before.EntriesScanned ==
+            (LONG64)XDPCPUMAP_TEST_ATTRIB_MAPS * XDPCPUMAP_TEST_ATTRIB_CPUS * RingDepth);
+
+    //
+    // Drain the synthetic entries before teardown: they hold no real references,
+    // but leaving Tail ahead of Head would misrepresent the rings to destroy.
+    //
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_ATTRIB_MAPS; M++) {
+        for (UINT32 C = 0; C < XDPCPUMAP_TEST_ATTRIB_CPUS; C++) {
+            XDP_CPUMAP_RING *Ring = Values[M][C].Target->Ring;
+
+            RtlZeroMemory(Ring->Entries, (SIZE_T)RingDepth * sizeof(XDP_CPUMAP_ENTRY));
+            Ring->Head = 0;
+            Ring->Tail = 0;
+            XdpCpuMapTestRelease(CpuMaps[M], &Values[M][C]);
+        }
+    }
+
+    XdpCpuMapTestDrainSweeps();
+
+    for (UINT32 M = 0; M < XDPCPUMAP_TEST_ATTRIB_MAPS; M++) {
+        XdpCpuMapTestDestroyMap(CpuMaps[M]);
+    }
+
+    XdpCpuMapTestDrainSweeps();
+    XdpCpuMapTestDrainEpochFrees();
+    XDPCPUMAP_TEST_ASSERT(XdpCpuMapTestLiveAllocations == Baseline);
+    XdpCpuMapStop();
+}
+
 typedef VOID (*XDPCPUMAP_TEST_ROUTINE)(VOID);
 
 typedef struct _XDPCPUMAP_TEST_CASE {
@@ -6104,6 +7502,13 @@ static const XDPCPUMAP_TEST_CASE XdpCpuMapTestCases[] = {
     XDPCPUMAP_TEST_CASE_ENTRY(DrainTombstoneSkip),
     XDPCPUMAP_TEST_CASE_ENTRY(DrainYieldRequeueGate),
     XDPCPUMAP_TEST_CASE_ENTRY(RetireDrainReturns),
+    XDPCPUMAP_TEST_CASE_ENTRY(RetireSuppressedTargetDpc),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiesceScoping),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiesceInterfaceScope),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiesceTailSnapshot),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiescePassBudget),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiesceTombstoneBalance),
+    XDPCPUMAP_TEST_CASE_ENTRY(QuiesceDurationAttribution),
 };
 
 INT
@@ -6128,9 +7533,9 @@ main(
     // The filter measures a criterion by running EVERY case in isolation and
     // typing each outcome as pass, assertion failure, crash or hang. It is not a
     // way to run only the case a criterion is expected to hit: a filtered result
-    // is evidence about that case alone and says nothing about the other 36, and
+    // is evidence about that case alone and says nothing about the other 46, and
     // reporting one as a whole-suite radius is how criterion 22's radius was
-    // first understated. Baseline: all 40 pass in isolation; an unknown name
+    // first understated. Baseline: all 47 pass in isolation; an unknown name
     // exits 2.
     //
     const CHAR *Filter = (argc > 1) ? argv[1] : NULL;

@@ -171,6 +171,11 @@ typedef enum _XDP_CPUMAP_HELPER_FALLBACK_REASON {
 // so that a test can assert the scan's SHAPE deterministically rather than
 // through a wall-clock threshold. They are traced at the end of every quiesce.
 //
+// These are process-wide aggregates. Every field the section 14 pause-latency
+// calibration has to record PER PAUSE EVENT is also on that trace line, because
+// aggregates cannot attribute a single pause and there is no user-mode query
+// path for CPUMAP statistics (issue #22, increment 10).
+//
 typedef struct _XDP_CPUMAP_QUIESCE_STATS {
     volatile LONG64 Count;
     volatile LONG64 MapsVisited;
@@ -179,14 +184,65 @@ typedef struct _XDP_CPUMAP_QUIESCE_STATS {
     volatile LONG64 Tombstoned;
     volatile LONG64 PassesTotal;
     volatile LONG64 MaxPassesExhausted;
+
+    //
+    // Total is scan + flush. It is the section 14 acceptance metric: the whole
+    // of it is duration this design ADDS to a pause event, because nothing on
+    // the pause path called any of it before CPUMAP existed.
+    //
+    // The split exists because the section 14 remediation rule -- "if exceeded,
+    // reduce XDP_CPUMAP_GLOBAL_MAX_RING_ENTRIES, then XDP_CPUMAP_MAX_LIVE_MAPS"
+    // -- acts on the SCAN only. KeFlushQueuedDpcs costs O(processor count) and
+    // waits on unrelated DPCs; section 8.4 says explicitly that it is outside
+    // every CPUMAP cap. A total that exceeds the limit while the flush dominates
+    // cannot be fixed by either constant, so a calibration that records only the
+    // total cannot tell whether its own remediation applies.
+    //
+    // Max is kept alongside Last because the calibration is a repeated-pause
+    // stress run whose per-event record is a WPP trace, and WPP drops events
+    // under load. Max survives the drop.
+    //
     volatile LONG64 LastDurationUs;
     volatile LONG64 MaxDurationUs;
+    volatile LONG64 LastScanDurationUs;
+    volatile LONG64 MaxScanDurationUs;
+    volatile LONG64 LastFlushDurationUs;
+    volatile LONG64 MaxFlushDurationUs;
 } XDP_CPUMAP_QUIESCE_STATS;
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 XdpCpuMapQueryQuiesceStats(
     _Out_ XDP_CPUMAP_QUIESCE_STATS *Stats
+    );
+
+//
+// Packets returned to the miniport WITHOUT indication because their target
+// retired while its ring still held them (section 8.3, "Delivery on retire").
+//
+// This is the only read path for it. Its two siblings in XDP_CPUMAP_SWEEP_STATS
+// are traced where they are incremented; this one was not, so before this it was
+// written and never read by anything.
+//
+// What it does NOT do is identify a ring quiesce failed to scan. EVERY target
+// retirement increments it, whatever the cause, so it cannot separate "the
+// pausing queue's entries went out via the retire drain" from any other
+// retirement. An earlier revision of this comment claimed it "counts exactly
+// those"; that was false, and the mechanism it described is worth keeping only
+// as context: the sweep unlinks a retiring target from the target table under
+// ConfigLock BEFORE running its rundown down, so quiesce -- which reads the
+// table and acquires that rundown inside one shared hold -- sees an acquirable
+// target or NULL, never a retiring one. A ring unlinked between pause
+// publication and the scan is therefore invisible to quiesce and its entries,
+// including the pausing queue's, are disposed of by the retire drain. That
+// disposal is correct and is counted here; it is simply not distinguishable
+// here from ordinary retirement. Distinguishing it would need a counter
+// incremented on that specific path, which does not currently exist.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+LONG64
+XdpCpuMapQueryRetireDropCount(
+    VOID
     );
 
 //
