@@ -6091,7 +6091,8 @@ AttachEbpfXdpProgram(
     _In_ const TestInterface &If,
     _In_ const CHAR *BpfRelativeFileName,
     _In_ const CHAR *BpfProgramName,
-    _In_ INT AttachFlags = 0
+    _In_ INT AttachFlags = 0,
+    _In_ UINT32 TimeoutMs = TEST_TIMEOUT_ASYNC_MS
     )
 {
     unique_xdp_program BpfProgram;
@@ -6102,7 +6103,15 @@ AttachEbpfXdpProgram(
     // Workaround till the above issue is fixed (and eBPF returns E_BUSY):
     // Try a few times to load and attach the program with a sleep in between.
     //
-    Stopwatch Watchdog(TEST_TIMEOUT_ASYNC_MS);
+    // TimeoutMs is a parameter because the default budget is a HARNESS
+    // assumption, not a product requirement. Attaching pauses and reactivates
+    // the RX queue, so a test that attaches and detaches repeatedly against the
+    // same interface can legitimately need longer than a test that attaches
+    // once -- see GenericRxEbpfCpuMapRedirectPauseRace, which fails at the
+    // default budget on hardware for that reason alone and not for any fault in
+    // the data path.
+    //
+    Stopwatch Watchdog(TimeoutMs);
     do {
         Result = TryAttachEbpfXdpProgram(
             BpfProgram, If, BpfRelativeFileName, BpfProgramName, AttachFlags);
@@ -6590,6 +6599,395 @@ GenericRxEbpfCpuMapRedirectChain()
     TEST_EQUAL(
         HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
         LwfRxGetFrame(FnLwf, 0, &FrameLength, NULL));
+}
+
+//
+// Low-resource redirect: the deep copy is delivered, the ORIGINAL goes straight
+// home (design section 8.1a row 9b).
+//
+// This is the first test in which a deep copy exists at all. Increments 6 and 7
+// carried originals only, so the RESOURCES branch in XdpCpuMapChainSetIndicate
+// had never executed on hardware.
+//
+// DO NOT ADD AN FnLwf RX FILTER TO THIS TEST. It bugchecks the machine.
+//
+// An earlier revision observed the redirected frame through LwfRxFilter, the way
+// GenericRxEbpfCpuMapRedirect does, and took VM-Test down with
+// 0xD1 DRIVER_IRQL_NOT_LESS_OR_EQUAL inside fnlwf. FnLwf's
+// FilterReceiveNetBufferLists never examines ReceiveFlags: a matching NBL is
+// captured by FnIoFilterNbl and RETAINED for the test to fetch later. That is
+// legal for a normal indication and illegal for a RESOURCES one, where the
+// indicating driver regains ownership the moment the call returns. Our drain
+// indicates the copy with RESOURCES -- correctly -- and recycles it into the
+// pool immediately afterwards, at which point FnLwf is holding freed memory and
+// touches it at DISPATCH_LEVEL.
+//
+// Pass-through is fine; only CAPTURE retains. That is why GenericRxLowResources
+// works today: its RESOURCES indications traverse FnLwf without matching a
+// filter. So this test installs none, and observes the copy where a real
+// consumer would -- through the local UDP stack, which honours RESOURCES by
+// copying inline.
+//
+// What that costs, stated plainly: this test does NOT assert the indication CPU,
+// because Output.ProcessorNumber is an FnLwf-capture-only observable and capture
+// is exactly what is unsafe here. The CPU claim rests on
+// GenericRxEbpfCpuMapRedirect, which proves target-CPU indication over the same
+// drain and indicate path -- IsDeepCopy and the RESOURCES bit are the only
+// difference -- plus the WPP correlation recorded on issue #19.
+//
+// What it does prove, and what makes it a real discriminator rather than a
+// delivery check:
+//
+//   - The copy reached the stack. A CPUMAP redirect leaves XdpRxAction as
+//     XDP_RX_ACTION_DROP, so if the copy path failed for any reason the original
+//     is dropped and NOTHING arrives. Receiving the payload therefore proves a
+//     copy was built, enqueued, drained and indicated.
+//   - Exactly once. A build that delivered both the original and the copy, or
+//     double-indicated the copy, leaves a second datagram.
+//   - The original came back to the miniport intact. FnMp's SharedIrpRxFlush
+//     builds a shadow list and verifies the returned chain matches the indicated
+//     one, so TryMpRxFlush succeeding is itself evidence for row 9b's claim that
+//     ownership of the original never left the normal receive path.
+//
+VOID
+GenericRxEbpfCpuMapRedirectLowResources()
+{
+    auto If = FnMpIf;
+    ADDRESS_FAMILY Af = AF_INET;
+    UINT16 LocalPort, RemotePort;
+    ETHERNET_ADDRESS LocalHw, RemoteHw;
+    INET_ADDR LocalIp, RemoteIp;
+
+    const UINT32 ProcessorCount = GetProcessorCount(0);
+    TEST_TRUE(ProcessorCount >= 2);
+
+    auto UdpSocket = CreateUdpSocket(Af, &If, &LocalPort);
+    auto GenericMp = MpOpenGeneric(If.GetIfIndex());
+
+    RemotePort = htons(1234);
+    If.GetHwAddress(&LocalHw);
+    If.GetRemoteHwAddress(&RemoteHw);
+    If.GetIpv4Address(&LocalIp.Ipv4);
+    If.GetRemoteIpv4Address(&RemoteIp.Ipv4);
+
+    UCHAR UdpPayload[] = "GenericRxEbpfCpuMapRedirectLowResources";
+    UCHAR UdpFrame[UDP_HEADER_STORAGE + sizeof(UdpPayload)];
+    UINT32 UdpFrameLength = sizeof(UdpFrame);
+    TEST_TRUE(
+        PktBuildUdpFrame(
+            UdpFrame, &UdpFrameLength, UdpPayload, sizeof(UdpPayload), &LocalHw, &RemoteHw,
+            Af, &LocalIp, &RemoteIp, LocalPort, RemotePort));
+
+    //
+    // Establish the arrival processor, then steer somewhere else, so the copy
+    // genuinely crosses a CPU even though the redirect phase cannot observe
+    // which CPU it lands on.
+    //
+    // The FnLwf handle and its filter live and die INSIDE this block. Measuring
+    // arrival needs a capture, capture is safe only for a normal indication, and
+    // the low-resource flush below must find no filter installed. Both are
+    // released here by scope exit rather than by remembering to undo them.
+    //
+    UINT32 TargetIndex = MAXUINT32;
+    {
+        unique_fnlwf_handle FnLwf = LwfOpenDefault(If.GetIfIndex());
+        const UCHAR ControlPayload[] = "GenericRxEbpfCpuMapRedirectLowResourcesControl";
+        PROCESSOR_NUMBER Arrival;
+
+        CxPlatVector<UCHAR> Mask(sizeof(ControlPayload), 0xFF);
+        auto LwfFilter =
+            LwfRxFilter(FnLwf, ControlPayload, Mask.data(), sizeof(ControlPayload));
+
+        unique_xdp_program PassProgram =
+            AttachEbpfXdpProgram(If, "\\bpf\\pass.sys", "pass");
+
+        DATA_FLUSH_OPTIONS ControlFlush = {0};
+        ControlFlush.Flags.RssCpu = TRUE;
+        ControlFlush.RssCpuQueueId = If.GetQueueId();
+
+        RX_FRAME ControlFrame;
+        RxInitializeFrame(
+            &ControlFrame, If.GetQueueId(), ControlPayload, sizeof(ControlPayload));
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &ControlFrame));
+        TEST_HRESULT(TryMpRxFlush(GenericMp, &ControlFlush));
+
+        auto RxFrame = LwfRxAllocateAndGetFrame(FnLwf, 0);
+        Arrival = RxFrame->Output.ProcessorNumber;
+        LwfRxDequeueFrame(FnLwf, 0);
+        LwfRxFlush(FnLwf);
+
+        TEST_EQUAL(0, Arrival.Group);
+
+        for (UINT32 Index = 0; Index < ProcessorCount; Index++) {
+            PROCESSOR_NUMBER Candidate;
+
+            ProcessorIndexToProcessorNumber(Index, &Candidate);
+            if (Candidate.Group == 0 && Candidate.Number != Arrival.Number) {
+                TargetIndex = Index;
+                break;
+            }
+        }
+    }
+    TEST_NOT_EQUAL(MAXUINT32, TargetIndex);
+
+    unique_xdp_program BpfProgram =
+        AttachEbpfXdpProgram(If, "\\bpf\\cpumap_redirect.sys", "cpumap_redirect");
+
+    fd_t cpu_map_fd = bpf_object__find_map_fd_by_name(BpfProgram.get(), "cpu_map");
+    TEST_NOT_EQUAL(cpu_map_fd, ebpf_fd_invalid);
+
+    XDP_CPUMAP_KEY MapKey = 0;
+    XDP_CPUMAP_ENTRY_V1 MapEntry;
+
+    RtlZeroMemory(&MapEntry, sizeof(MapEntry));
+    MapEntry.Size = XDP_CPUMAP_ENTRY_SIZE_V1;
+    MapEntry.Version = XDP_CPUMAP_ENTRY_VERSION_1;
+    MapEntry.TargetCpu = TargetIndex;
+    TEST_EQUAL(0, bpf_map_update_elem(cpu_map_fd, &MapKey, &MapEntry, BPF_ANY));
+
+    //
+    // LowResources is what forces the copy: NDIS forbids pending the NBL, so
+    // commit cannot take the original and the flush must build a copy instead.
+    //
+    DATA_FLUSH_OPTIONS FlushOptions = {0};
+    FlushOptions.Flags.RssCpu = TRUE;
+    FlushOptions.RssCpuQueueId = If.GetQueueId();
+    FlushOptions.Flags.LowResources = TRUE;
+
+    RX_FRAME Frame;
+    RxInitializeFrame(&Frame, If.GetQueueId(), UdpFrame, UdpFrameLength);
+    TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+    TEST_HRESULT(TryMpRxFlush(GenericMp, &FlushOptions));
+
+    //
+    // The copy arrived. Nothing else could have delivered this: the redirect
+    // converted the action to DROP, so a failed copy path means silence.
+    //
+    CHAR RecvPayload[sizeof(UdpPayload)];
+    TEST_EQUAL(
+        sizeof(UdpPayload),
+        FnSockRecv(UdpSocket.get(), RecvPayload, sizeof(RecvPayload), FALSE, 0));
+    TEST_TRUE(RtlEqualMemory(UdpPayload, RecvPayload, sizeof(UdpPayload)));
+
+    //
+    // And exactly once.
+    //
+    TEST_TRUE(FAILED(FnSockRecv(UdpSocket.get(), RecvPayload, sizeof(RecvPayload), FALSE, 0)));
+    TEST_EQUAL(WSAETIMEDOUT, FnSockGetLastError());
+}
+
+//
+// Low-resource redirect across repeated PASS <-> REDIRECT program replacement.
+//
+// READ THIS BEFORE TREATING IT AS RACE COVERAGE. It is a stressor, not a proof,
+// and the real race test is tracked as issue #21 in increment 9.
+//
+// The sequence B3 guards against needs a committed redirect to be outstanding at
+// the moment XdpGenericReceiveLowResources releases the EC spinlock. That
+// release is conditional: it happens only when the PASS LIST IS NON-EMPTY and
+// something is being returned. So the window requires a chain in which a PASSED
+// frame precedes a REDIRECTED one within the same receive call.
+//
+// This test does not build that chain. Each iteration enqueues a single frame
+// and flushes it, and TryMpRxFlush completes before the program destructor
+// starts the pause -- so the flush and the pause never overlap, and the pass
+// list is empty when the redirected frame is dropped. "No duplicate index"
+// therefore passes whether or not the production fix is present. What the test
+// does cover is program replacement under low-resource traffic without a wedge
+// or a duplicate, which is worth having but is not what B3 is about.
+//
+// Making it real needs a BPF program that redirects SELECTIVELY -- our
+// cpumap_redirect.c redirects unconditionally, so a chain of [PASS, REDIRECT]
+// frames cannot be constructed with it -- plus a way to hold the target DPC off
+// so a post-quiesce insertion is observable rather than merely survivable. Both
+// are new surfaces, so they are deferred to issue #21 in increment 9, alongside
+// quiesce hardening and the section 14 pause calibration that share the same
+// guarantee. Note for whoever picks it up: "no duplicate index" is NOT a valid
+// assertion there, for the reason above.
+//
+// Until then the deterministic proof of the production fix is the unit deletion
+// criterion that reverts commit to a deferred flush, recorded on
+// XdpCpuMapTestDeepCopySuccess as criterion (l). Nothing else proves it.
+//
+// The assertion is deliberately NOT "every frame arrives". Reconfiguration is
+// loss-minimising, not lossless: a frame can legitimately be absorbed by
+// CommitPauseDrop, by quiesce, or by the ring, and asserting zero loss would be
+// asserting something the design explicitly denies.
+//
+// No FnLwf RX filter here either, for the reason given on
+// GenericRxEbpfCpuMapRedirectLowResources: capturing a RESOURCES indication
+// bugchecks the machine.
+//
+#define XDPCPUMAP_TEST_PAUSE_RACE_FRAMES 32u
+
+//
+// One attach/detach per frame is far more churn than any other test creates,
+// and attach pauses and reactivates the RX queue each time. The default
+// TEST_TIMEOUT_ASYNC_MS budget is not enough for that on hardware, so this test
+// gets its own. Measured, not guessed: at the default budget an attach fails
+// reproducibly, and the failure reproduces identically against the increment 7
+// driver while every other eBPF test passes on both -- so the limit is in the
+// harness, not the data path.
+//
+#define XDPCPUMAP_TEST_PAUSE_RACE_ATTACH_TIMEOUT_MS (30 * 1000)
+
+VOID
+GenericRxEbpfCpuMapRedirectPauseRace()
+{
+    auto If = FnMpIf;
+    ADDRESS_FAMILY Af = AF_INET;
+    UINT16 LocalPort, RemotePort;
+    ETHERNET_ADDRESS LocalHw, RemoteHw;
+    INET_ADDR LocalIp, RemoteIp;
+    BOOLEAN Seen[XDPCPUMAP_TEST_PAUSE_RACE_FRAMES] = {0};
+    UINT32 Delivered = 0;
+
+    const UINT32 ProcessorCount = GetProcessorCount(0);
+    TEST_TRUE(ProcessorCount >= 2);
+
+    auto UdpSocket = CreateUdpSocket(Af, &If, &LocalPort);
+    auto GenericMp = MpOpenGeneric(If.GetIfIndex());
+
+    RemotePort = htons(1234);
+    If.GetHwAddress(&LocalHw);
+    If.GetRemoteHwAddress(&RemoteHw);
+    If.GetIpv4Address(&LocalIp.Ipv4);
+    If.GetRemoteIpv4Address(&RemoteIp.Ipv4);
+
+    UCHAR UdpPayload[] = "GenericRxEbpfCpuMapRedirectPauseRace#";
+    const SIZE_T PayloadIndexOffset = sizeof(UdpPayload) - 2;
+
+    DATA_FLUSH_OPTIONS FlushOptions = {0};
+    FlushOptions.Flags.RssCpu = TRUE;
+    FlushOptions.RssCpuQueueId = If.GetQueueId();
+    FlushOptions.Flags.LowResources = TRUE;
+
+    for (UINT32 Index = 0; Index < XDPCPUMAP_TEST_PAUSE_RACE_FRAMES; Index++) {
+        UCHAR UdpFrame[UDP_HEADER_STORAGE + sizeof(UdpPayload)];
+        UINT32 UdpFrameLength = sizeof(UdpFrame);
+
+        UdpPayload[PayloadIndexOffset] = (UCHAR)('A' + Index);
+        TEST_TRUE(
+            PktBuildUdpFrame(
+                UdpFrame, &UdpFrameLength, UdpPayload, sizeof(UdpPayload), &LocalHw, &RemoteHw,
+                Af, &LocalIp, &RemoteIp, LocalPort, RemotePort));
+
+        //
+        // Alternate the attached program every frame. Each attach and detach
+        // pauses and reactivates the RX queue, so half the frames are inspected
+        // by a redirecting program and half by a passing one, with the queue
+        // transitioning between them.
+        //
+        // The attach budget is raised well above the default. 32 attach/detach
+        // cycles against one interface is far more churn than any other test
+        // creates, and at the default 1 s budget an attach reliably fails on
+        // hardware -- verified as a HARNESS limit, not a regression: the same
+        // failure reproduces against the increment 7 driver, while every other
+        // eBPF test passes on both. Raising it here rather than raising
+        // TEST_TIMEOUT_ASYNC_MS keeps every other test's timing unchanged.
+        //
+        BOOLEAN Redirect = (Index % 2) == 0;
+        unique_xdp_program Program =
+            Redirect
+                ? AttachEbpfXdpProgram(
+                    If, "\\bpf\\cpumap_redirect.sys", "cpumap_redirect", 0,
+                    XDPCPUMAP_TEST_PAUSE_RACE_ATTACH_TIMEOUT_MS)
+                : AttachEbpfXdpProgram(
+                    If, "\\bpf\\pass.sys", "pass", 0,
+                    XDPCPUMAP_TEST_PAUSE_RACE_ATTACH_TIMEOUT_MS);
+
+        if (Redirect) {
+            fd_t cpu_map_fd = bpf_object__find_map_fd_by_name(Program.get(), "cpu_map");
+            TEST_NOT_EQUAL(cpu_map_fd, ebpf_fd_invalid);
+
+            XDP_CPUMAP_KEY MapKey = 0;
+            XDP_CPUMAP_ENTRY_V1 MapEntry;
+
+            RtlZeroMemory(&MapEntry, sizeof(MapEntry));
+            MapEntry.Size = XDP_CPUMAP_ENTRY_SIZE_V1;
+            MapEntry.Version = XDP_CPUMAP_ENTRY_VERSION_1;
+            MapEntry.TargetCpu = 1;
+            TEST_EQUAL(0, bpf_map_update_elem(cpu_map_fd, &MapKey, &MapEntry, BPF_ANY));
+        }
+
+        RX_FRAME Frame;
+        RxInitializeFrame(&Frame, If.GetQueueId(), UdpFrame, UdpFrameLength);
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+
+        //
+        // A flush racing a pause may legitimately be refused; that is the
+        // loss the design permits, not a failure.
+        //
+        (VOID)TryMpRxFlush(GenericMp, &FlushOptions);
+    }
+
+    //
+    // Drain whatever arrived. Loss is legal; a repeat is not.
+    //
+    for (;;) {
+        CHAR RecvPayload[sizeof(UdpPayload)];
+        INT Result =
+            FnSockRecv(UdpSocket.get(), RecvPayload, sizeof(RecvPayload), FALSE, 0);
+
+        if (FAILED(Result)) {
+            TEST_EQUAL(WSAETIMEDOUT, FnSockGetLastError());
+            break;
+        }
+
+        TEST_EQUAL(sizeof(UdpPayload), Result);
+
+        UINT32 FrameIndex = (UINT32)(RecvPayload[PayloadIndexOffset] - 'A');
+        TEST_TRUE(FrameIndex < XDPCPUMAP_TEST_PAUSE_RACE_FRAMES);
+        TEST_FALSE(Seen[FrameIndex]);
+        Seen[FrameIndex] = TRUE;
+        Delivered++;
+    }
+
+    //
+    // Some loss is permitted, total silence is not: that would mean the storm
+    // wedged the path rather than merely dropping into it.
+    //
+    TEST_TRUE(Delivered > 0);
+
+    //
+    // And the path still works once things are quiescent.
+    //
+    {
+        UCHAR UdpFrame[UDP_HEADER_STORAGE + sizeof(UdpPayload)];
+        UINT32 UdpFrameLength = sizeof(UdpFrame);
+        CHAR RecvPayload[sizeof(UdpPayload)];
+
+        UdpPayload[PayloadIndexOffset] = 'z';
+        TEST_TRUE(
+            PktBuildUdpFrame(
+                UdpFrame, &UdpFrameLength, UdpPayload, sizeof(UdpPayload), &LocalHw, &RemoteHw,
+                Af, &LocalIp, &RemoteIp, LocalPort, RemotePort));
+
+        unique_xdp_program Program =
+            AttachEbpfXdpProgram(If, "\\bpf\\cpumap_redirect.sys", "cpumap_redirect");
+
+        fd_t cpu_map_fd = bpf_object__find_map_fd_by_name(Program.get(), "cpu_map");
+        TEST_NOT_EQUAL(cpu_map_fd, ebpf_fd_invalid);
+
+        XDP_CPUMAP_KEY MapKey = 0;
+        XDP_CPUMAP_ENTRY_V1 MapEntry;
+
+        RtlZeroMemory(&MapEntry, sizeof(MapEntry));
+        MapEntry.Size = XDP_CPUMAP_ENTRY_SIZE_V1;
+        MapEntry.Version = XDP_CPUMAP_ENTRY_VERSION_1;
+        MapEntry.TargetCpu = 1;
+        TEST_EQUAL(0, bpf_map_update_elem(cpu_map_fd, &MapKey, &MapEntry, BPF_ANY));
+
+        RX_FRAME Frame;
+        RxInitializeFrame(&Frame, If.GetQueueId(), UdpFrame, UdpFrameLength);
+        TEST_HRESULT(MpRxEnqueueFrame(GenericMp, &Frame));
+        TEST_HRESULT(TryMpRxFlush(GenericMp, &FlushOptions));
+
+        TEST_EQUAL(
+            sizeof(UdpPayload),
+            FnSockRecv(UdpSocket.get(), RecvPayload, sizeof(RecvPayload), FALSE, 0));
+        TEST_TRUE(RtlEqualMemory(UdpPayload, RecvPayload, sizeof(UdpPayload)));
+    }
 }
 
 VOID

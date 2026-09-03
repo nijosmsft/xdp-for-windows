@@ -85,23 +85,300 @@ typedef struct _DEVICE_OBJECT DEVICE_OBJECT;
 //
 // NDIS types.
 //
+// NDIS_HANDLE and NDIS_STATUS come from the SDK's ndis/types.h, which is a
+// dependency-free two-typedef header that something in this translation unit
+// already pulls in. Redefining them here produced a C4142 that /WX turned into a
+// build break, so the harness defers to it rather than shadowing it.
+//
+#include <ndis/types.h>
+
+typedef ULONG NDIS_PORT_NUMBER;
 // NET_BUFFER_LIST is modelled only as far as CPUMAP touches it: the data path
 // chains NBLs through Next when it builds indication partitions, so Next has to
 // be real. Everything else about an NBL is NDIS-internal and CPUMAP never reads
 // it.
 //
-typedef VOID *NDIS_HANDLE;
-typedef ULONG NDIS_PORT_NUMBER;
+
+//
+// NBL / NET_BUFFER / MDL model for the deep-copy path (design section 7,
+// "Deep-copy path"; section 8.1a row 9b).
+//
+// Increments 6 and 7 needed only Next, because CPUMAP carried originals and
+// never looked inside one. Increment 8 builds a copy, so the harness has to
+// model enough that the copy is genuinely verifiable rather than assumed:
+// buffers really are allocated by the retreat and really are freed by the
+// advance, and the MDL copy really moves bytes. A model that faked any of those
+// would let a build that copies nothing pass.
+//
+// Live-object counters back that up: a leaked descriptor or a leaked page is a
+// counter that does not return to its baseline, which is how the row 9b failure
+// paths are checked rather than merely executed.
+//
+
+typedef struct _XDPCPUMAP_TEST_MDL {
+    struct _XDPCPUMAP_TEST_MDL *Next;
+    UCHAR *Buffer;
+    ULONG Length;
+} XDPCPUMAP_TEST_MDL;
+
+#define MDL XDPCPUMAP_TEST_MDL
+
+typedef struct _NET_BUFFER {
+    struct _NET_BUFFER *Next;
+    MDL *MdlChain;
+    MDL *CurrentMdl;
+    ULONG DataLength;
+    ULONG DataOffset;
+    ULONG CurrentMdlOffset;
+} NET_BUFFER;
+
+//
+// Slot identities come from the REAL WDK enum, not a restatement.
+//
+// ndis/nblinfo.h needs only winapifamily.h, ndis/types.h and ndis/version.h, so
+// the harness can take it verbatim. That matters because several slots are
+// ALIASES -- TcpReceiveNoPush == TcpLargeSendNetBufferListInfo,
+// UdpSegmentationOffloadInfo == TcpRecvSegCoalesceInfo,
+// NetBufferListProtocolId == NetBufferListFrameType -- and a hand-written enum
+// made them distinct, which let a test assert that "send" slots stayed zero when
+// NDIS makes no such guarantee. The assertion passed for the wrong reason and
+// hid a real omission underneath it.
+//
+// NDIS684 is the level the drivers under test build at -- src/xdp/xdp.vcxproj
+// and src/xdplwf/xdplwf.vcxproj both define it -- so the harness sees exactly
+// the slot set the production code sees. NDIS_PLATFORM is what makes version.h
+// honour the level macro instead of deriving one from miniport version fields
+// this project does not set.
+//
+#ifndef NDIS_PLATFORM
+#define NDIS_PLATFORM
+#endif
+#ifndef NDIS684
+#define NDIS684 1
+#endif
+#include <ndis/nblinfo.h>
 
 typedef struct _NET_BUFFER_LIST {
     struct _NET_BUFFER_LIST *Next;
+    NET_BUFFER *FirstNetBuffer;
+
+    //
+    // Ownership, not metadata. A filter that originates a receive indication
+    // must stamp this with its own filter module handle; NDIS uses it to route
+    // the return. Modelled because an originated NBL that leaves it NULL is a
+    // contract violation the harness previously could not see.
+    //
+    NDIS_HANDLE SourceHandle;
+
+    VOID *NetBufferListInfo[MaxNetBufferListInfo];
+
+    //
+    // Harness-only. Lets a test tell a descriptor apart across recycle cycles
+    // and assert that a reused one really came back from the free list.
+    //
+    ULONG64 TestTag;
 } NET_BUFFER_LIST;
 
 #define NET_BUFFER_LIST_NEXT_NBL(_NBL) ((_NBL)->Next)
+#define NET_BUFFER_LIST_FIRST_NB(_NBL) ((_NBL)->FirstNetBuffer)
+#define NET_BUFFER_NEXT_NB(_NB) ((_NB)->Next)
+#define NET_BUFFER_DATA_LENGTH(_NB) ((_NB)->DataLength)
+#define NET_BUFFER_LIST_INFO(_NBL, _Id) ((_NBL)->NetBufferListInfo[_Id])
 
 #define NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL 0x00000001
 #define NDIS_RECEIVE_FLAGS_RESOURCES      0x00000002
 #define NDIS_RETURN_FLAGS_DISPATCH_LEVEL  0x00000001
+
+#define NDIS_STATUS_SUCCESS   ((NDIS_STATUS)0x00000000L)
+#define NDIS_STATUS_RESOURCES ((NDIS_STATUS)0xc000009aL)
+
+#define NDIS_OBJECT_TYPE_DEFAULT 0x80
+#define NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1 1
+#define NDIS_PROTOCOL_ID_DEFAULT 0x00
+
+typedef struct _NDIS_OBJECT_HEADER {
+    UCHAR Type;
+    UCHAR Revision;
+    USHORT Size;
+} NDIS_OBJECT_HEADER;
+
+typedef struct _NET_BUFFER_LIST_POOL_PARAMETERS {
+    NDIS_OBJECT_HEADER Header;
+    UCHAR ProtocolId;
+    BOOLEAN fAllocateNetBuffer;
+    USHORT ContextSize;
+    ULONG PoolTag;
+    ULONG DataSize;
+} NET_BUFFER_LIST_POOL_PARAMETERS;
+
+//
+// Live-object accounting and failure injection for the deep-copy model.
+//
+// Every one of these exists so a test can make a row 9b failure path REACHABLE
+// and then prove the path released exactly what the table says. Without
+// injection the allocation and retreat failure rows could only ever be reasoned
+// about, and section 12 requires every failure to be counted, which means every
+// failure has to be executable.
+//
+extern LONG XdpCpuMapTestNblPoolLive;
+extern LONG XdpCpuMapTestNblLive;
+extern LONG XdpCpuMapTestPageLive;
+extern LONG XdpCpuMapTestNblAllocTotal;
+extern ULONG64 XdpCpuMapTestNextNblTag;
+
+extern LONG XdpCpuMapTestFailNblPoolAlloc;
+extern LONG XdpCpuMapTestFailNblAllocAfter;
+extern LONG XdpCpuMapTestFailRetreatAfter;
+extern LONG XdpCpuMapTestFailMdlCopyAfter;
+
+//
+// When set, a source NBL is given real pointer-owned metadata. Off by default,
+// because production REFUSES the redirect when the source carries a slot outside
+// the carried set, so a test only turns this on when the refusal is what it is
+// testing.
+//
+extern BOOLEAN XdpCpuMapTestSourceMetadataBlobs;
+
+//
+// When set, a freshly allocated descriptor comes back with residue in a slot
+// CPUMAP does not carry. Reaches the fresh half of the uniform cleanliness
+// check, which is otherwise unreachable.
+//
+extern BOOLEAN XdpCpuMapTestDirtyFreshAlloc;
+
+VOID
+XdpCpuMapTestResetNdisPool(
+    VOID
+    );
+
+NDIS_HANDLE
+NdisAllocateNetBufferListPool(
+    _In_opt_ NDIS_HANDLE NdisHandle,
+    _In_ NET_BUFFER_LIST_POOL_PARAMETERS *Parameters
+    );
+
+VOID
+NdisFreeNetBufferListPool(
+    _In_ NDIS_HANDLE PoolHandle
+    );
+
+NET_BUFFER_LIST *
+NdisAllocateNetBufferAndNetBufferList(
+    _In_ NDIS_HANDLE PoolHandle,
+    _In_ USHORT ContextSize,
+    _In_ USHORT ContextBackFill,
+    _In_opt_ MDL *MdlChain,
+    _In_ ULONG DataOffset,
+    _In_ SIZE_T DataLength
+    );
+
+VOID
+NdisFreeNetBufferList(
+    _In_ NET_BUFFER_LIST *NetBufferList
+    );
+
+NDIS_STATUS
+NdisRetreatNetBufferDataStart(
+    _In_ NET_BUFFER *NetBuffer,
+    _In_ ULONG DataOffsetDelta,
+    _In_ ULONG DataBackFill,
+    _In_opt_ VOID *AllocateMdlHandler
+    );
+
+VOID
+NdisAdvanceNetBufferDataStart(
+    _In_ NET_BUFFER *NetBuffer,
+    _In_ ULONG DataOffsetDelta,
+    _In_ BOOLEAN FreeMdl,
+    _In_opt_ VOID *FreeMdlHandler
+    );
+
+NTSTATUS
+MdlCopyMdlChainToMdlChainAtOffsetNonTemporal(
+    _In_ MDL *DestinationMdl,
+    _In_ ULONG DestinationOffset,
+    _In_ MDL *SourceMdl,
+    _In_ ULONG SourceOffset,
+    _In_ ULONG Length
+    );
+
+VOID
+NdisCopyReceiveNetBufferListInfo(
+    _In_ NET_BUFFER_LIST *DestNetBufferList,
+    _In_ const NET_BUFFER_LIST *SrcNetBufferList
+    );
+
+//
+// The set NdisCopyReceiveNetBufferListInfo is modelled as carrying. Exposed so a
+// test asserts against the POLICY rather than restating a list of its own, which
+// would drift the moment the policy changed.
+//
+extern const NDIS_NET_BUFFER_LIST_INFO *XdpCpuMapTestReceiveInfoSlots;
+extern const ULONG XdpCpuMapTestReceiveInfoSlotCount;
+
+//
+// The subset above whose slots hold POINTERS to storage the source owns. A
+// source NBL points these at a real allocation that
+// XdpCpuMapTestDeleteSourceNbl frees, so a build that carried one instead of
+// refusing the redirect is holding freed memory -- observable, rather than
+// argued.
+//
+extern const NDIS_NET_BUFFER_LIST_INFO *XdpCpuMapTestPointerOwnedSlots;
+extern const ULONG XdpCpuMapTestPointerOwnedSlotCount;
+
+//
+// Outstanding WFP context references the model has handed out. Must return to
+// zero: a build that reintroduces NdisCopyReceiveNetBufferListInfo acquires one
+// per copy and has no way to release it from a cached descriptor.
+//
+extern LONG XdpCpuMapTestWfpReferences;
+
+//
+// When set, the indication stub stamps upper-stack metadata into slots CPUMAP
+// does not carry. Off by default so descriptor reuse is testable; on, the
+// discard path is.
+//
+extern BOOLEAN XdpCpuMapTestStampOnIndicate;
+
+BOOLEAN
+XdpCpuMapTestIsCarriedSlot(
+    _In_ ULONG Slot
+    );
+
+//
+// N.B. InterlockedPushListSList is NOT declared here. In kernel mode it comes
+// from ntifs.h, but in user mode interlockedapi.h already defines it as a macro
+// onto InterlockedPushListSListEx with the same signature, so cpumap.c's call
+// resolves to the real Win32 primitive. Declaring it again collides with that
+// macro. The harness therefore exercises genuine SList semantics, not a stand-in.
+//
+//
+// Build a source NBL a test can copy from, and tear one down. Payload bytes are
+// real, so the copy can be checked byte for byte rather than by length.
+//
+//
+// Size of the driver-owned metadata blob a source NBL points its pointer-owned
+// slots at.
+//
+#define XDPCPUMAP_TEST_METADATA_BLOB_SIZE 64u
+
+NET_BUFFER_LIST *
+XdpCpuMapTestCreateSourceNbl(
+    _In_reads_bytes_(Length) const VOID *Payload,
+    _In_ ULONG Length
+    );
+
+VOID
+XdpCpuMapTestDeleteSourceNbl(
+    _In_ NET_BUFFER_LIST *Nbl
+    );
+
+BOOLEAN
+XdpCpuMapTestNblPayloadEquals(
+    _In_ const NET_BUFFER_LIST *Nbl,
+    _In_reads_bytes_(Length) const VOID *Payload,
+    _In_ ULONG Length
+    );
 
 //
 // Every indication and every return is recorded, because partitioned indication

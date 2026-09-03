@@ -55,6 +55,15 @@ typedef struct _XDP_LWF_GENERIC_RX_QUEUE {
     UINT32 TxCloneCacheCount;
     NET_BUFFER_LIST *TxCloneNblList;
 
+    //
+    // Deep-copy cache for low-resource CPUMAP redirects (design section 7,
+    // "NDIS resources"). Created and freed alongside TxCloneNblPool above, from
+    // the same NdisFilterHandle. It carries its own cache-aligned free list, for
+    // the same reason TxCloneNblSList has one: the target CPU's drain DPC writes
+    // it while this queue's flush reads its neighbours.
+    //
+    XDP_CPUMAP_DEEPCOPY_POOL CpuMapDeepCopyPool;
+
     DECLSPEC_CACHEALIGN SLIST_HEADER TxCloneNblSList;
     DECLSPEC_CACHEALIGN EX_RUNDOWN_REF NblRundown;
 

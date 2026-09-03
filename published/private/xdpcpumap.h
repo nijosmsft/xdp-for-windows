@@ -85,6 +85,72 @@ XdpGetCpuMapRedirectExtension(
 //
 
 //
+// Per-RX-queue deep-copy NBL cache (section 7, "NDIS resources").
+//
+// Owned by XDP_LWF_GENERIC_RX_QUEUE and created alongside the existing
+// TxCloneNblPool from the same NdisFilterHandle, so the handle, the lifetime,
+// the create-failure path and the deferred free are all pre-existing shapes.
+// CPUMAP only ever reaches it through a pointer carried on the commit group and
+// stamped into the ring slot, and the slot's NblRundown reference is what keeps
+// it alive: XdpGenericRxDeleteQueueEntry runs only after the rundown wait
+// completes, so no deep copy can outlive its own pool.
+//
+// Two lists, deliberately, mirroring XdpGenericRxAllocateTxCloneNbl:
+//
+//   FreeList   interlocked, pushed by the DRAIN DPC on the target CPU after a
+//              deep copy returns synchronously from its RESOURCES indication.
+//   LocalList  plain, popped by the FLUSH on the source CPU, refilled in bulk by
+//              a single InterlockedFlushSList when it empties.
+//
+// The split is what keeps section 11 satisfied: the allocating side performs an
+// interlocked operation only when its local list runs dry, not once per packet.
+// LocalList needs no synchronisation because the flush runs under the receive
+// queue's EC, which is single-threaded per queue -- the same argument upstream
+// relies on for TxCloneNblList.
+//
+typedef struct DECLSPEC_CACHEALIGN _XDP_CPUMAP_DEEPCOPY_POOL {
+    NDIS_HANDLE NblPool;
+
+    //
+    // The filter module handle the pool was created from, kept because an
+    // originated receive NBL must carry it in SourceHandle so NDIS routes the
+    // return to this filter rather than to a miniport that never owned it.
+    //
+    NDIS_HANDLE NdisFilterHandle;
+
+    NET_BUFFER_LIST *LocalList;
+
+    //
+    // Descriptors ever allocated, capped at XDP_CPUMAP_DEEPCOPY_CACHE_MAX. Not
+    // decremented on recycle: a recycled descriptor is reused, not freed.
+    // Touched only by the flush, so it needs no interlocked update.
+    //
+    UINT32 CacheCount;
+
+    //
+    // Separated from the fields above because the drain DPC writes it from the
+    // TARGET CPU while the flush reads LocalList and CacheCount on the source
+    // CPU. Sharing a line would put an interlocked push in the middle of the
+    // allocating CPU's working set on every recycle.
+    //
+    DECLSPEC_CACHEALIGN SLIST_HEADER FreeList;
+} XDP_CPUMAP_DEEPCOPY_POOL;
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+XdpCpuMapDeepCopyPoolInitialize(
+    _Out_ XDP_CPUMAP_DEEPCOPY_POOL *Pool,
+    _In_ NDIS_HANDLE NdisFilterHandle
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+XdpCpuMapDeepCopyPoolCleanup(
+    _Inout_ XDP_CPUMAP_DEEPCOPY_POOL *Pool
+    );
+
+//
 // The flush batch. Section 7 "Batch enqueue": generic RX accumulates redirect
 // decisions and the flush groups them by target so the ring lock is taken once
 // per target per flush rather than once per packet (section 7.1).
@@ -147,10 +213,37 @@ typedef struct _XDP_CPUMAP_COMMIT_GROUP {
     const VOID *GenericOwner;
 
     //
+    // TRUE when this group's indication was low-resource, so every entry in it
+    // is a DEEP COPY rather than an original (section 8.1a row 9b).
+    //
+    // It lives on the group rather than the entry because CanPend is a property
+    // of the indication, constant for the whole post-inspection call the group
+    // belongs to. It also makes the batch's shape provable: when this is TRUE
+    // XdpGenericReceivePreInspectNbs admits exactly one NB per call, so the
+    // group can only ever hold a single entry, which is why the per-entry
+    // release the copy pre-pass performs on failure is bounded rather than a
+    // per-packet interlocked cost.
+    //
+    BOOLEAN DeepCopy;
+
+    //
+    // The receiving queue's deep-copy cache, used only when DeepCopy is set.
+    // NULL is legal and simply makes every low-resource redirect a counted
+    // failure; the unit harness relies on that to exercise the allocation
+    // failure row without a real NDIS pool.
+    //
+    XDP_CPUMAP_DEEPCOPY_POOL *DeepCopyPool;
+
+    //
     // Originals CPUMAP committed but could not queue. Ownership was taken and
     // ActionNbl cleared, so the RX action switch can no longer deliver them and
     // the caller must return them to the miniport (section 6.3 step 6, section
     // 8.1a row 9a "Released -- post-commit failure").
+    //
+    // Deep copies NEVER appear here. The caller appends this list to DropList,
+    // which returns its NBLs to the miniport, and the miniport never owned a
+    // copy; a rejected copy is recycled into its own pool instead (row 9b,
+    // "Released -- post-commit failure (ii)").
     //
     NET_BUFFER_LIST *RejectedNbls;
 
@@ -175,7 +268,9 @@ XdpCpuMapCommitGroupInit(
     _In_ NDIS_PORT_NUMBER PortNumber,
     _In_opt_ const VOID *RxQueueOwner,
     _In_opt_ const VOID *GenericOwner,
-    _In_ BOOLEAN TxInspect
+    _In_ BOOLEAN TxInspect,
+    _In_ BOOLEAN DeepCopy,
+    _In_opt_ XDP_CPUMAP_DEEPCOPY_POOL *DeepCopyPool
     )
 {
     Group->NblRundown = NblRundown;
@@ -186,6 +281,8 @@ XdpCpuMapCommitGroupInit(
     Group->PortNumber = PortNumber;
     Group->RxQueueOwner = RxQueueOwner;
     Group->GenericOwner = GenericOwner;
+    Group->DeepCopy = DeepCopy;
+    Group->DeepCopyPool = DeepCopyPool;
     Group->RejectedNbls = NULL;
     Group->Count = 0;
 }
@@ -244,9 +341,41 @@ XdpCpuMapCommitGroupFinish(
     _Outptr_result_maybenull_ NET_BUFFER_LIST **RejectedNbls
     );
 
+//
+// What commit did with the caller's NBL.
+//
+// A BOOLEAN cannot express this: on the low-resource path ownership IS committed
+// while the original stays with the caller, so "returned FALSE" covered both a
+// successful deep-copy redirect and an outright rejection. The caller has to
+// tell those apart -- one is a delivered packet whose original is on its way
+// home, the other is a loss -- and reading the zeroed metadata could not do it,
+// because every path here zeroes it.
+//
+typedef enum _XDP_CPUMAP_COMMIT_RESULT {
+    //
+    // Commit declined. The caller still owns the NBL and applies its RX action
+    // normally, including whatever drop diagnostics that implies.
+    //
+    XdpCpuMapCommitDeclined = 0,
+
+    //
+    // Ownership transferred (section 8.1a row 9a). The caller must clear
+    // ActionNbl: the original must not reach PassList, DropList or TxList.
+    //
+    XdpCpuMapCommitOwnershipTaken,
+
+    //
+    // A deep copy was built and queued; the caller keeps the ORIGINAL (row 9b).
+    // The original still goes to DropList -- there is nothing else to do with it
+    // -- but this is a SUCCESSFUL redirect, so it must not be logged as a
+    // program-inspection drop.
+    //
+    XdpCpuMapCommitDeepCopied,
+} XDP_CPUMAP_COMMIT_RESULT;
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
-BOOLEAN
+XDP_CPUMAP_COMMIT_RESULT
 XdpCpuMapCommitRedirect(
     _Inout_ XDP_FRAME_CPUMAP_REDIRECT_V1 *Redirect,
     _In_opt_ NET_BUFFER_LIST *ActionNbl,

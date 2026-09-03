@@ -16,6 +16,7 @@
     <ClCompile Include="$(SolutionDir)src\xdp\cpumap.c" />
     <ClCompile Include="cpumaptest.c" />
     <ClCompile Include="stubs/workqueue.c" />
+    <ClCompile Include="stubs/ndismodel.c" />
   </ItemGroup>
   <PropertyGroup>
     <ProjectGuid>{6d2ad3a4-6b1f-4a7a-9b62-2f6ff8f9a4c1}</ProjectGuid>
@@ -35,6 +36,16 @@
         $(SolutionDir)published\private;
         $(SolutionDir)src\rtl\inc;
         $(SolutionDir)src\xdp;
+        <!--
+          Last, and only for <ndis/nblinfo.h>. The NBL info slot enum has to be
+          the REAL one: several of its entries are aliases, and a hand-written
+          copy made them distinct, which let a test assert something NDIS does
+          not guarantee and pass for the wrong reason. The header itself needs
+          only winapifamily.h, ndis/types.h and ndis/version.h, so taking it
+          verbatim costs nothing. Placed after every other directory so it
+          cannot shadow an SDK header this user-mode project already resolves.
+        -->
+        $(NuGetPackageRoot)microsoft.windows.wdk.$(Platform)\$(XdpWdkVersion)\c\Include\$(TargetPlatformVersion)\km;
         %(AdditionalIncludeDirectories);
       </AdditionalIncludeDirectories>
       <!--
@@ -48,7 +59,17 @@
         warning configuration, not a finding against the driver, which builds
         this same file clean at /W4 /WX with code analysis as errors.
       -->
-      <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <!--
+        4324: alignment padding warnings from DECLSPEC_CACHEALIGN members.
+        6262: stack-size heuristic. It is calibrated for the KERNEL's small stack,
+              and this is a user-mode test process. Modelling the real NDIS
+              NetBufferListInfo slot array made NET_BUFFER_LIST large enough that
+              a ring's worth on the stack trips it at ~17 KB, which is
+              unremarkable against a 1 MB user-mode stack. Suppressed rather than
+              worked around, because moving these arrays to the heap would cost
+              every RTL_NUMBER_OF in the affected tests and buy nothing real.
+      -->
+      <DisableSpecificWarnings>4324;6262;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <!-- ASAN prefers linking dynamically. -->
     <ClCompile Condition="'$(Configuration)'=='Debug'">

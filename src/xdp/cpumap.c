@@ -241,11 +241,15 @@ XdpCpuMapQueryHelperStats(
         Stats->HelperTargetInactive += ReadULong64NoFence(&Current->HelperTargetInactive);
         Stats->CommitPauseDrop += ReadULong64NoFence(&Current->CommitPauseDrop);
         Stats->CommitRundownDrop += ReadULong64NoFence(&Current->CommitRundownDrop);
-        Stats->DeepCopyUnsupportedDrop +=
-            ReadULong64NoFence(&Current->DeepCopyUnsupportedDrop);
         Stats->EnqueueCount += ReadULong64NoFence(&Current->EnqueueCount);
         Stats->EnqueueTargetInactive += ReadULong64NoFence(&Current->EnqueueTargetInactive);
         Stats->RingFullCount += ReadULong64NoFence(&Current->RingFullCount);
+        Stats->DeepCopyBuildCount += ReadULong64NoFence(&Current->DeepCopyBuildCount);
+        Stats->DeepCopyFailCount += ReadULong64NoFence(&Current->DeepCopyFailCount);
+        Stats->DeepCopyMetadataUnsupported +=
+            ReadULong64NoFence(&Current->DeepCopyMetadataUnsupported);
+        Stats->DeepCopyDescriptorResidue +=
+            ReadULong64NoFence(&Current->DeepCopyDescriptorResidue);
         Stats->DrainCount += ReadULong64NoFence(&Current->DrainCount);
         Stats->DrainTombstoneCount += ReadULong64NoFence(&Current->DrainTombstoneCount);
         Stats->IndicateChainCount += ReadULong64NoFence(&Current->IndicateChainCount);
@@ -273,15 +277,532 @@ XdpCpuMapRecordCommitReject(
     case XdpCpuMapCommitRejectRundown:
         Counter = &Stats->CommitRundownDrop;
         break;
-    case XdpCpuMapCommitRejectDeepCopyUnsupported:
-        Counter = &Stats->DeepCopyUnsupportedDrop;
-        break;
     default:
         ASSERT(FALSE);
         return;
     }
 
     (*Counter)++;
+}
+
+//
+// Deep-copy cache (section 7, "NDIS resources"; section 8.1a row 9b).
+//
+// The pool belongs to the LWF receive queue, but the allocate/copy/recycle
+// mechanics live here because the flush and the drain are the only callers and
+// both are CPUMAP code. xdplwf creates and destroys the pool; it never touches
+// a copy.
+//
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+XdpCpuMapDeepCopyPoolInitialize(
+    _Out_ XDP_CPUMAP_DEEPCOPY_POOL *Pool,
+    _In_ NDIS_HANDLE NdisFilterHandle
+    )
+{
+    NET_BUFFER_LIST_POOL_PARAMETERS PoolParams = {0};
+
+    RtlZeroMemory(Pool, sizeof(*Pool));
+    InitializeSListHead(&Pool->FreeList);
+    Pool->NdisFilterHandle = NdisFilterHandle;
+
+    PoolParams.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+    PoolParams.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+    PoolParams.Header.Size = sizeof(PoolParams);
+    PoolParams.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
+    PoolParams.PoolTag = XDP_POOLTAG_CPUMAP_DEEPCOPY;
+
+    //
+    // A NET_BUFFER is allocated with each NBL and no context is reserved: a deep
+    // copy carries payload and RSS metadata, never an XDP-private context. Data
+    // buffers are NOT pre-allocated; NdisRetreatNetBufferDataStart supplies
+    // pages per copy and the recycle gives them straight back.
+    //
+    PoolParams.fAllocateNetBuffer = TRUE;
+    PoolParams.ContextSize = 0;
+    PoolParams.DataSize = 0;
+
+    Pool->NblPool = NdisAllocateNetBufferListPool(NdisFilterHandle, &PoolParams);
+    if (Pool->NblPool == NULL) {
+        return STATUS_NO_MEMORY;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+XdpCpuMapDeepCopyPoolCleanup(
+    _Inout_ XDP_CPUMAP_DEEPCOPY_POOL *Pool
+    )
+{
+    NET_BUFFER_LIST *Cached;
+
+    //
+    // Every descriptor is bare here: a copy holds pages only between its retreat
+    // and its recycle, and both the drain and the teardown paths recycle before
+    // releasing the NblRundown reference that gates this queue's deletion. So
+    // nothing in either list can still own pages.
+    //
+    Cached = (NET_BUFFER_LIST *)InterlockedFlushSList(&Pool->FreeList);
+    while (Cached != NULL) {
+        NET_BUFFER_LIST *Next = Cached->Next;
+
+        ASSERT(NET_BUFFER_LIST_FIRST_NB(Cached)->MdlChain == NULL);
+        NdisFreeNetBufferList(Cached);
+        Cached = Next;
+    }
+
+    Cached = Pool->LocalList;
+    Pool->LocalList = NULL;
+    while (Cached != NULL) {
+        NET_BUFFER_LIST *Next = Cached->Next;
+
+        ASSERT(NET_BUFFER_LIST_FIRST_NB(Cached)->MdlChain == NULL);
+        NdisFreeNetBufferList(Cached);
+        Cached = Next;
+    }
+
+    if (Pool->NblPool != NULL) {
+        NdisFreeNetBufferListPool(Pool->NblPool);
+        Pool->NblPool = NULL;
+    }
+}
+
+//
+// Return a bare descriptor to the cache.
+//
+// Pushed to the interlocked list because the caller is usually the drain DPC on
+// the TARGET CPU, while the allocating flush runs on the source CPU. The
+// allocator drains this list in bulk, so the interlocked cost here is not paid
+// again per allocation.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapDeepCopyPushFree(
+    _Inout_ XDP_CPUMAP_DEEPCOPY_POOL *Pool,
+    _Inout_ NET_BUFFER_LIST *Nbl
+    )
+{
+    //
+    // The NBL's Next field doubles as the SLIST_ENTRY, which is what upstream's
+    // TxCloneNblSList already does. SLIST_ENTRY must be 16-byte aligned on x64,
+    // and Next is at offset 0 of a pool-allocated NBL, so the descriptor's own
+    // alignment is the guarantee.
+    //
+    ASSERT(((ULONG_PTR)Nbl & (MEMORY_ALLOCATION_ALIGNMENT - 1)) == 0);
+    ASSERT(NET_BUFFER_LIST_FIRST_NB(Nbl)->MdlChain == NULL);
+
+    InterlockedPushEntrySList(&Pool->FreeList, (PSLIST_ENTRY)&Nbl->Next);
+}
+
+//
+// Release a completed deep copy: give its pages back, then cache the descriptor.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapDeepCopyRecycle(
+    _Inout_ XDP_CPUMAP_DEEPCOPY_POOL *Pool,
+    _Inout_ NET_BUFFER_LIST *Nbl
+    )
+{
+    NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(Nbl);
+
+    //
+    // FreeMdl is TRUE: the MDL and pages came from this copy's own retreat, so
+    // advancing the full data length gives them back to NDIS and leaves a bare
+    // descriptor. Advancing by DataLength rather than a remembered retreat size
+    // is correct because nothing on the redirect path trims a copy.
+    //
+    NdisAdvanceNetBufferDataStart(Nb, NET_BUFFER_DATA_LENGTH(Nb), TRUE, NULL);
+
+    NET_BUFFER_LIST_NEXT_NBL(Nbl) = NULL;
+    XdpCpuMapDeepCopyPushFree(Pool, Nbl);
+}
+
+//
+// The receive OOB slots a deep copy carries.
+//
+// Every one is a VALUE packed into the pointer-sized entry -- a checksum result
+// union, an 802.1Q priority/VID union, a frame type, a filtering-info union, an
+// RSS hash value and the packed hash type/function word. None of them owns
+// storage, so carrying one costs nothing to release and clearing one on reuse
+// discharges no obligation.
+//
+// Anything NOT in this table causes the redirect to be refused rather than
+// carried; see XdpCpuMapDeepCopyAllocate. That is what makes the list safe to
+// maintain by hand: a slot nobody has classified fails closed instead of being
+// copied on a guess.
+//
+static const NDIS_NET_BUFFER_LIST_INFO XdpCpuMapDeepCopyCarriedSlots[] = {
+    TcpIpChecksumNetBufferListInfo,
+    Ieee8021QNetBufferListInfo,
+    NetBufferListFrameType,
+    NetBufferListFilteringInfo,
+    NetBufferListHashValue,
+    NetBufferListHashInfo,
+};
+
+static
+BOOLEAN
+XdpCpuMapDeepCopyIsCarriedSlot(
+    _In_ ULONG Slot
+    )
+{
+    for (ULONG Index = 0; Index < RTL_NUMBER_OF(XdpCpuMapDeepCopyCarriedSlots); Index++) {
+        if ((ULONG)XdpCpuMapDeepCopyCarriedSlots[Index] == Slot) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static
+BOOLEAN
+XdpCpuMapDeepCopyIsDescriptorClean(
+    _In_ const NET_BUFFER_LIST *Nbl,
+    _Out_opt_ ULONG *DirtySlot
+    )
+{
+    if (DirtySlot != NULL) {
+        *DirtySlot = MaxNetBufferListInfo;
+    }
+
+    for (ULONG Slot = 0; Slot < MaxNetBufferListInfo; Slot++) {
+        if (XdpCpuMapDeepCopyIsCarriedSlot(Slot)) {
+            //
+            // Ours: set by the carry loop and cleared before it. Whatever is
+            // here now is this code's own leftover and is safe to overwrite.
+            //
+            continue;
+        }
+
+        if (Nbl->NetBufferListInfo[Slot] != NULL) {
+            //
+            // Report WHICH slot, for the same reason the metadata refusal does:
+            // "a descriptor was dirty" says something broke, "slot N was dirty"
+            // says what to go and look at.
+            //
+            if (DirtySlot != NULL) {
+                *DirtySlot = Slot;
+            }
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+//
+// Build an independent copy of Original from Pool, or return NULL.
+//
+// Runs in the flush's pre-pass, OUTSIDE the ring lock: it allocates, retreats
+// and memcpys, none of which belongs under a spinlock the drain also contends
+// for. POC A does the same, in the phase before its per-target enqueue.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NET_BUFFER_LIST *
+XdpCpuMapDeepCopyAllocate(
+    _Inout_ XDP_CPUMAP_DEEPCOPY_POOL *Pool,
+    _In_ NET_BUFFER_LIST *Original,
+    _Inout_ XDP_CPUMAP_HELPER_STATS *Stats
+    )
+{
+    NET_BUFFER_LIST *Copy;
+    NET_BUFFER *SourceNb = NET_BUFFER_LIST_FIRST_NB(Original);
+    NET_BUFFER *CopyNb;
+    ULONG DataLength;
+    ULONG DirtySlot = MaxNetBufferListInfo;
+
+    //
+    // A low-resource indication carries one NB, and the receive path asserts it
+    // (recv.c, "only one NB should be processed at a time"). Copying only the
+    // first would silently truncate, so refuse rather than guess.
+    //
+    if (SourceNb == NULL || NET_BUFFER_NEXT_NB(SourceNb) != NULL) {
+        return NULL;
+    }
+
+    DataLength = NET_BUFFER_DATA_LENGTH(SourceNb);
+    if (DataLength == 0) {
+        return NULL;
+    }
+
+    //
+    // RULE 2 -- refuse the redirect if the original carries anything else.
+    //
+    // The drift protection rule 1 gives up is bought back by refusing rather
+    // than guessing. If a slot we do not carry is occupied we cannot know
+    // whether it is load-bearing, so we decline to build a copy instead of
+    // delivering a packet we have quietly damaged. That covers
+    // MediaSpecificInformation and its Ex form, the WFP context, and every slot
+    // a future NDIS version adds -- new slots fail closed.
+    //
+    // This is deliberately NOT an assertion. A conforming miniport supplying
+    // media-specific information on a receive is VALID EXTERNAL INPUT, and a
+    // checked build must never bugcheck on input a peer driver is entitled to
+    // produce. Asserting would turn a legitimate configuration into a crash.
+    //
+    // What it is instead is a counted DROP, and the packet is LOST. It is not
+    // `delivered but not steered'': XdpInvokeEbpf already converted the
+    // program's XDP_REDIRECT into XDP_RX_ACTION_DROP before post-inspection ran,
+    // so by the time this refusal fires the caller's action is drop and there is
+    // no fallback left to honour. The original goes back to the miniport exactly
+    // once and nothing is delivered. Calling it graceful degradation would be
+    // the same overstatement the design carried until Ash caught it.
+    //
+    // ORDERING IS LOAD-BEARING, for two independent reasons.
+    //
+    // It must stay BEFORE the descriptor is taken, so refusing costs no retreat
+    // and leaves no partially-built copy to unwind. Placing it after the retreat
+    // leaked a page on every refusal -- the exact row 9b failure the design
+    // calls out.
+    //
+    // Its domain stays "every slot" so that metadata a future NDIS version adds
+    // fails CLOSED. Narrowing it to a known list would silently start carrying
+    // whatever appears next.
+    //
+    // N.B. an earlier revision claimed these facts also made the carry loop
+    // below unobservable, and retired its deletion criterion as vacuous. That
+    // was WRONG. The argument compared the carry loop against
+    // NdisCopyReceiveNetBufferListInfo and found them equivalent -- but a
+    // deletion criterion DELETES the operation, it does not swap it for another
+    // correct one, and two equivalent implementations say nothing about whether
+    // the step is load-bearing. Deleting the carry loop outright fails six
+    // assertions, one per carried slot. The criterion is reinstated.
+    //
+    for (ULONG Slot = 0; Slot < MaxNetBufferListInfo; Slot++) {
+        if (XdpCpuMapDeepCopyIsCarriedSlot(Slot)) {
+            continue;
+        }
+
+        if (Original->NetBufferListInfo[Slot] != NULL) {
+            Stats->DeepCopyMetadataUnsupported++;
+
+            //
+            // Section 12 observability. The offending SLOT is the whole point:
+            // section 12 says a non-zero DeepCopyMetadataUnsupported means the
+            // carried set needs revisiting, and that guidance is unusable
+            // without knowing WHICH slot forced the refusal. Logging the count
+            // alone would say something is wrong but not what to change.
+            //
+            TraceVerbose(
+                TRACE_CORE,
+                "DeepCopy refuse Original=%p Reason=MetadataUnsupported Slot=%u",
+                Original, Slot);
+            return NULL;
+        }
+    }
+
+    if (Pool->LocalList == NULL) {
+        Pool->LocalList = (NET_BUFFER_LIST *)InterlockedFlushSList(&Pool->FreeList);
+    }
+
+    //
+    // Take a descriptor we can prove is clean, discarding any we cannot -- and
+    // apply that test UNIFORMLY, to freshly allocated descriptors as well as
+    // recycled ones.
+    //
+    // A cached descriptor can be dirty in slots this code never sets: the upper
+    // stack stamps its own metadata during an indication, and nothing requires
+    // it to clear the slot afterwards. Those slots are NOT ours to zero -- the
+    // array holds entries with mixed ownership, and blanket-clearing one that
+    // NDIS reference-manages would bypass its handling and leak the reference.
+    // So a dirty descriptor is not repaired, it is FREED through
+    // NdisFreeNetBufferList, the documented disposal for a pool-allocated NBL,
+    // which runs whatever cleanup NDIS owns.
+    //
+    // The fresh path gets the same test for a narrower reason. Drivers rely on
+    // NdisAllocateNetBufferAndNetBufferList returning zeroed NetBufferListInfo
+    // slots, and it evidently does, but Microsoft documents initialization only
+    // for specific fields such as Scratch and says nothing about that array. An
+    // earlier revision of this code argued the behaviour must hold because
+    // residue would leave no correct handling available -- which reasons from
+    // "this must be so" to "this is contractually so", and that is the same step
+    // that made an earlier, wrong metadata policy look reasonable. Checking
+    // costs one pass over an array on an exceptional path and removes the
+    // dependency entirely: if NDIS always zeroes, this never fires.
+    //
+    while (Pool->LocalList != NULL) {
+        Copy = Pool->LocalList;
+        Pool->LocalList = Copy->Next;
+
+        if (XdpCpuMapDeepCopyIsDescriptorClean(Copy, NULL)) {
+            goto Found;
+        }
+
+        Copy->Next = NULL;
+        NdisFreeNetBufferList(Copy);
+        ASSERT(Pool->CacheCount > 0);
+        Pool->CacheCount--;
+    }
+
+    if (Pool->CacheCount < XDP_CPUMAP_DEEPCOPY_CACHE_MAX) {
+        Copy = NdisAllocateNetBufferAndNetBufferList(Pool->NblPool, 0, 0, NULL, 0, 0);
+        if (Copy == NULL) {
+            return NULL;
+        }
+
+        Pool->CacheCount++;
+
+        //
+        // A dirty FRESH descriptor fails the copy; it is not freed and retried.
+        //
+        // Retrying would loop for as long as the allocator kept handing back
+        // residue, on a path that runs at DISPATCH_LEVEL. One counted loss is
+        // the bounded outcome, and it is the honest one: if this ever fires, the
+        // allocator assumption above has broken and we want a counter saying so,
+        // not a spin.
+        //
+        if (!XdpCpuMapDeepCopyIsDescriptorClean(Copy, &DirtySlot)) {
+            Copy->Next = NULL;
+            NdisFreeNetBufferList(Copy);
+            Pool->CacheCount--;
+            Stats->DeepCopyDescriptorResidue++;
+
+            //
+            // Section 12 observability. Distinct from the refusal above and
+            // deliberately so: this says the ALLOCATOR handed back a descriptor
+            // with residue, which means the assumption behind the uniform
+            // cleanliness check has broken. The response is to investigate that,
+            // never to widen the carried set, so the two must be
+            // distinguishable in a trace and not just in a counter.
+            //
+            // The dirty slot is reported for the same reason the metadata
+            // refusal reports its offending slot: the counter says something
+            // broke, the slot says where to look.
+            //
+            TraceVerbose(
+                TRACE_CORE,
+                "DeepCopy refuse Original=%p Copy=%p Reason=DescriptorResidue Slot=%u Pool=%p",
+                Original, Copy, DirtySlot, Pool);
+            return NULL;
+        }
+    } else {
+        //
+        // Cache cap reached. A counted, non-fatal drop: CanPend == FALSE is an
+        // exceptional path and the cap exists so a burst of it cannot consume
+        // unbounded non-paged pool.
+        //
+        return NULL;
+    }
+
+Found:
+
+    CopyNb = NET_BUFFER_LIST_FIRST_NB(Copy);
+
+    //
+    // A recycled descriptor carries the previous copy's stale geometry. Retreat
+    // reads CurrentMdl and the offsets, so they have to be cleared rather than
+    // assumed zero.
+    //
+    CopyNb->MdlChain = NULL;
+    CopyNb->CurrentMdl = NULL;
+    CopyNb->DataLength = 0;
+    CopyNb->DataOffset = 0;
+    CopyNb->CurrentMdlOffset = 0;
+    NET_BUFFER_LIST_NEXT_NBL(Copy) = NULL;
+
+    //
+    // Clear ONLY the slots this code sets, and only those.
+    //
+    // A recycled descriptor carries values in the slots the previous copy
+    // carried, and a fresh one carries whatever the allocator left. Both must go
+    // before the carry loop runs, or a slot the source leaves empty would keep a
+    // stale value from the packet before it -- a cross-packet metadata leak
+    // through the cache.
+    //
+    // It is a targeted clear rather than an RtlZeroMemory over the whole array,
+    // and the distinction is load-bearing. The array holds entries with MIXED
+    // ownership: some are values, some are NDIS-managed references, some are
+    // reserved. Blanket-zeroing would clobber a referenced WfpNetBufferListInfo
+    // on a recycled descriptor and bypass NDIS's reference handling entirely,
+    // leaking it. This code never puts anything in those slots -- rule 2 refuses
+    // the redirect instead -- so a descriptor reaching here can only be dirty in
+    // slots this loop owns.
+    //
+    for (ULONG Index = 0; Index < RTL_NUMBER_OF(XdpCpuMapDeepCopyCarriedSlots); Index++) {
+        Copy->NetBufferListInfo[XdpCpuMapDeepCopyCarriedSlots[Index]] = NULL;
+    }
+
+    if (NdisRetreatNetBufferDataStart(CopyNb, DataLength, 0, NULL) != NDIS_STATUS_SUCCESS) {
+        //
+        // Section 8.1a row 9b: the retreat failed, so no pages were attached and
+        // the descriptor is still bare. It goes back on the free list rather
+        // than being leaked -- this is the "partially built copy" obligation in
+        // its no-pages form.
+        //
+        XdpCpuMapDeepCopyPushFree(Pool, Copy);
+        return NULL;
+    }
+
+#pragma prefast(suppress:6387, "NdisRetreatNetBufferDataStart sets CurrentMdl on success.")
+    if (!NT_SUCCESS(
+            MdlCopyMdlChainToMdlChainAtOffsetNonTemporal(
+                CopyNb->CurrentMdl, CopyNb->CurrentMdlOffset,
+                SourceNb->CurrentMdl, SourceNb->CurrentMdlOffset, DataLength))) {
+        //
+        // The retreat SUCCEEDED and a later step did not. This is the exact case
+        // row 9b calls out as the one that leaks if unhandled: the pages are
+        // already attached, so the descriptor must have its data start advanced
+        // back before it can be cached.
+        //
+        XdpCpuMapDeepCopyRecycle(Pool, Copy);
+        return NULL;
+    }
+
+    //
+    // Receive metadata policy: carry values, refuse everything else.
+    //
+    // Rule 2 above has already established that every non-carried slot of the
+    // source is empty, so what remains is to move the carried ones.
+    //
+    // N.B. an earlier revision justified copying the hash slots raw on the
+    // grounds that NET_BUFFER_LIST_SET_HASH_TYPE and _SET_HASH_FUNCTION share
+    // one slot and clobber each other. That is FALSE: nblhash.h shows each is a
+    // read-modify-write masked to its own field
+    // (`... & ~NDIS_HASH_TYPE_MASK) | (HashType & NDIS_HASH_TYPE_MASK)`), so
+    // they compose safely. POC A's lost hash function is a real defect with a
+    // different cause -- it never calls _SET_HASH_FUNCTION at all.
+    //
+    //
+    // RULE 1 -- carry an explicit set of VALUE-typed slots, by hand.
+    //
+    // An earlier revision delegated to NdisCopyReceiveNetBufferListInfo, on the
+    // grounds that "whatever NDIS considers receive metadata" cannot drift the
+    // way a hand-written list can. That is true, and it is not sufficient: the
+    // routine also brings OWNERSHIP we have no way to discharge. Verified
+    // against ndis.sys 10.0.26100.8521, it moves seventeen slots with plain
+    // load/store pairs and handles WfpNetBufferListInfo specially -- masked,
+    // tag-bit tested, routed through a call -- which is NDIS taking a REFERENCE
+    // on the WFP context. A copy that acquires that reference and is then
+    // refused by the ring is recycled into this pool, and nothing documented
+    // lets us release it from a cached descriptor. Delegating trades a drift
+    // risk for a reference leak.
+    //
+    // Every slot carried below is a VALUE packed into the pointer-sized entry.
+    // A copy that carries one owns nothing, and a descriptor that is reused can
+    // have it overwritten with no cleanup obligation at all.
+
+    for (ULONG Index = 0; Index < RTL_NUMBER_OF(XdpCpuMapDeepCopyCarriedSlots); Index++) {
+        NDIS_NET_BUFFER_LIST_INFO Slot = XdpCpuMapDeepCopyCarriedSlots[Index];
+
+        Copy->NetBufferListInfo[Slot] = Original->NetBufferListInfo[Slot];
+    }
+
+    //
+    // Ownership, not metadata.
+    //
+    Copy->SourceHandle = Pool->NdisFilterHandle;
+
+    return Copy;
 }
 
 //
@@ -303,11 +824,98 @@ XdpCpuMapRecordCommitReject(
 //
 static
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
+UINT32
 XdpCpuMapFlushBatch(
     _Inout_ XDP_CPUMAP_COMMIT_GROUP *Group
     )
 {
+    UINT32 TotalEnqueued = 0;
+
+    //
+    // Pre-pass: on a low-resource group, replace each entry's borrowed ORIGINAL
+    // with an independent deep copy (section 8.1a row 9b).
+    //
+    // It runs here, before any ring lock is taken, because building a copy
+    // allocates a descriptor, retreats for pages and memcpys the payload, none
+    // of which belongs inside a spinlock the drain CPU also contends for. POC A
+    // splits its flush the same way.
+    //
+    // This is the last moment at which Entry->Nbl may be the caller's original.
+    // The original is NOT owned by CPUMAP on this path: commit leaves it with
+    // the caller. It is unambiguously alive here because commit calls this
+    // function inline, before returning, so the caller has not yet applied its
+    // RX action and cannot have released the EC lock. After this loop every
+    // surviving entry holds a copy CPUMAP owns outright.
+    //
+    if (Group->DeepCopy) {
+        for (UINT32 Index = 0; Index < Group->Count; Index++) {
+            XDP_CPUMAP_BATCH_ENTRY *BatchEntry = &Group->Entries[Index];
+            XDP_CPUMAP_HELPER_STATS *Stats;
+            NET_BUFFER_LIST *Copy = NULL;
+            NET_BUFFER_LIST *Original;
+
+            ASSERT(BatchEntry->Target != NULL);
+            ASSERT(BatchEntry->Nbl != NULL);
+
+            Original = BatchEntry->Nbl;
+
+            Stats = XdpCpuMapGetCurrentHelperStats(BatchEntry->CpuMap);
+
+            if (Group->DeepCopyPool != NULL) {
+                Copy = XdpCpuMapDeepCopyAllocate(Group->DeepCopyPool, BatchEntry->Nbl, Stats);
+            }
+
+            if (Copy != NULL) {
+                BatchEntry->Nbl = Copy;
+                Stats->DeepCopyBuildCount++;
+
+                //
+                // Section 12 observability. The deep-copy path is exceptional --
+                // one NB per low-resource indication -- so per-copy verbose
+                // tracing adds no volume on the normal path, and it is the only
+                // way to correlate the original with the copy from outside the
+                // driver. Original and copy are both logged because "O != C" is
+                // the property the design turns on: the original goes home to
+                // the miniport while the copy travels to another CPU.
+                //
+                TraceVerbose(
+                    TRACE_CORE,
+                    "CpuMapId=%u DeepCopy build Original=%p Copy=%p Pool=%p TargetCpu=%u",
+                    BatchEntry->CpuMap->CpuMapId, Original, Copy, Group->DeepCopyPool,
+                    BatchEntry->Target->AbsoluteCpu);
+                continue;
+            }
+
+            //
+            // Row 9b, "Released -- post-commit failure (i)". Three obligations,
+            // and all three are discharged here rather than left to a later
+            // stage that has no entry to act on:
+            //
+            //   - The ORIGINAL needs nothing: it was never taken, and the
+            //     caller's DROP action returns it to the miniport exactly once.
+            //     Simply dropping the borrowed pointer is the whole action.
+            //   - The entry's backing reference and NblRundown credit are
+            //     released here.
+            //   - The entry's target rundown reference is released here too,
+            //     because clearing Target below removes the entry from the
+            //     per-target accounting that step 6 would otherwise use.
+            //
+            // Releasing per failed entry rather than in one batch is acceptable
+            // precisely because Group->DeepCopy implies a single-entry group:
+            // the receive path admits one NB per low-resource call.
+            //
+            Stats->DeepCopyFailCount++;
+
+            ExReleaseRundownProtection(&BatchEntry->Target->PacketRundown);
+            XdpCpuMapReleaseBacking(BatchEntry->CpuMap);
+            XdpCpuMapCommitGroupReturnCredit(Group);
+
+            BatchEntry->Nbl = NULL;
+            BatchEntry->CpuMap = NULL;
+            BatchEntry->Target = NULL;
+        }
+    }
+
     for (UINT32 First = 0; First < Group->Count; First++) {
         XDP_CPUMAP_TARGET *Target = Group->Entries[First].Target;
         XDP_CPUMAP *CpuMap;
@@ -319,10 +927,12 @@ XdpCpuMapFlushBatch(
         UINT32 RingFull = 0;
         UINT32 Inactive = 0;
         BOOLEAN Active;
+        NET_BUFFER_LIST *DeepCopyRejects = NULL;
 
         //
         // A NULL target marks an entry that an earlier target group in this
-        // same flush has already consumed.
+        // same flush has already consumed, or one the deep-copy pre-pass above
+        // released.
         //
         if (Target == NULL) {
             continue;
@@ -370,13 +980,26 @@ XdpCpuMapFlushBatch(
             if (!Active || Ring->Tail - Ring->Head >= Ring->Capacity) {
                 //
                 // Ownership was committed and ActionNbl cleared, so there is no
-                // RX action left to fall back to: the original is chained for
-                // return to the miniport and the packet is counted as a drop.
-                // Only pointer stores happen under the lock; the reference
+                // RX action left to fall back to: the packet is counted as a
+                // drop. Only pointer stores happen under the lock; the reference
                 // releases are batched below it.
                 //
-                NET_BUFFER_LIST_NEXT_NBL(BatchEntry->Nbl) = Group->RejectedNbls;
-                Group->RejectedNbls = BatchEntry->Nbl;
+                // Row 9b, "Released -- post-commit failure (ii)": a deep copy is
+                // NOT chained here. RejectedNbls is appended to the caller's
+                // DropList, which returns its NBLs to the MINIPORT, and the
+                // miniport never owned a copy -- returning one would hand it a
+                // buffer from our pool. The copy is instead collected for
+                // recycling once the lock is dropped. The original on this path
+                // is unaffected: it went to DropList at commit and is already
+                // being returned by the normal receive path.
+                //
+                if (Group->DeepCopy) {
+                    NET_BUFFER_LIST_NEXT_NBL(BatchEntry->Nbl) = DeepCopyRejects;
+                    DeepCopyRejects = BatchEntry->Nbl;
+                } else {
+                    NET_BUFFER_LIST_NEXT_NBL(BatchEntry->Nbl) = Group->RejectedNbls;
+                    Group->RejectedNbls = BatchEntry->Nbl;
+                }
                 BatchEntry->Nbl = NULL;
 
                 if (!Active) {
@@ -396,7 +1019,8 @@ XdpCpuMapFlushBatch(
             Slot->BackingRef = BatchEntry->CpuMap;
             Slot->NblRundown = Group->NblRundown;
             Slot->PortNumber = Group->PortNumber;
-            Slot->IsDeepCopy = FALSE;
+            Slot->DeepCopyPool = Group->DeepCopyPool;
+            Slot->IsDeepCopy = Group->DeepCopy;
 
             BatchEntry->Nbl = NULL;
             BatchEntry->CpuMap = NULL;
@@ -413,6 +1037,35 @@ XdpCpuMapFlushBatch(
         // Step 4.
         //
         KeReleaseInStackQueuedSpinLock(&LockHandle);
+
+        //
+        // Deep copies the ring refused, recycled now that the lock is gone.
+        //
+        // Placed between steps 4 and 5 for the same reason the counter writes
+        // below are: the group still holds every target rundown reference here,
+        // so the receive queue cannot have reached deletion and DeepCopyPool is
+        // still alive. Recycling costs no ring lock and no NDIS call -- the
+        // pages go back and the descriptor lands on the free list.
+        //
+        while (DeepCopyRejects != NULL) {
+            NET_BUFFER_LIST *Next = NET_BUFFER_LIST_NEXT_NBL(DeepCopyRejects);
+
+            ASSERT(Group->DeepCopyPool != NULL);
+
+            //
+            // Section 12 observability. A ring-rejected copy is the case most
+            // easily confused with a leak from outside the driver: it was built,
+            // never indicated, and never returned to the miniport. Tracing it
+            // with an explicit disposition is what distinguishes "recycled
+            // correctly" from "lost".
+            //
+            TraceVerbose(
+                TRACE_CORE, "DeepCopy recycle Head=%p Count=1 Pool=%p Disposition=RingRejected",
+                DeepCopyRejects, Group->DeepCopyPool);
+
+            XdpCpuMapDeepCopyRecycle(Group->DeepCopyPool, DeepCopyRejects);
+            DeepCopyRejects = Next;
+        }
 
         //
         // Counters are written HERE, before step 6, while the group still holds
@@ -433,6 +1086,7 @@ XdpCpuMapFlushBatch(
         Stats->EnqueueCount += Enqueued;
         Stats->EnqueueTargetInactive += Inactive;
         Stats->RingFullCount += RingFull;
+        TotalEnqueued += Enqueued;
 
         //
         // Step 5. Safe without a producer reference because step 6 has not run.
@@ -464,11 +1118,12 @@ XdpCpuMapFlushBatch(
     }
 
     Group->Count = 0;
+    return TotalEnqueued;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
-BOOLEAN
+XDP_CPUMAP_COMMIT_RESULT
 XdpCpuMapCommitRedirect(
     _Inout_ XDP_FRAME_CPUMAP_REDIRECT_V1 *Redirect,
     _In_opt_ NET_BUFFER_LIST *ActionNbl,
@@ -482,6 +1137,7 @@ XdpCpuMapCommitRedirect(
     XDP_CPUMAP_BATCH_ENTRY *BatchEntry;
     BOOLEAN RedirectReferencesHeld;
     BOOLEAN NblRundownCreditHeld = FALSE;
+    UINT32 Enqueued;
 
     //
     // Two independent questions, deliberately not conflated.
@@ -529,33 +1185,26 @@ XdpCpuMapCommitRedirect(
     //
     ASSERT(!Group->TxInspect);
 
+    //
+    // CanPend and Group->DeepCopy are two derivations of one value: both come
+    // from the CanPend argument of the post-inspection call this group belongs
+    // to. The code below uses the group's copy, because the flush needs it long
+    // after this function has returned, so the parameter is checked rather than
+    // read. They can only disagree through a plumbing defect -- a group
+    // initialized outside the loop that calls this, or a group reused across
+    // calls with different CanPend -- and the consequence would be silent: a
+    // low-resource original lent across a DPC and indicated from another CPU, or
+    // a pendable original needlessly copied and dropped. The assertion converts
+    // that into a checked-build failure at the first packet.
+    //
+    ASSERT(Group->DeepCopy == !CanPend);
+
     if (!RedirectReferencesHeld || ActionNbl == NULL || Group->TxInspect) {
         goto Reject;
     }
 
     if (RxQueuePaused) {
         XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectPause);
-        goto Reject;
-    }
-
-    //
-    // Increment 6 carries ORIGINALS ONLY. A low-resource indication cannot lend
-    // its NBL out, and the per-receive-queue deep-copy pool that would replace
-    // it does not exist until increment 8.
-    //
-    // Like every other commit-time outcome this is a DROP, not a fallback:
-    // XdpInvokeEbpf converted the program's XDP_REDIRECT into XDP_RX_ACTION_DROP
-    // before post-inspection ran, so the action this packet falls back to is
-    // already drop and the program's declared fallback is unreachable. What the
-    // commit does is decline ownership -- it releases the metadata's references
-    // and leaves the original with the caller, whose DROP action then returns it
-    // to the miniport exactly once. Counted DeepCopyUnsupportedDrop.
-    //
-    // Decided BEFORE the rundown credit, so a declined packet never touches the
-    // shared rundown.
-    //
-    if (!CanPend) {
-        XdpCpuMapRecordCommitReject(CpuMap, XdpCpuMapCommitRejectDeepCopyUnsupported);
         goto Reject;
     }
 
@@ -578,7 +1227,7 @@ XdpCpuMapCommitRedirect(
     // either.
     //
     if (Group->Count == RTL_NUMBER_OF(Group->Entries)) {
-        XdpCpuMapFlushBatch(Group);
+        (VOID)XdpCpuMapFlushBatch(Group);
     }
     ASSERT(Group->Count < RTL_NUMBER_OF(Group->Entries));
 
@@ -607,7 +1256,80 @@ XdpCpuMapCommitRedirect(
     // by the flush, which is the first point at which it is known.
     //
     RtlZeroMemory(Redirect, sizeof(*Redirect));
-    return TRUE;
+
+    //
+    // Section 8.1a row 9b: on the low-resource path the ORIGINAL is not taken.
+    //
+    // Returning FALSE is not a rejection here, and this is deliberately not the
+    // Reject label: the batch entry above is live and owns all three references,
+    // exactly as on the CanPend path. What FALSE means to the caller is only
+    // "you still own this NBL", and that is precisely right -- the caller's
+    // XDP_RX_ACTION_DROP appends the original to DropList and the normal receive
+    // path returns it to the miniport once. That is the whole point of the
+    // low-resource path: the original goes home immediately and a copy travels
+    // to the target CPU instead.
+    //
+    // Entry->Nbl is therefore a BORROWED copy source until the flush replaces it
+    // with a real copy. It stays valid because the group is flushed by
+    // XdpCpuMapCommitGroupFinish at the end of the same post-inspection call
+    // that put the original on DropList, and nothing between those two points
+    // returns it: XdpGenericReceiveLowResources only relinks it onto the
+    // reassembled low-resources chain the miniport gets back when the whole
+    // receive call unwinds.
+    //
+    if (Group->DeepCopy) {
+        //
+        // Flush NOW, before returning to the caller, and not at the end of the
+        // post-inspection call.
+        //
+        // Section 8.4's quiesce guarantee is that a pause does not depend on any
+        // target DPC running: pause publishes its gate, then quiesce scans every
+        // ring and tombstones what it finds. A batch entry is invisible to that
+        // scan -- it lives on the receive path's stack, not in a ring. On the
+        // low-resource path the caller goes on to call
+        // XdpGenericReceiveLowResources, which RELEASES AND REACQUIRES the EC
+        // spinlock in order to indicate its pass list. A pause running in that
+        // window would publish, scan, find nothing, and complete -- and then the
+        // deferred flush would enqueue behind the scan, putting a packet in a
+        // ring that quiesce has already passed and making its delivery depend on
+        // the target DPC after all.
+        //
+        // Flushing here closes the window rather than detecting it: by the time
+        // the lock can be dropped, the entry is either in a ring where quiesce
+        // can see it or already disposed of. The group can hold only this one
+        // entry -- XdpGenericReceivePreInspectNbs admits a single NB per
+        // low-resource call -- so this costs nothing a deferred flush would have
+        // saved.
+        //
+        // It also removes the borrowed-pointer window entirely: the copy is
+        // built while the caller is still holding the original, before the RX
+        // action has even been applied.
+        //
+        Enqueued = XdpCpuMapFlushBatch(Group);
+        ASSERT(Group->RejectedNbls == NULL);
+
+        //
+        // The flush's enqueue count is what makes this result honest.
+        //
+        // Returning DeepCopied unconditionally would report success for a copy
+        // that was never built -- pool exhausted, retreat failed, metadata
+        // refused -- and for one the ring rejected, and the caller would then
+        // suppress the drop record for a packet that really was lost. That is
+        // the diagnostic regression the tri-state exists to prevent, so the
+        // tri-state has to be driven by the outcome rather than by reaching this
+        // line.
+        //
+        // Declined is exactly right on failure: the caller still owns the
+        // original, applies its DROP action, and logs the drop it should log.
+        //
+        if (Enqueued == 0) {
+            return XdpCpuMapCommitDeclined;
+        }
+
+        return XdpCpuMapCommitDeepCopied;
+    }
+
+    return XdpCpuMapCommitOwnershipTaken;
 
 Reject:
 
@@ -626,7 +1348,7 @@ Reject:
     }
 
     RtlZeroMemory(Redirect, sizeof(*Redirect));
-    return FALSE;
+    return XdpCpuMapCommitDeclined;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -636,7 +1358,7 @@ XdpCpuMapCommitGroupFinish(
     _Outptr_result_maybenull_ NET_BUFFER_LIST **RejectedNbls
     )
 {
-    XdpCpuMapFlushBatch(Group);
+    (VOID)XdpCpuMapFlushBatch(Group);
 
     if (Group->Credits > 0) {
         ExReleaseRundownProtectionEx(Group->NblRundown, Group->Credits);
@@ -722,6 +1444,14 @@ typedef struct _XDP_CPUMAP_NBL_CHAIN {
     BOOLEAN IsDeepCopy;
     XDP_CPUMAP *BackingRef;
     EX_RUNDOWN_REF *NblRundown;
+
+    //
+    // Constant across a partition, because the partition key includes
+    // NblRundown and both it and the pool are per receive queue. Carried so the
+    // disposal paths can recycle without revisiting slots that are already gone.
+    //
+    XDP_CPUMAP_DEEPCOPY_POOL *DeepCopyPool;
+
     NET_BUFFER_LIST *Head;
     NET_BUFFER_LIST *Tail;
     ULONG Count;
@@ -790,10 +1520,19 @@ XdpCpuMapChainSetTake(
         Chain->IsDeepCopy = Entry->IsDeepCopy;
         Chain->BackingRef = Entry->BackingRef;
         Chain->NblRundown = Entry->NblRundown;
+        Chain->DeepCopyPool = Entry->DeepCopyPool;
         Chain->Head = NULL;
         Chain->Tail = NULL;
         Chain->Count = 0;
     }
+
+    //
+    // A deep-copy slot must name the pool its copy came from; there is nowhere
+    // else to recycle it to. The partition key makes this constant per chain,
+    // so checking it on every take is what keeps that assumption honest.
+    //
+    ASSERT(!Entry->IsDeepCopy || Entry->DeepCopyPool != NULL);
+    ASSERT(Chain->DeepCopyPool == Entry->DeepCopyPool);
 
     NET_BUFFER_LIST_NEXT_NBL(Entry->Nbl) = NULL;
     if (Chain->Tail != NULL) {
@@ -831,15 +1570,88 @@ XdpCpuMapChainRelease(
 
     Chain->BackingRef = NULL;
     Chain->NblRundown = NULL;
+    Chain->DeepCopyPool = NULL;
     Chain->Head = NULL;
     Chain->Tail = NULL;
     Chain->Count = 0;
 }
 
 //
+// Recycle a whole partition of deep copies back into the pool they came from.
+//
+// Must run BEFORE XdpCpuMapChainRelease: the pool belongs to the receive queue,
+// and the chain's NblRundown references are the only thing keeping that queue
+// from completing its pause and being deleted. Releasing first would leave this
+// loop dereferencing a freed pool.
+//
+// The whole partition goes back in ONE interlocked push. The chain is already
+// linked through Next, which is the same field the free list uses as its
+// SLIST_ENTRY, so advancing each copy's data start in place leaves a list the
+// pool can take wholesale -- the shape upstream uses for returned TX clones, and
+// what section 11 asks for instead of an interlocked operation per packet.
+//
+static
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+XdpCpuMapChainRecycleDeepCopies(
+    _Inout_ XDP_CPUMAP_NBL_CHAIN *Chain,
+    _In_ const CHAR *Disposition
+    )
+{
+    NET_BUFFER_LIST *First = Chain->Head;
+    NET_BUFFER_LIST *Nbl = First;
+
+    ASSERT(Chain->IsDeepCopy);
+    ASSERT(Chain->DeepCopyPool != NULL);
+    ASSERT(First != NULL);
+    ASSERT(Chain->Tail != NULL);
+
+    //
+    // Section 12 observability. Disposition is a parameter rather than inferred
+    // because the three ways a copy leaves the data path -- delivered and
+    // returned by the stack, refused by the ring, or discarded at teardown --
+    // are indistinguishable from here, and they are exactly what a reader needs
+    // to tell apart. Every one of them ends in the SAME pool the copy came from,
+    // which is the property this trace exists to make checkable.
+    //
+    TraceVerbose(
+        TRACE_CORE, "DeepCopy recycle Head=%p Count=%u Pool=%p Disposition=%s",
+        First, Chain->Count, Chain->DeepCopyPool, Disposition);
+    UNREFERENCED_PARAMETER(Disposition);
+
+    while (Nbl != NULL) {
+        NET_BUFFER *Nb = NET_BUFFER_LIST_FIRST_NB(Nbl);
+
+        //
+        // FreeMdl is TRUE: the MDL and pages came from this copy's own retreat,
+        // so advancing the full data length gives them back and leaves a bare
+        // descriptor. Advancing by DataLength rather than a remembered retreat
+        // size is correct because nothing on the redirect path trims a copy.
+        //
+        NdisAdvanceNetBufferDataStart(Nb, NET_BUFFER_DATA_LENGTH(Nb), TRUE, NULL);
+
+        //
+        // The free list stores its SLIST_ENTRY in the NBL's Next field, which
+        // requires MEMORY_ALLOCATION_ALIGNMENT. Next is at offset 0 of a
+        // pool-allocated NBL, so the descriptor's own alignment is the
+        // guarantee -- checked per entry rather than assumed once.
+        //
+        ASSERT(((ULONG_PTR)Nbl & (MEMORY_ALLOCATION_ALIGNMENT - 1)) == 0);
+        Nbl = NET_BUFFER_LIST_NEXT_NBL(Nbl);
+    }
+
+    InterlockedPushListSList(
+        &Chain->DeepCopyPool->FreeList, (SLIST_ENTRY *)&First->Next,
+        (SLIST_ENTRY *)&Chain->Tail->Next, Chain->Count);
+
+    Chain->Head = NULL;
+    Chain->Tail = NULL;
+}
+
+//
 // Data-path disposal: indicate each partition up the stack with its own captured
-// handle, port and flags. Originals go without RESOURCES; deep copies (increment
-// 8) go with it and return synchronously.
+// handle, port and flags. Originals go without RESOURCES; deep copies go with
+// it and return synchronously.
 //
 static
 _IRQL_requires_(DISPATCH_LEVEL)
@@ -855,9 +1667,11 @@ XdpCpuMapChainSetIndicate(
         ASSERT(Chain->Count > 0);
 
         //
-        // IsDeepCopy is always FALSE in this increment -- the flush enqueues
-        // originals only -- but the flag is part of the partition key, so the
-        // RESOURCES bit is derived from it rather than hard-coded.
+        // RESOURCES is derived from the partition key rather than hard-coded,
+        // and on a deep-copy partition it is what makes the lifetime argument
+        // work: the stack must consume the copy inline, so the indication
+        // returns with the chain still ours and the recycle below happens before
+        // this DPC does.
         //
         if (Chain->IsDeepCopy) {
             ReceiveFlags |= NDIS_RECEIVE_FLAGS_RESOURCES;
@@ -867,6 +1681,25 @@ XdpCpuMapChainSetIndicate(
             Chain->FilterHandle, Chain->Head, Chain->PortNumber, Chain->Count,
             ReceiveFlags);
 
+        //
+        // Section 12 observability. ReceiveFlags is logged as ACTUALLY PASSED,
+        // not as intended: the RESOURCES bit is what forces the stack to consume
+        // the copy inline, and the whole recycle lifetime argument rests on it,
+        // so it must be observable rather than inferred from IsDeepCopy. The
+        // executing CPU is logged because the point of the feature is that this
+        // is the map-selected CPU and not the arrival CPU.
+        //
+        if (Chain->IsDeepCopy) {
+            TraceVerbose(
+                TRACE_CORE,
+                "DeepCopy indicate Head=%p Count=%u ReceiveFlags=%x Cpu=%u",
+                Chain->Head, Chain->Count, ReceiveFlags, KeGetCurrentProcessorIndex());
+        }
+
+        if (Chain->IsDeepCopy) {
+            XdpCpuMapChainRecycleDeepCopies(Chain, "Indicated");
+        }
+
         XdpCpuMapChainRelease(Chain);
     }
 
@@ -874,9 +1707,9 @@ XdpCpuMapChainSetIndicate(
 }
 
 //
-// Teardown disposal: return each partition to the miniport WITHOUT indicating
-// it. Retire and quiesce both reach here, and in both cases the packet is lost
-// by design (sections 8.3 and 8.4).
+// Teardown disposal: dispose of each partition WITHOUT indicating it. Retire and
+// quiesce both reach here, and in both cases the packet is lost by design
+// (sections 8.3 and 8.4).
 //
 static
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -891,12 +1724,15 @@ XdpCpuMapChainSetReturn(
         ASSERT(Chain->Count > 0);
 
         //
-        // A deep copy is never returned to the miniport, which never owned it;
-        // increment 8 recycles it into the receive queue's pool here instead.
+        // Section 8.1a row 9b, "Released -- teardown": a deep copy goes back to
+        // its pool, never to the miniport, which never owned it. Returning one
+        // would hand the miniport a buffer allocated from our own pool.
         //
-        ASSERT(!Chain->IsDeepCopy);
-
-        NdisFReturnNetBufferLists(Chain->FilterHandle, Chain->Head, 0);
+        if (Chain->IsDeepCopy) {
+            XdpCpuMapChainRecycleDeepCopies(Chain, "Teardown");
+        } else {
+            NdisFReturnNetBufferLists(Chain->FilterHandle, Chain->Head, 0);
+        }
 
         XdpCpuMapChainRelease(Chain);
     }
@@ -1755,6 +2591,31 @@ XdpCpuMapDestroy(
     ASSERT(CpuMap->ChargedNonPagedBytes == CpuMap->HelperStatsBytes);
 
     if (CpuMap->HelperStats != NULL) {
+        //
+        // Section 12 observability: the ONLY way these counters leave the
+        // driver. They are per-CPU and map-scoped, so this aggregates them here,
+        // at map destruction, which is the last moment the array is valid and
+        // the only point at which the totals are final. Queue teardown would be
+        // the wrong scope -- a map outlives any one queue.
+        //
+        // This exists because the section 12 guidance is operational: a non-zero
+        // MetadataUnsupported means revisit the carried set, a non-zero
+        // DescriptorResidue means the allocator assumption broke. Guidance about
+        // counters nobody can read is not guidance, and shipping it that way is
+        // what made this trace necessary.
+        //
+        XDP_CPUMAP_HELPER_STATS Totals;
+
+        XdpCpuMapQueryHelperStats(CpuMap, &Totals);
+
+        TraceInfo(
+            TRACE_CORE,
+            "CpuMapId=%u DeepCopy summary Build=%llu Fail=%llu MetadataUnsupported=%llu "
+            "DescriptorResidue=%llu RingFull=%llu EnqueueTargetInactive=%llu",
+            CpuMap->CpuMapId, Totals.DeepCopyBuildCount, Totals.DeepCopyFailCount,
+            Totals.DeepCopyMetadataUnsupported, Totals.DeepCopyDescriptorResidue,
+            Totals.RingFullCount, Totals.EnqueueTargetInactive);
+
         ExFreePoolWithTag(CpuMap->HelperStats, XDP_POOLTAG_CPUMAP);
         CpuMap->HelperStats = NULL;
     }
