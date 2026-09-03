@@ -1197,7 +1197,14 @@ XdpCpuMapCommitRedirect(
     // a pendable original needlessly copied and dropped. The assertion converts
     // that into a checked-build failure at the first packet.
     //
+    // ASSERT compiles out in Release, and this is CanPend's ONLY remaining use
+    // since the deep-copy refactor moved the low-resource decision to
+    // Group->DeepCopy -- so without the explicit reference below, /WX fails the
+    // Release build on C4100 while Debug builds clean. The parameter is kept
+    // rather than removed because the assertion it feeds is load-bearing.
+    //
     ASSERT(Group->DeepCopy == !CanPend);
+    UNREFERENCED_PARAMETER(CanPend);
 
     if (!RedirectReferencesHeld || ActionNbl == NULL || Group->TxInspect) {
         goto Reject;
